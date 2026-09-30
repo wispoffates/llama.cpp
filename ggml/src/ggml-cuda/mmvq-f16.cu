@@ -85,11 +85,10 @@ static __device__ __forceinline__ uint32_t mmvq_f16_fld(const uint32_t * wb, con
 
 template <int NC, int RPW, int NBLK, int B = 0>
 static __device__ __forceinline__ void mmvq_f16_blocks(
-        const uint32_t * const * wb, const __half * const * xw, __half2 (&t)[NC][RPW],
-        const int P, const int ql_w, const int qh_w, const int vh_shift,
-        const int sc_we, const int sc_wo, const uint32_t sc_sel_e, const uint32_t sc_sel_o) {
+        const uint32_t * const * wb, const uint2 * const * scs, const __half * const * xw, __half2 (&t)[NC][RPW],
+        const int P, const int ql_w, const int qh_w, const int vh_shift, const int sp) {
     if constexpr (B < NBLK) {
-        const __half2 k1056 = __float2half2_rn(1056.0f), k1152 = __float2half2_rn(1152.0f), k1024 = __float2half2_rn(1024.0f);
+        const __half2 k1056 = __float2half2_rn(1056.0f);
         __half2 xa[NC][2], xb[NC][2];
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
@@ -102,22 +101,9 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
         for (int i = 0; i < RPW; ++i) {
             const uint32_t vl = mmvq_f16_fld<B, 0>(wb[i], ql_w);
             const uint32_t vh = mmvq_f16_fld<B, 128>(wb[i], qh_w) >> vh_shift;
-            // scales so and so+4: window-relative bytes 210*B + 192 + so and +4, one byte lane apart by a word
-            uint32_t sab;
-            if constexpr ((B & 1) == 0) {
-                constexpr int C = (210*B + 192)/4;
-                sab = __byte_perm(wb[i][C + sc_we], wb[i][C + sc_we + 1], sc_sel_e);
-            } else {
-                constexpr int C = (210*B + 190)/4;
-                sab = __byte_perm(wb[i][C + sc_wo], wb[i][C + sc_wo + 1], sc_sel_o);
-            }
-            const uint32_t sh = __byte_perm(sab ^ 0x8080u, 0x64646464u, 0x5140); // half(1024 + 128 + sc)
-            constexpr int DA = 210*B + 208;
-            const uint32_t dw = wb[i][DA/4];
-            const uint32_t dd = ((DA & 3) == 0) ? __byte_perm(dw, 0, 0x1010) : __byte_perm(dw, 0, 0x3232);
-            const __half2 d2  = __hmul2(*(const __half2 *) &dd, k1024);
-            const __half2 sc2 = __hmul2(__hsub2(*(const __half2 *) &sh, k1152), d2);
-            const __half2 sA  = __low2half2(sc2), sB = __high2half2(sc2);
+            // scales so and so+4, precomputed per window by mmvq_f16_scales (the same half ops)
+            const uint2 sAB = scs[i][B*8 + sp];
+            const __half2 sA = *(const __half2 *) &sAB.x, sB = *(const __half2 *) &sAB.y;
             const uint32_t qa = (vl & 0x0F0F0F0F) | ((vh << 4) & 0x30303030);
             const uint32_t qb = ((vl >> 4) & 0x0F0F0F0F) | (vh & 0x30303030);
             // half(1024 + q) per byte, minus 1056, times the scale
@@ -135,7 +121,33 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
                 t[c][i] = __hfma2(w3, xb[c][1], u);
             }
         }
-        mmvq_f16_blocks<NC, RPW, NBLK, B + 1>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o);
+        mmvq_f16_blocks<NC, RPW, NBLK, B + 1>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp);
+    }
+}
+
+// A block's 16 scales, as the (sA, sB) half2 pairs its lanes use: lane l of the warp computes pair
+// p = l % 8 (scales j and j + 4, j = p < 4 ? p : p + 4) of block l / 8 of the window, once, instead
+// of every lane recomputing its pair for every block (~12 instructions per lane, block and row).
+// The half arithmetic is exactly the per-lane version's: sc2 = (half(1152 + sc) - 1152) * (d*1024).
+template <int RPW>
+static __device__ __forceinline__ void mmvq_f16_scales(const uint32_t * const * wb, uint2 (*scst)[MMVQ_F16_NBF*8],
+                                                       const int nblk, const int lane) {
+    const int B = lane >> 3, p = lane & 7, j = p < 4 ? p : p + 4;
+    if (B >= nblk) {
+        return;
+    }
+    const __half2 k1152 = __float2half2_rn(1152.0f), k1024 = __float2half2_rn(1024.0f);
+#pragma unroll
+    for (int i = 0; i < RPW; ++i) {
+        const uint8_t * bb = (const uint8_t *) wb[i] + 210*B;
+        const uint32_t sab = (uint32_t) bb[192 + j] | ((uint32_t) bb[196 + j] << 8);
+        const uint32_t sh  = __byte_perm(sab ^ 0x8080u, 0x64646464u, 0x5140); // half(1024 + 128 + sc)
+        const uint32_t d16 = *(const uint16_t *) (bb + 208);
+        const uint32_t dd  = d16 | (d16 << 16);
+        const __half2 d2  = __hmul2(*(const __half2 *) &dd, k1024);
+        const __half2 sc2 = __hmul2(__hsub2(*(const __half2 *) &sh, k1152), d2);
+        const __half2 sA  = __low2half2(sc2), sB = __high2half2(sc2);
+        scst[i][B*8 + p] = make_uint2(*(const uint32_t *) &sA, *(const uint32_t *) &sB);
     }
 }
 
@@ -155,8 +167,13 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
     // this lane's 8 values of a block: P..P+3 (scale so) and P+64..P+67 (scale so+4)
     const int iqs = lane, P = 128*(iqs/16) + 4*(iqs % 16);
     const int ql_w = iqs, qh_w = 8*(iqs/16) + iqs % 8, vh_shift = 2*((iqs % 16)/8), so = 8*(iqs/16) + (iqs % 16)/4;
-    const int sc_we = so >> 2, sc_wo = (so + 2) >> 2;
-    const uint32_t sc_sel_e = (so & 3) | ((4 + (so & 3)) << 4), sc_sel_o = ((so + 2) & 3) | ((4 + ((so + 2) & 3)) << 4);
+    const int sp = so < 8 ? so : so - 4; // this lane's scale pair (so, so + 4), see mmvq_f16_scales
+    __shared__ uint2 scst[NWT][RPW][MMVQ_F16_NBF*8];
+    const uint2 * scs[RPW];
+#pragma unroll
+    for (int i = 0; i < RPW; ++i) {
+        scs[i] = scst[wid][i];
+    }
 
     float acc[NC][RPW];
 #pragma unroll
@@ -198,10 +215,12 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
             }
         }
         __syncwarp();
+        mmvq_f16_scales<RPW>(wb, scst[wid], nblk, lane);
+        __syncwarp();
         __half2 t[NC][RPW];
         switch (nblk) {
-            case 4: mmvq_f16_blocks<NC, RPW, 4>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o); break;
-            default: mmvq_f16_blocks<NC, RPW, 2>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o); break; // nb % 4 == 2
+            case 4: mmvq_f16_blocks<NC, RPW, 4>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break;
+            default: mmvq_f16_blocks<NC, RPW, 2>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break; // nb % 4 == 2
         }
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
