@@ -651,7 +651,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         switch (ncols_dst) {
             case 1:
 #ifdef GGML_CUDA_MMVQ_PASCAL
-                return 4;
+                return 2;
 #else
                 if (small_k) {
                     return nwarps;
