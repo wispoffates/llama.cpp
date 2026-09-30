@@ -1,5 +1,7 @@
 #include "mmvq-f16.cuh"
 
+#include <unordered_map>
+
 // q6_K x f32 matvec for 2..5 columns on Pascal, in fp16 with short chains folded into fp32.
 //
 // The integer path (mmvq.cu) is ALU-bound here: sm_60 has no DP4A, and its emulation costs ~2.2
@@ -227,6 +229,27 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
     }
 }
 
+// The prescaled fp16 activation, reused across consecutive matmuls that read the same src1 (gate
+// and up, the q/k/v projections), like the integer path's q8_1 cache. Keyed on the src1 node, whose
+// contents are fixed within one graph evaluation; cleared at the start of each one. One persistent
+// buffer per CUDA context (contexts are per device).
+struct mmvq_f16_cache {
+    const ggml_tensor * src1 = nullptr;
+    const void *        data = nullptr;
+    int64_t             ncols = 0, K = 0;
+    void *              buf  = nullptr;
+    size_t              cap  = 0;
+};
+static std::unordered_map<const ggml_backend_cuda_context *, mmvq_f16_cache> mmvq_f16_caches;
+
+void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx) {
+    auto it = mmvq_f16_caches.find(&ctx);
+    if (it != mmvq_f16_caches.end()) {
+        it->second.src1 = nullptr;
+        it->second.data = nullptr;
+    }
+}
+
 bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                             ggml_tensor * dst, const int64_t ncols) {
     static const bool enabled = [] {
@@ -250,11 +273,27 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
     cudaStream_t stream = ctx.stream();
 
-    ggml_cuda_pool_alloc<__half> xs(ctx.pool(), ncols*K);
-    ggml_cuda_pool_alloc<float>  sc(ctx.pool(), ncols*nw);
-    {
+    mmvq_f16_cache & cache = mmvq_f16_caches[&ctx];
+    const size_t xs_bytes = (size_t) ncols*K*sizeof(__half);
+    const size_t need     = xs_bytes + (size_t) ncols*nw*sizeof(float);
+    __half * xs_ptr;
+    float  * sc_ptr;
+    const bool hit = cache.src1 == src1 && cache.data == src1->data && cache.ncols == ncols && cache.K == K;
+    if (!hit) {
+        if (cache.cap < need) {
+            if (cache.buf) {
+                CUDA_CHECK(cudaFree(cache.buf)); // synchronizes; only when the buffer grows
+            }
+            CUDA_CHECK(cudaMalloc(&cache.buf, need));
+            cache.cap = need;
+        }
+        cache.src1 = src1; cache.data = src1->data; cache.ncols = ncols; cache.K = K;
+    }
+    xs_ptr = (__half *) cache.buf;
+    sc_ptr = (float *) ((char *) cache.buf + xs_bytes);
+    if (!hit) {
         const dim3 pb(WARP_SIZE, 4), pg((nw + 3)/4, ncols);
-        mmvq_f16_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, src1->nb[1]/sizeof(float), xs.get(), sc.get(), (int) K);
+        mmvq_f16_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, src1->nb[1]/sizeof(float), xs_ptr, sc_ptr, (int) K);
     }
     const dim3 bd(WARP_SIZE, MMVQ_F16_NW);
     const int  g  = (int) ((rows + MMVQ_F16_NW*MMVQ_F16_RPW - 1)/(MMVQ_F16_NW*MMVQ_F16_RPW));
@@ -262,10 +301,10 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const uint8_t * W = (const uint8_t *) src0->data;
     float * Y = (float *) dst->data;
     switch (ncols) {
-        case 2: mmvq_f16_q6_K<2><<<g, bd, 0, stream>>>(W, src0->nb[1], xs.get(), sc.get(), Y, sy, (int) rows, (int) K); break;
-        case 3: mmvq_f16_q6_K<3><<<g, bd, 0, stream>>>(W, src0->nb[1], xs.get(), sc.get(), Y, sy, (int) rows, (int) K); break;
-        case 4: mmvq_f16_q6_K<4><<<g, bd, 0, stream>>>(W, src0->nb[1], xs.get(), sc.get(), Y, sy, (int) rows, (int) K); break;
-        default: mmvq_f16_q6_K<5><<<g, bd, 0, stream>>>(W, src0->nb[1], xs.get(), sc.get(), Y, sy, (int) rows, (int) K); break;
+        case 2: mmvq_f16_q6_K<2><<<g, bd, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+        case 3: mmvq_f16_q6_K<3><<<g, bd, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+        case 4: mmvq_f16_q6_K<4><<<g, bd, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+        default: mmvq_f16_q6_K<5><<<g, bd, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
