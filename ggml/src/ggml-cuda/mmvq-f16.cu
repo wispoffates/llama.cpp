@@ -237,12 +237,12 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     static const int64_t min_rows = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MINROWS"); return s ? (int64_t) atoll(s) : (int64_t) 3072; }();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t K = src0->ne[0], rows = src0->ne[1];
-    // Only where it measured faster than the integer path (OPTLOG 206), test-backend-ops at 5 columns:
-    // K = 5120 with >= 3072 rows (8704x5120 154 -> 133 us, 6144x5120 115 -> 97, 5120x5120 98 -> 89,
-    // 3072x5120 67 -> 61). Other K (3072, 8704) lose and stay on the integer path.
+    // Where it measured faster than the integer path (OPTLOG 206), test-backend-ops at 5 columns, rows x K:
+    // 8704x5120 154 -> 133 us, 6144x5120 115 -> 97, 5120x5120 98 -> 89, 3072x5120 67 -> 61,
+    // 5120x8704 161 -> 146, 5120x3072 61 -> 57. K must hold an even number of q6_K blocks.
     if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || src0->type != GGML_TYPE_Q6_K ||
             src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < 2 || ncols > 5 ||
-            K != 5120 || rows < min_rows || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            K % 512 != 0 || rows < min_rows || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src0->nb[1] != (size_t) (K/256)*210 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
             (src1->nb[1] % 16) != 0 || ((uintptr_t) src1->data % 16) != 0 || ((uintptr_t) src0->data % 4) != 0) {
         return false;
