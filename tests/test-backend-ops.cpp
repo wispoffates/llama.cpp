@@ -11155,11 +11155,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4360, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, n, 17408, {1, 1}, {1, 1}));
     }
-    // the fp16 verify path on Pascal (mmvq-f16.cu) takes K = 5120 with >= 6144 rows at 2..5 columns;
+    // the fp16 verify path on Pascal (mmvq-f16.cu) takes >= 3072 rows at 2..5 columns;
     // 6150 rows leaves a partial block of rows
-    for (int m : {6144, 6150, 8704}) {
+    for (int m : {3072, 6144, 6150, 8704}) {
         for (int n : {2, 3, 4, 5}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
+    for (int k : {3072, 8704}) {
+        for (int n : {2, 5}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, n, k, {1, 1}, {1, 1}));
         }
     }
 
