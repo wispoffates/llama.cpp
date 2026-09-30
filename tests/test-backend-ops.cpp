@@ -13066,6 +13066,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, n, k, {1, 1}, {1, 1}));
         }
     }
+    // below 3072 rows (wk/wv at 512 rows, the delta-net alpha/beta at 24); 300 and 20 rows leave
+    // partial blocks
+    for (int m : {512, 300, 24, 20}) {
+        for (int n : {2, 3, 5}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 5, 8704, {1, 1}, {1, 1}));
+        }
+    }
     for (int hs : {64, 128, 256}) {
         for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3}) {
             test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, type_K, GGML_TYPE_F8_E4M3));
