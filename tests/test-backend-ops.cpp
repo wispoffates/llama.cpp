@@ -13143,6 +13143,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F8_E4M3, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F8_E4M3));
 
+    // q6_K matvec at the model's shapes and the speculative-verify widths. The m=16 cases elsewhere
+    // take the small-rows path on Pascal and never reach the multi-column kernel. 4360 rows leaves a
+    // partial block, 17408 is the down projection's K.
+    for (int n : {1, 2, 3, 4, 5, 6, 7}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4360, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, n, 17408, {1, 1}, {1, 1}));
+    }
+    // the fp16 verify path on Pascal (mmvq-f16.cu) takes K = 5120 with >= 6144 rows at 2..5 columns;
+    // 6150 rows leaves a partial block of rows
+    for (int m : {6144, 6150, 8704}) {
+        for (int n : {2, 3, 4, 5}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+        }
+    }
     for (int hs : {64, 128, 256}) {
         for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3}) {
             test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {1, 1}, 256, 1, true, false, 0, 0, GGML_PREC_F32, type_K, GGML_TYPE_F8_E4M3));
