@@ -161,6 +161,8 @@ static __global__ void rms_norm_f32(const float * x,
                     dst[col] = scale * xv[u] * mul[fastmodulo(col, mul_ncols_packed)] + add[fastmodulo(col, add_ncols_packed)];
                 } else if constexpr (do_multiply) {
                     dst[col] = scale * xv[u] * mul[fastmodulo(col, mul_ncols_packed)];
+                } else if constexpr (do_scale) {
+                    dst[col] = scale_out * (scale * xv[u]);
                 } else {
                     dst[col] = scale * xv[u];
                 }
