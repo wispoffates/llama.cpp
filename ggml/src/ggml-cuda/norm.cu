@@ -116,6 +116,12 @@ static __global__ void rms_norm_f32(const float * x,
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
 
+    // A row is normalised by a single block, so no other block covers this one's memory latency
+    // and the row is read twice: once to accumulate the sum of squares and again to scale it.
+    // When the row fits in a fixed number of registers per thread, hold it there instead: the
+    // loads all issue up front, and the second pass costs nothing.
+    constexpr int max_regs = 8;
+
     extern __shared__ float s_sum[];
 
     ggml_cuda_pdl_sync();
@@ -142,31 +148,63 @@ static __global__ void rms_norm_f32(const float * x,
                 addc = add + add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
             }
 
-            float tmp = 0.0f; // partial sum for thread in warp
+            if (ncols <= block_size*max_regs) {
+                float xv[max_regs];
+                float tmp = 0.0f;
+#pragma unroll
+                for (int u = 0; u < max_regs; ++u) {
+                    const int col = tid + u*block_size;
+                    xv[u] = col < ncols ? xc[col] : 0.0f;
+                    tmp += xv[u] * xv[u];
+                }
 
-            for (int col = tid; col < ncols; col += block_size) {
-                const float xi = xc[col];
-                tmp += xi * xi;
-            }
+                tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
 
-            // sum up partial sums
-            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+                const float mean  = tmp / ncols;
+                const float scale = rsqrtf(mean + eps);
 
-            const float mean = tmp / ncols;
-            const float scale = rsqrtf(mean + eps);
+#pragma unroll
+                for (int u = 0; u < max_regs; ++u) {
+                    const int col = tid + u*block_size;
+                    if (col < ncols) {
+                        if constexpr (do_multiply && do_add) {
+                            dstc[col] = scale * xv[u] * mulc[fastmodulo(col, mul_ncols_packed)] + addc[fastmodulo(col, add_ncols_packed)];
+                        } else if constexpr (do_multiply) {
+                            dstc[col] = scale * xv[u] * mulc[fastmodulo(col, mul_ncols_packed)];
+                        } else if constexpr (do_scale) {
+                            dstc[col] = scale_out * (scale * xv[u]);
+                        } else {
+                            dstc[col] = scale * xv[u];
+                        }
+                    }
+                }
+            } else {
+                float tmp = 0.0f; // partial sum for thread in warp
 
-            for (int col = tid; col < ncols; col += block_size) {
-                if constexpr (do_multiply && do_add) {
-                    const int mul_col = fastmodulo(col, mul_ncols_packed);
-                    const int add_col = fastmodulo(col, add_ncols_packed);
-                    dstc[col]         = scale * xc[col] * mulc[mul_col] + addc[add_col];
-                } else if constexpr (do_multiply) {
-                    const int mul_col = fastmodulo(col, mul_ncols_packed);
-                    dstc[col]         = scale * xc[col] * mulc[mul_col];
-                } else if constexpr (do_scale) {
-                    dstc[col] = scale_out * (scale * xc[col]);
-                } else {
-                    dstc[col] = scale * xc[col];
+                for (int col = tid; col < ncols; col += block_size) {
+                    const float xi = xc[col];
+                    tmp += xi * xi;
+                }
+
+                // sum up partial sums
+                tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+                const float mean = tmp / ncols;
+                const float scale = rsqrtf(mean + eps);
+
+                for (int col = tid; col < ncols; col += block_size) {
+                    if constexpr (do_multiply && do_add) {
+                        const int mul_col = fastmodulo(col, mul_ncols_packed);
+                        const int add_col = fastmodulo(col, add_ncols_packed);
+                        dstc[col]         = scale * xc[col] * mulc[mul_col] + addc[add_col];
+                    } else if constexpr (do_multiply) {
+                        const int mul_col = fastmodulo(col, mul_ncols_packed);
+                        dstc[col]         = scale * xc[col] * mulc[mul_col];
+                    } else if constexpr (do_scale) {
+                        dstc[col] = scale_out * (scale * xc[col]);
+                    } else {
+                        dstc[col] = scale * xc[col];
+                    }
                 }
             }
 
