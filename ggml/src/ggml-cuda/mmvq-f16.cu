@@ -151,8 +151,8 @@ static __device__ __forceinline__ void mmvq_f16_scales(const uint32_t * const * 
     }
 }
 
-template <int NC, int RPW, int NWT, bool KS>
-__launch_bounds__(NWT*WARP_SIZE, 12/NWT) // 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
+template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT>
+__launch_bounds__(NWT*WARP_SIZE, MINB) // 12/NWT: 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
 static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XS,
                                      const float * __restrict__ S, float * __restrict__ Y, const int64_t sy,
                                      const int rows, const int K) {
@@ -351,26 +351,36 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     float * Y = (float *) dst->data;
     // big matrices: 2 warps x 4 rows per block; mid-size: 1 row per warp; small (< 256 rows): the 4
     // warps of a block split K over one row, so there are enough blocks and warps to cover the GPU
-    auto launch = [&](auto rpw, auto nwt, auto ks) {
-        constexpr int  RPW = decltype(rpw)::value;
-        constexpr int  NWT = decltype(nwt)::value;
-        constexpr bool KS  = decltype(ks)::value;
+    auto launch = [&](auto rpw, auto nwt, auto ks, auto minb) {
+        constexpr int  RPW  = decltype(rpw)::value;
+        constexpr int  NWT  = decltype(nwt)::value;
+        constexpr bool KS   = decltype(ks)::value;
+        constexpr int  MINB = decltype(minb)::value;
         const dim3 bdk(WARP_SIZE, NWT);
         const int g = KS ? (int) ((rows + RPW - 1)/RPW) : (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
         switch (ncols) {
-            case 2:  mmvq_f16_q6_K<2, RPW, NWT, KS><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-            case 3:  mmvq_f16_q6_K<3, RPW, NWT, KS><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-            case 4:  mmvq_f16_q6_K<4, RPW, NWT, KS><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-            default: mmvq_f16_q6_K<5, RPW, NWT, KS><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+            case 2:  mmvq_f16_q6_K<2, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+            case 3:  mmvq_f16_q6_K<3, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+            case 4:  mmvq_f16_q6_K<4, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+            default: mmvq_f16_q6_K<5, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
         }
     };
     using I = std::integral_constant<int, 1>;
     if (rows >= 3072) {
-        launch(std::integral_constant<int, MMVQ_F16_RPW>{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{});
+        // 6 or 7 blocks per SM (168 or 128 registers): take 7 when it needs fewer waves over the
+        // SMs (3072 rows: 2 -> 1 wave, 49 vs 57 us at 5 columns; 6144: 3 -> 2; 8704: 4 -> 3).
+        const int64_t nblk = (rows + MMVQ_F16_NW*MMVQ_F16_RPW - 1)/(MMVQ_F16_NW*MMVQ_F16_RPW);
+        const int64_t nsm  = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+        const int64_t w6 = (nblk + 6*nsm - 1)/(6*nsm), w7 = (nblk + 7*nsm - 1)/(7*nsm);
+        if (w7 < w6) {
+            launch(std::integral_constant<int, MMVQ_F16_RPW>{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 7>{});
+        } else {
+            launch(std::integral_constant<int, MMVQ_F16_RPW>{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 6>{});
+        }
     } else if (rows >= 256) {
-        launch(I{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{});
+        launch(I{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 12/MMVQ_F16_NW>{});
     } else {
-        launch(I{}, std::integral_constant<int, 4>{}, std::true_type{});
+        launch(I{}, std::integral_constant<int, 4>{}, std::true_type{}, std::integral_constant<int, 3>{});
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
