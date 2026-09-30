@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-f16.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1771,6 +1772,11 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(!src0->view_src);
             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
         }
+    }
+
+    // Pascal: fp16 path for the verify widths where it is faster (mmvq-f16.cu)
+    if (!ids && !fusion && ggml_cuda_mmvq_f16_try(ctx, src0, src1, dst, ne11)) {
+        return;
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
