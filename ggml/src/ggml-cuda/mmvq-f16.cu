@@ -140,7 +140,7 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
 }
 
 template <int NC>
-__launch_bounds__(MMVQ_F16_NW*WARP_SIZE, 1)
+__launch_bounds__(MMVQ_F16_NW*WARP_SIZE, 6) // 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
 static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XS,
                                      const float * __restrict__ S, float * __restrict__ Y, const int64_t sy,
                                      const int rows, const int K) {
