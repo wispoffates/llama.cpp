@@ -83,9 +83,9 @@ static __device__ __forceinline__ uint32_t mmvq_f16_fld(const uint32_t * wb, con
     }
 }
 
-template <int NC, int NBLK, int B = 0>
+template <int NC, int RPW, int NBLK, int B = 0>
 static __device__ __forceinline__ void mmvq_f16_blocks(
-        const uint32_t * const * wb, const __half * const * xw, __half2 (&t)[NC][MMVQ_F16_RPW],
+        const uint32_t * const * wb, const __half * const * xw, __half2 (&t)[NC][RPW],
         const int P, const int ql_w, const int qh_w, const int vh_shift,
         const int sc_we, const int sc_wo, const uint32_t sc_sel_e, const uint32_t sc_sel_o) {
     if constexpr (B < NBLK) {
@@ -99,7 +99,7 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
             xb[c][0] = *(const __half2 *) &bb.x; xb[c][1] = *(const __half2 *) &bb.y;
         }
 #pragma unroll
-        for (int i = 0; i < MMVQ_F16_RPW; ++i) {
+        for (int i = 0; i < RPW; ++i) {
             const uint32_t vl = mmvq_f16_fld<B, 0>(wb[i], ql_w);
             const uint32_t vh = mmvq_f16_fld<B, 128>(wb[i], qh_w) >> vh_shift;
             // scales so and so+4: window-relative bytes 210*B + 192 + so and +4, one byte lane apart by a word
@@ -135,21 +135,22 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
                 t[c][i] = __hfma2(w3, xb[c][1], u);
             }
         }
-        mmvq_f16_blocks<NC, NBLK, B + 1>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o);
+        mmvq_f16_blocks<NC, RPW, NBLK, B + 1>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o);
     }
 }
 
-template <int NC>
-__launch_bounds__(MMVQ_F16_NW*WARP_SIZE, 6) // 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
+template <int NC, int RPW, int NWT, bool KS>
+__launch_bounds__(NWT*WARP_SIZE, 12/NWT) // 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
 static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XS,
                                      const float * __restrict__ S, float * __restrict__ Y, const int64_t sy,
                                      const int rows, const int K) {
-    constexpr int RPB = MMVQ_F16_NW*MMVQ_F16_RPW, WB = MMVQ_F16_NBF*210, NU = (WB + 15 + 15)/16;
+    constexpr int RPB = NWT*RPW, WB = MMVQ_F16_NBF*210, NU = (WB + 15 + 15)/16;
     const int lane = threadIdx.x, wid = threadIdx.y;
     const int nb = K/256, nw = (nb + MMVQ_F16_NBF - 1)/MMVQ_F16_NBF;
-    const int row0 = blockIdx.x*RPB + wid*MMVQ_F16_RPW;
+    // KS (split K): the block's warps share its RPW rows and take every NWT-th window each
+    const int row0 = KS ? blockIdx.x*RPW : blockIdx.x*RPB + wid*RPW;
 
-    __shared__ uint4 wst[MMVQ_F16_NW][MMVQ_F16_RPW][NU];
+    __shared__ uint4 wst[NWT][RPW][NU];
 
     // this lane's 8 values of a block: P..P+3 (scale so) and P+64..P+67 (scale so+4)
     const int iqs = lane, P = 128*(iqs/16) + 4*(iqs % 16);
@@ -157,33 +158,33 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
     const int sc_we = so >> 2, sc_wo = (so + 2) >> 2;
     const uint32_t sc_sel_e = (so & 3) | ((4 + (so & 3)) << 4), sc_sel_o = ((so + 2) & 3) | ((4 + ((so + 2) & 3)) << 4);
 
-    float acc[NC][MMVQ_F16_RPW];
+    float acc[NC][RPW];
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
 #pragma unroll
-        for (int i = 0; i < MMVQ_F16_RPW; ++i) {
+        for (int i = 0; i < RPW; ++i) {
             acc[c][i] = 0.0f;
         }
     }
-    const char * rp[MMVQ_F16_RPW];
+    const char * rp[RPW];
 #pragma unroll
-    for (int i = 0; i < MMVQ_F16_RPW; ++i) {
-        rp[i] = (const char *) W + (int64_t) min(row0 + i, rows - 1)*row_bytes;
+    for (int i = 0; i < RPW; ++i) {
+        rp[i] = (const char *) W + (int64_t) min(row0 + i, rows - 1)*row_bytes + (KS ? (int64_t) wid*WB : 0);
     }
     const __half * xw[NC];
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
-        xw[c] = XS + (int64_t) c*K;
+        xw[c] = XS + (int64_t) c*K + (KS ? (int64_t) wid*MMVQ_F16_WIN : 0);
     }
 
-    for (int win = 0; win < nw; ++win) {
+    for (int win = KS ? wid : 0; win < nw; win += KS ? NWT : 1) {
         const int nblk = min(MMVQ_F16_NBF, nb - win*MMVQ_F16_NBF);
         __syncwarp();
-        const uint32_t * wb[MMVQ_F16_RPW];
+        const uint32_t * wb[RPW];
 #pragma unroll
-        for (int i = 0; i < MMVQ_F16_RPW; ++i) {
+        for (int i = 0; i < RPW; ++i) {
             const char * g = rp[i];
-            rp[i] += WB;
+            rp[i] += KS ? (int64_t) NWT*WB : WB;
             const int m = (int) ((uintptr_t) g & 15); // a multiple of 4
             wb[i] = (const uint32_t *) wst[wid][i] + (m >> 2);
             const uint4 * g16 = (const uint4 *) (g - m);
@@ -197,26 +198,57 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
             }
         }
         __syncwarp();
-        __half2 t[NC][MMVQ_F16_RPW];
+        __half2 t[NC][RPW];
         switch (nblk) {
-            case 4: mmvq_f16_blocks<NC, 4>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o); break;
-            default: mmvq_f16_blocks<NC, 2>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o); break; // nb % 4 == 2
+            case 4: mmvq_f16_blocks<NC, RPW, 4>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o); break;
+            default: mmvq_f16_blocks<NC, RPW, 2>(wb, xw, t, P, ql_w, qh_w, vh_shift, sc_we, sc_wo, sc_sel_e, sc_sel_o); break; // nb % 4 == 2
         }
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
-            xw[c] += MMVQ_F16_WIN;
+            xw[c] += KS ? NWT*MMVQ_F16_WIN : MMVQ_F16_WIN;
             const float s = __ldg(S + c*nw + win);
 #pragma unroll
-            for (int i = 0; i < MMVQ_F16_RPW; ++i) {
+            for (int i = 0; i < RPW; ++i) {
                 const __half2 u = __hadd2(t[c][i], __lowhigh2highlow(t[c][i]));
                 acc[c][i] = fmaf(s, __low2float(u), acc[c][i]);
             }
         }
     }
+    if constexpr (KS) {
+        // per-warp partials, then warp 0 adds them in a fixed order
+        __shared__ float red[NWT][NC][RPW];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) {
+                float v = acc[c][i];
+#pragma unroll
+                for (int o = 16; o; o >>= 1) {
+                    v += __shfl_xor_sync(0xFFFFFFFF, v, o);
+                }
+                if (lane == 0) {
+                    red[wid][c][i] = v;
+                }
+            }
+        }
+        __syncthreads();
+        if (wid == 0 && lane < NC*RPW) {
+            const int c = lane / RPW, i = lane % RPW;
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < NWT; ++w) {
+                v += red[w][c][i];
+            }
+            if (row0 + i < rows) {
+                Y[c*sy + row0 + i] = v;
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int c = 0; c < NC; ++c) {
 #pragma unroll
-        for (int i = 0; i < MMVQ_F16_RPW; ++i) {
+        for (int i = 0; i < RPW; ++i) {
             float v = acc[c][i];
 #pragma unroll
             for (int o = 16; o; o >>= 1) {
@@ -257,7 +289,7 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         return !s || atoi(s) != 0;
     }();
     // GGML_CUDA_MMVQ_F16_MINROWS: the smallest row count that takes this path
-    static const int64_t min_rows = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MINROWS"); return s ? (int64_t) atoll(s) : (int64_t) 3072; }();
+    static const int64_t min_rows = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MINROWS"); return s ? (int64_t) atoll(s) : (int64_t) 16; }();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t K = src0->ne[0], rows = src0->ne[1];
     // Where it measured faster than the integer path (OPTLOG 206), test-backend-ops at 5 columns, rows x K:
@@ -295,16 +327,31 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         const dim3 pb(WARP_SIZE, 4), pg((nw + 3)/4, ncols);
         mmvq_f16_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, src1->nb[1]/sizeof(float), xs_ptr, sc_ptr, (int) K);
     }
-    const dim3 bd(WARP_SIZE, MMVQ_F16_NW);
-    const int  g  = (int) ((rows + MMVQ_F16_NW*MMVQ_F16_RPW - 1)/(MMVQ_F16_NW*MMVQ_F16_RPW));
     const int64_t sy = dst->nb[1]/sizeof(float);
     const uint8_t * W = (const uint8_t *) src0->data;
     float * Y = (float *) dst->data;
-    switch (ncols) {
-        case 2: mmvq_f16_q6_K<2><<<g, bd, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-        case 3: mmvq_f16_q6_K<3><<<g, bd, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-        case 4: mmvq_f16_q6_K<4><<<g, bd, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-        default: mmvq_f16_q6_K<5><<<g, bd, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+    // big matrices: 2 warps x 4 rows per block; mid-size: 1 row per warp; small (< 256 rows): the 4
+    // warps of a block split K over one row, so there are enough blocks and warps to cover the GPU
+    auto launch = [&](auto rpw, auto nwt, auto ks) {
+        constexpr int  RPW = decltype(rpw)::value;
+        constexpr int  NWT = decltype(nwt)::value;
+        constexpr bool KS  = decltype(ks)::value;
+        const dim3 bdk(WARP_SIZE, NWT);
+        const int g = KS ? (int) ((rows + RPW - 1)/RPW) : (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
+        switch (ncols) {
+            case 2:  mmvq_f16_q6_K<2, RPW, NWT, KS><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+            case 3:  mmvq_f16_q6_K<3, RPW, NWT, KS><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+            case 4:  mmvq_f16_q6_K<4, RPW, NWT, KS><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+            default: mmvq_f16_q6_K<5, RPW, NWT, KS><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+        }
+    };
+    using I = std::integral_constant<int, 1>;
+    if (rows >= 3072) {
+        launch(std::integral_constant<int, MMVQ_F16_RPW>{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{});
+    } else if (rows >= 256) {
+        launch(I{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{});
+    } else {
+        launch(I{}, std::integral_constant<int, 4>{}, std::true_type{});
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
