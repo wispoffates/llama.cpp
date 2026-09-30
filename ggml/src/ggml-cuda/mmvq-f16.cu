@@ -378,7 +378,16 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
             launch(std::integral_constant<int, MMVQ_F16_RPW>{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 6>{});
         }
     } else if (rows >= 256) {
-        launch(I{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 12/MMVQ_F16_NW>{});
+        // one warp of 2 rows per block: at 512 rows x 5120 and 5 columns (wk/wv under -sm tensor)
+        // 13.3 us against 17.7 for 2 warps of 1 row (test-backend-ops, prep included). The rows'
+        // arithmetic doesn't depend on the grouping, so the results are identical.
+        // GGML_CUDA_MMVQ_F16_MID=0 restores 2 warps x 1 row.
+        static const bool mid2 = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MID"); return !s || atoi(s) != 0; }();
+        if (mid2) {
+            launch(std::integral_constant<int, 2>{}, I{}, std::false_type{}, std::integral_constant<int, 16>{});
+        } else {
+            launch(I{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 12/MMVQ_F16_NW>{});
+        }
     } else {
         launch(I{}, std::integral_constant<int, 4>{}, std::true_type{}, std::integral_constant<int, 3>{});
     }
