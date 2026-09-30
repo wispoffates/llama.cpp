@@ -48,7 +48,10 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+// Radix select: 4 histogram passes over the row, then one gather. Also used on CUDA when CUB has
+// no DeviceTopK (CCCL < 3.2, e.g. CUDA 12.0): the fallback there is a full segmented radix sort
+// of the row, which for a 248k-entry vocabulary is the bulk of a speculative draft step's sampling.
+#if !defined(CUB_TOP_K_AVAILABLE)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -208,7 +211,7 @@ static void top_k_radix_cuda(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#endif // !defined(CUB_TOP_K_AVAILABLE)
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -233,6 +236,14 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+    static const bool radix = [] {
+        const char * e = getenv("GGML_CUDA_TOPK_RADIX");
+        return !e || atoi(e) != 0;
+    }();
+    if (radix && ncols > 1024) {
+        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        return;
+    }
     // Fall back to argsort + copy
     const int    ncols_pad      = next_power_of_2(ncols);
     const size_t shared_mem     = ncols_pad * sizeof(int);
