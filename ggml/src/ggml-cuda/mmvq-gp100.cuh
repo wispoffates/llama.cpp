@@ -10,6 +10,13 @@ bool ggml_cuda_gp100_mmvq_supported(int cc, const ggml_tensor * src0, const ggml
 void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
                           const ggml_cuda_mm_fusion_args_host * fusion);
 
+// MUL_MAT_ID for one token (Q4_K/Q5_K experts): ids [n_used, 1], src1 with 1 column (shared input) or n_used columns
+bool ggml_cuda_gp100_mmvq_id_supported(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                                       const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
+
+void ggml_cuda_gp100_mmvq_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                             ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion);
+
 // Fused RMS_NORM * weight for a single row that also fills the GP100 activation cache for the matmuls that
 // consume it. Returns false (nothing launched) when not applicable.
 bool ggml_cuda_gp100_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul);
