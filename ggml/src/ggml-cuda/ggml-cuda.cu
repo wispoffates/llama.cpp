@@ -1836,7 +1836,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
-    // fusion is not universally faster on Pascal, except through the hybrid sm_60 kernels (GGML_CUDA_HYBRID_GLU=1)
+    // fusion is not universally faster on Pascal, except through the hybrid sm_60 kernels (GGML_CUDA_HYBRID_GLU=0 turns that off)
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (cc <= GGML_CUDA_CC_PASCAL && !(cc == GGML_CUDA_CC_PASCAL && ggml_cuda_hybrid_glu_enabled() && ggml_cuda_hybrid_mmvq_enabled() &&
                                        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) &&

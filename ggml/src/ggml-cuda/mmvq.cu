@@ -1649,10 +1649,10 @@ static void mul_mat_vec_q_switch_type(
 // Measured 4096x14336 (plan doc §17): Q4_K/Q5_K ~2x faster at every width 1..8; Q8_0 -21 % at 1 column (slower at 2+);
 // ours wins Q6_K, Q4_0, Q5_0/Q5_1 and every multi-column Q8_0. GGML_CUDA_HYBRID_MMVQ=0 disables it (A/B).
 // MoE experts (MUL_MAT_ID, one token) take it for Q4_K/Q5_K too; GGML_CUDA_HYBRID_MMVQ_ID=0 disables just that.
-// GGML_CUDA_HYBRID_GLU=1: let gate/up/SWIGLU fuse on Pascal for Q4_K/Q5_K (upstream turns MMVQ fusion off for Pascal; qr0n's
-// kernels have a fused form). Opt-in until measured.
+// Gate/up/SWIGLU fusion is re-enabled on Pascal for Q4_K/Q5_K (upstream turns MMVQ fusion off for Pascal; qr0n's kernels
+// have a fused form): +3 % decode on qwen36/ornith over the unfused hybrid path (plan doc §22). GGML_CUDA_HYBRID_GLU=0 disables it.
 bool ggml_cuda_hybrid_glu_enabled() {
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HYBRID_GLU"); return e && e[0] == '1'; }();
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HYBRID_GLU"); return !e || e[0] != '0'; }();
     return enabled;
 }
 
