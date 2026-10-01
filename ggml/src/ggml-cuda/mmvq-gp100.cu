@@ -138,19 +138,22 @@ template <> struct gp100_kq<GGML_TYPE_Q4_K> { typedef block_q4_K block; static c
 template <> struct gp100_kq<GGML_TYPE_Q5_K> { typedef block_q5_K block; static constexpr int qs_u4 = 3; static constexpr bool has_qh = true;  };
 
 // The body is a device function so the MUL_MAT_ID kernel below can run it on one expert's matrices.
-template <ggml_type type, int R, bool GLU>
+// GS = groups of 8 lanes per row set (4: the whole warp walks K for R rows). For short K (MoE ffn_down: K = 512 = 2
+// super-blocks) groups 2 and 3 would idle, so GS = 2 gives the warp two row sets of R rows, each walked by 16 lanes.
+template <ggml_type type, int R, bool GLU, int GS = 4>
 static __device__ __forceinline__ void gp100_mmvq_kq_impl(
         const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys,
         float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
 #if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    static_assert(GS == 4 || GS == 2 || GS == 1, "GS must divide 4");
     constexpr int RT = GLU ? 2*R : R; // with GLU: R rows of ffn_up, then the same R rows of ffn_gate
     typedef typename gp100_kq<type>::block block;
     constexpr int U4_PER_BLOCK = sizeof(block) / sizeof(uint4); // q4_K 9, q5_K 11
     static_assert(sizeof(block) % sizeof(uint4) == 0, "block must be a whole number of uint4");
 
     const int lane = threadIdx.x % WARP_SIZE;
-    const int row0 = (blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE) * R;
-    const int g  = lane / 8;
+    const int row0 = ((blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE) * (4 / GS) + (GS == 4 ? 0 : lane / (8 * GS))) * R;
+    const int g  = GS == 4 ? lane / 8 : (lane / 8) % GS;
     const int t  = lane % 8;
     const int jj = t / 2;
     const int hf = t % 2;
@@ -178,7 +181,7 @@ static __device__ __forceinline__ void gp100_mmvq_kq_impl(
         sum[r] = 0.0f;
     }
 
-    for (int sb = g; sb < nsb; sb += 4) {
+    for (int sb = g; sb < nsb; sb += GS) {
         uint4 hd[RT], qh[RT], qs[RT];
 #pragma unroll
         for (int r = 0; r < RT; r++) {
@@ -231,7 +234,23 @@ static __device__ __forceinline__ void gp100_mmvq_kq_impl(
         }
     }
 
-    gp100_store<R, GLU>(sum, dst, row0, nrows, lane);
+    if constexpr (GS == 4) {
+        gp100_store<R, GLU>(sum, dst, row0, nrows, lane);
+    } else { // reduce within each row set's 8*GS lanes
+#pragma unroll
+        for (int r = 0; r < RT; r++) {
+#pragma unroll
+            for (int o = 4 * GS; o > 0; o >>= 1) {
+                sum[r] += __shfl_xor_sync(0xFFFFFFFF, sum[r], o);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (lane % (8 * GS) == 0 && row0 + r < nrows) {
+                dst[row0 + r] = GLU ? ggml_cuda_op_silu_single(sum[R + r]) * sum[r] : sum[r];
+            }
+        }
+    }
 #else
     GGML_UNUSED_VARS(vW, vG, y, ys, dst, nrows, nsb, stride_row);
     NO_DEVICE_CODE;
@@ -249,7 +268,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_kq(
 // MUL_MAT_ID, one token: blockIdx.y is the expert slot. Slot e multiplies expert ids[e] (src0 plane, nb02 bytes apart)
 // with activation column e % ncols_y (1 = the same input for every expert, as for ffn_up/ffn_gate) and writes dst
 // column e. Same weight path as the dense kernel, so an expert matrix costs what a dense matrix of its size does.
-template <ggml_type type, int R, bool GLU>
+template <ggml_type type, int R, bool GLU, int GS>
 static __global__ void __launch_bounds__(128) gp100_mmvq_kq_id(
         const char * __restrict__ vW, const char * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys,
         float * __restrict__ dst, const int32_t * __restrict__ ids, const int nrows, const int nsb, const int stride_row,
@@ -258,7 +277,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_kq_id(
     const int64_t off = (int64_t) ids[e] * nb02;
     const int     c   = e % ncols_y;
     const int     K   = nsb * QK_K;
-    gp100_mmvq_kq_impl<type, R, GLU>(vW + off, GLU ? vG + off : nullptr, y + (int64_t) c * K, ys + (int64_t) c * (K / 32),
+    gp100_mmvq_kq_impl<type, R, GLU, GS>(vW + off, GLU ? vG + off : nullptr, y + (int64_t) c * K, ys + (int64_t) c * (K / 32),
                                      dst + e * stride_dst, nrows, nsb, stride_row);
 }
 
@@ -1459,8 +1478,17 @@ static void gp100_launch_id(const ggml_tensor * src0, const void * G, const half
             src0->ne[0] / QK_K, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
     } else {
         GGML_UNUSED(s16);
-        gp100_mmvq_kq_id<type, R, GLU><<<grid, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, dst, ids, nrows,
-            src0->ne[0] / QK_K, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        // short K: 2 row sets per warp (GGML_CUDA_HYBRID_ID_GS=4 turns it off)
+        static const bool gs_off = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_GS"); return e && e[0] == '4'; }();
+        const int nsb = src0->ne[0] / QK_K;
+        if (nsb <= 2 && !gs_off) {
+            const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
+            gp100_mmvq_kq_id<type, R, GLU, 2><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, dst, ids, nrows,
+                nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        } else {
+            gp100_mmvq_kq_id<type, R, GLU, 4><<<grid, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, dst, ids, nrows,
+                nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        }
     }
 }
 
