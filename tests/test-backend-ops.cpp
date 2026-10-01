@@ -11315,6 +11315,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
 
+    // Hybrid sm_60 matvec (qr0n's fp16 path, mmvq-gp100.cu): the routed types at small-row and large-row launch shapes,
+    // single token and the speculative-verify widths
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{24, 5120}, {32, 256}, {64, 768}, {512, 1280}, {2048, 1024}, {3072, 2304}}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+        for (int64_t ncols = 2; ncols <= 8; ncols++) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, ncols, 1280, {1, 1}, {1, 1}));
+        }
+    }
+
     // q6_K matvec at the model's shapes and the speculative-verify widths. The m=16 cases elsewhere
     // take the small-rows path on Pascal and never reach the multi-column kernel. 4360 rows leaves a
     // partial block, 17408 is the down projection's K.
