@@ -12160,6 +12160,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, ncols, 1280, {1, 1}, {1, 1}));
         }
     }
+    // ... and its MoE form (MUL_MAT_ID, one token): qwen35moe ffn_up/ffn_gate (shared input) and ffn_down (one column per
+    // expert), a partial row block, a large-magnitude input, plus the fused gate/up/SWIGLU form (GGML_CUDA_HYBRID_GLU=1)
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, b, 512, 1, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, b, 2048, 1, 512));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 6, b, 40, 1, 768));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, b, 256, 1, 1024, 1e5f));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 32, 8, b, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 40, 768, true, 16, 6, b, false, true, false, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, false, 1, 1, false, false, true, false, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 3072, 2304, false, 1, 1, false, false, true, false, {1, 1}));
+    }
 
     // q6_K matvec at the model's shapes and the speculative-verify widths. The m=16 cases elsewhere
     // take the small-rows path on Pascal and never reach the multi-column kernel. 4360 rows leaves a
@@ -12547,6 +12561,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // qwen35moe experts at one token (256 experts, 8 used): ffn_up/ffn_gate 2048 -> 512 (shared input), ffn_down 512 -> 2048
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, true,  512,  1, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, 1, 512));
+    }
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 256, 8, true, false, true, false, {1, 1}));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
