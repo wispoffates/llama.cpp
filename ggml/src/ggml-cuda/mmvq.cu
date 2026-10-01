@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-f16.cuh"
+#include "mmvq-gp100.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1678,6 +1679,22 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// Hybrid sm_60 matvec (2026-10-01): qr0n's fp16 kernels (mmvq-gp100.cu) where they beat ours on the P100, ours elsewhere.
+// Measured 4096x14336 (plan doc §17): Q4_K/Q5_K ~2x faster at every width 1..8; Q8_0 -21 % at 1 column (slower at 2+);
+// ours wins Q6_K, Q4_0, Q5_0/Q5_1 and every multi-column Q8_0. GGML_CUDA_HYBRID_MMVQ=0 disables it (A/B).
+static bool ggml_cuda_hybrid_mmvq_take(const ggml_tensor * src0, const ggml_tensor * src1) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HYBRID_MMVQ"); return !e || e[0] != '0'; }();
+    if (!enabled) {
+        return false;
+    }
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: return true;
+        case GGML_TYPE_Q8_0: return src1->ne[1] == 1;
+        default:             return false;
+    }
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1688,6 +1705,12 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_TENSOR_BINARY_OP_LOCALS;
 
     cudaStream_t stream = ctx.stream();
+
+    if (!ids && !fusion && ggml_cuda_hybrid_mmvq_take(src0, src1) &&
+            ggml_cuda_gp100_mmvq_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion)) {
+        ggml_cuda_gp100_mmvq(ctx, src0, src1, dst, fusion);
+        return;
+    }
 
     const size_t ts_src0 = ggml_type_size(src0->type);
     const size_t ts_src1 = ggml_type_size(src1->type);
