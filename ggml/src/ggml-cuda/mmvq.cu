@@ -1648,9 +1648,26 @@ static void mul_mat_vec_q_switch_type(
 // Hybrid sm_60 matvec (2026-10-01): qr0n's fp16 kernels (mmvq-gp100.cu) where they beat ours on the P100, ours elsewhere.
 // Measured 4096x14336 (plan doc §17): Q4_K/Q5_K ~2x faster at every width 1..8; Q8_0 -21 % at 1 column (slower at 2+);
 // ours wins Q6_K, Q4_0, Q5_0/Q5_1 and every multi-column Q8_0. GGML_CUDA_HYBRID_MMVQ=0 disables it (A/B).
-static bool ggml_cuda_hybrid_mmvq_take(const ggml_tensor * src0, const ggml_tensor * src1) {
+// MoE experts (MUL_MAT_ID, one token) take it for Q4_K/Q5_K too; GGML_CUDA_HYBRID_MMVQ_ID=0 disables just that.
+// GGML_CUDA_HYBRID_GLU=1: let gate/up/SWIGLU fuse on Pascal for Q4_K/Q5_K (upstream turns MMVQ fusion off for Pascal; qr0n's
+// kernels have a fused form). Opt-in until measured.
+bool ggml_cuda_hybrid_glu_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HYBRID_GLU"); return e && e[0] == '1'; }();
+    return enabled;
+}
+
+bool ggml_cuda_hybrid_mmvq_enabled() {
     static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HYBRID_MMVQ"); return !e || e[0] != '0'; }();
-    if (!enabled) {
+    return enabled;
+}
+
+static bool ggml_cuda_hybrid_mmvq_id_enabled() {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HYBRID_MMVQ_ID"); return !e || e[0] != '0'; }();
+    return enabled && ggml_cuda_hybrid_mmvq_enabled();
+}
+
+static bool ggml_cuda_hybrid_mmvq_take(const ggml_tensor * src0, const ggml_tensor * src1) {
+    if (!ggml_cuda_hybrid_mmvq_enabled()) {
         return false;
     }
     switch (src0->type) {
@@ -1672,7 +1689,13 @@ void ggml_cuda_mul_mat_vec_q(
 
     cudaStream_t stream = ctx.stream();
 
-    if (!ids && !fusion && ggml_cuda_hybrid_mmvq_take(src0, src1) &&
+    if (ids) {
+        if (ggml_cuda_hybrid_mmvq_id_enabled() &&
+                ggml_cuda_gp100_mmvq_id_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion)) {
+            ggml_cuda_gp100_mmvq_id(ctx, src0, src1, ids, dst, fusion);
+            return;
+        }
+    } else if ((!fusion || ggml_cuda_hybrid_glu_enabled()) && ggml_cuda_hybrid_mmvq_take(src0, src1) &&
             ggml_cuda_gp100_mmvq_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion)) {
         ggml_cuda_gp100_mmvq(ctx, src0, src1, dst, fusion);
         return;
