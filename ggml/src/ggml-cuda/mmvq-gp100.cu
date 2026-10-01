@@ -137,20 +137,23 @@ template <ggml_type type> struct gp100_kq;
 template <> struct gp100_kq<GGML_TYPE_Q4_K> { typedef block_q4_K block; static constexpr int qs_u4 = 1; static constexpr bool has_qh = false; };
 template <> struct gp100_kq<GGML_TYPE_Q5_K> { typedef block_q5_K block; static constexpr int qs_u4 = 3; static constexpr bool has_qh = true;  };
 
-template <ggml_type type, int R, bool GLU>
-static __global__ void __launch_bounds__(128) gp100_mmvq_kq(
-        const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
+// The body is a device function so the MUL_MAT_ID kernel below can run it on one expert's matrices.
+// GS = groups of 8 lanes per row set (4: the whole warp walks K for R rows). For short K (MoE ffn_down: K = 512 = 2
+// super-blocks) groups 2 and 3 would idle, so GS = 2 gives the warp two row sets of R rows, each walked by 16 lanes.
+template <ggml_type type, int R, bool GLU, int GS = 4>
+static __device__ __forceinline__ void gp100_mmvq_kq_impl(
+        const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys,
         float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
 #if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+    static_assert(GS == 4 || GS == 2 || GS == 1, "GS must divide 4");
     constexpr int RT = GLU ? 2*R : R; // with GLU: R rows of ffn_up, then the same R rows of ffn_gate
-    GGML_UNUSED(s16);
     typedef typename gp100_kq<type>::block block;
     constexpr int U4_PER_BLOCK = sizeof(block) / sizeof(uint4); // q4_K 9, q5_K 11
     static_assert(sizeof(block) % sizeof(uint4) == 0, "block must be a whole number of uint4");
 
     const int lane = threadIdx.x % WARP_SIZE;
-    const int row0 = (blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE) * R;
-    const int g  = lane / 8;
+    const int row0 = ((blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE) * (4 / GS) + (GS == 4 ? 0 : lane / (8 * GS))) * R;
+    const int g  = GS == 4 ? lane / 8 : (lane / 8) % GS;
     const int t  = lane % 8;
     const int jj = t / 2;
     const int hf = t % 2;
@@ -178,7 +181,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_kq(
         sum[r] = 0.0f;
     }
 
-    for (int sb = g; sb < nsb; sb += 4) {
+    for (int sb = g; sb < nsb; sb += GS) {
         uint4 hd[RT], qh[RT], qs[RT];
 #pragma unroll
         for (int r = 0; r < RT; r++) {
@@ -231,11 +234,51 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_kq(
         }
     }
 
-    gp100_store<R, GLU>(sum, dst, row0, nrows, lane);
+    if constexpr (GS == 4) {
+        gp100_store<R, GLU>(sum, dst, row0, nrows, lane);
+    } else { // reduce within each row set's 8*GS lanes
+#pragma unroll
+        for (int r = 0; r < RT; r++) {
+#pragma unroll
+            for (int o = 4 * GS; o > 0; o >>= 1) {
+                sum[r] += __shfl_xor_sync(0xFFFFFFFF, sum[r], o);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (lane % (8 * GS) == 0 && row0 + r < nrows) {
+                dst[row0 + r] = GLU ? ggml_cuda_op_silu_single(sum[R + r]) * sum[r] : sum[r];
+            }
+        }
+    }
 #else
-    GGML_UNUSED_VARS(vW, vG, y, ys, s16, dst, nrows, nsb, stride_row);
+    GGML_UNUSED_VARS(vW, vG, y, ys, dst, nrows, nsb, stride_row);
     NO_DEVICE_CODE;
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
+template <ggml_type type, int R, bool GLU>
+static __global__ void __launch_bounds__(128) gp100_mmvq_kq(
+        const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
+        float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
+    GGML_UNUSED(s16);
+    gp100_mmvq_kq_impl<type, R, GLU>(vW, vG, y, ys, dst, nrows, nsb, stride_row);
+}
+
+// MUL_MAT_ID, one token: blockIdx.y is the expert slot. Slot e multiplies expert ids[e] (src0 plane, nb02 bytes apart)
+// with activation column e % ncols_y (1 = the same input for every expert, as for ffn_up/ffn_gate) and writes dst
+// column e. Same weight path as the dense kernel, so an expert matrix costs what a dense matrix of its size does.
+template <ggml_type type, int R, bool GLU, int GS>
+static __global__ void __launch_bounds__(128) gp100_mmvq_kq_id(
+        const char * __restrict__ vW, const char * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys,
+        float * __restrict__ dst, const int32_t * __restrict__ ids, const int nrows, const int nsb, const int stride_row,
+        const int64_t nb02, const int ncols_y, const int64_t stride_dst) {
+    const int     e   = blockIdx.y;
+    const int64_t off = (int64_t) ids[e] * nb02;
+    const int     c   = e % ncols_y;
+    const int     K   = nsb * QK_K;
+    gp100_mmvq_kq_impl<type, R, GLU, GS>(vW + off, GLU ? vG + off : nullptr, y + (int64_t) c * K, ys + (int64_t) c * (K / 32),
+                                     dst + e * stride_dst, nrows, nsb, stride_row);
 }
 
 // Q4_K/Q5_K with 2..8 columns (speculative-decoding verification, small batches). Same weight path as the
@@ -546,7 +589,7 @@ static __device__ __forceinline__ float gp100_s8_f(const uint32_t w, const int s
 // i.e. 8 weights of each of 4 sixteen-wide sub-blocks. q (0..63) is used as a subnormal half; the -32
 // offset is removed in fp32 with the per-16 sums, once per sub-block by the even thread of each pair.
 template <int R, bool GLU>
-static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K(
+static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
         const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
         float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
 #if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
@@ -674,6 +717,27 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K(
     GGML_UNUSED_VARS(vW, vG, y, ys, s16, dst, nrows, nsb, stride_row);
     NO_DEVICE_CODE;
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
+}
+
+template <int R, bool GLU>
+static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K(
+        const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
+        float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
+    gp100_mmvq_q6_K_impl<R, GLU>(vW, vG, y, ys, s16, dst, nrows, nsb, stride_row);
+}
+
+// MUL_MAT_ID form of gp100_mmvq_q6_K (see gp100_mmvq_kq_id)
+template <int R, bool GLU>
+static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_id(
+        const char * __restrict__ vW, const char * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys,
+        const float * __restrict__ s16, float * __restrict__ dst, const int32_t * __restrict__ ids, const int nrows, const int nsb,
+        const int stride_row, const int64_t nb02, const int ncols_y, const int64_t stride_dst) {
+    const int     e   = blockIdx.y;
+    const int64_t off = (int64_t) ids[e] * nb02;
+    const int     c   = e % ncols_y;
+    const int     K   = nsb * QK_K;
+    gp100_mmvq_q6_K_impl<R, GLU>(vW + off, GLU ? vG + off : nullptr, y + (int64_t) c * K, ys + (int64_t) c * (K / 32),
+                                 s16 + (int64_t) c * (K / 16), dst + e * stride_dst, nrows, nsb, stride_row);
 }
 
 // Q6_K with 2..8 columns: same staging and unpack as gp100_mmvq_q6_K, one accumulator set per column.
@@ -1326,15 +1390,11 @@ static bool gp100_cache_enabled() {
     return !no_cache;
 }
 
-void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
-                          const ggml_cuda_mm_fusion_args_host * fusion) {
+// fp16 activations of src1's first ncols columns (K each), from the cache when the previous matmul already made them
+static char * gp100_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int64_t K, const int ncols,
+                         ggml_cuda_pool_alloc<char> & tmp) {
     cudaStream_t stream = ctx.stream();
-    const int64_t K     = src0->ne[0];
-    const int64_t nrows = src0->ne[1];
-    const int     ncols = src1->ne[1];
-    const int     nb32  = K / 32;
-
-    ggml_cuda_pool_alloc<char> tmp(ctx.pool());
+    const int    nb32   = K / 32;
     char * base;
     bool   hit = false;
     if (gp100_cache_enabled() && K * ncols <= GP100_ACT_CACHE_MAX_K) {
@@ -1345,13 +1405,26 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     } else {
         base = tmp.alloc(GP100_ACT_BYTES);
     }
+    if (!hit) {
+        const int nblk = nb32 * ncols;
+        gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, (half *) base, (float2 *) (base + GP100_OFF_YS),
+                                                           (float *) (base + GP100_OFF_S16), nblk, nb32, src1->nb[1] / sizeof(float));
+    }
+    return base;
+}
+
+void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+                          const ggml_cuda_mm_fusion_args_host * fusion) {
+    cudaStream_t stream = ctx.stream();
+    const int64_t K     = src0->ne[0];
+    const int64_t nrows = src0->ne[1];
+    const int     ncols = src1->ne[1];
+
+    ggml_cuda_pool_alloc<char> tmp(ctx.pool());
+    char * base = gp100_prep(ctx, src1, K, ncols, tmp);
     half   * y   = (half   *) base;
     float2 * ys  = (float2 *) (base + GP100_OFF_YS);
     float  * s16 = (float  *) (base + GP100_OFF_S16);
-    if (!hit) {
-        const int nblk = nb32 * ncols;
-        gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, y, ys, s16, nblk, nb32, src1->nb[1] / sizeof(float));
-    }
 
     const int nsb        = K / QK_K;
     const int stride_row = src0->nb[1] / ggml_type_size(src0->type);
@@ -1361,6 +1434,118 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         gp100_dispatch<true >(src0->type, src0->data, fusion->gate->data, y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, stream);
     } else {
         gp100_dispatch<false>(src0->type, src0->data, nullptr,            y, ys, s16, (float *) dst->data, nrows, nsb, stride_row, stream);
+    }
+}
+
+bool ggml_cuda_gp100_mmvq_id_supported(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                                       const ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    if (cc != GGML_CUDA_CC_PASCAL || GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_MTHREADS(cc) || !ids) {
+        return false;
+    }
+    static const bool disabled = getenv("GGML_CUDA_GP100_MMVQ_DISABLE") != nullptr;
+    // Q6_K only for short K: 8 of 256 experts, one token, us/run ours -> this: 512x2048 (ffn_down) 41.6 -> 35.5,
+    // 2048x512 (ffn_up/gate) 22.4 -> 26.2. GGML_CUDA_HYBRID_ID_Q6K=0 keeps every Q6_K expert on ours.
+    static const bool q6k = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_Q6K"); return !e || e[0] != '0'; }();
+    const bool q6k_take = q6k && src0->type == GGML_TYPE_Q6_K && src0->ne[0] <= 1024;
+    if (disabled || (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && !q6k_take)) {
+        return false;
+    }
+    if (fusion) { // only the plain gate/up/SWIGLU fusion: no biases, no scales
+        if (!fusion->gate || fusion->x_bias || fusion->gate_bias || fusion->x_scale || fusion->gate_scale ||
+            fusion->glu_op != GGML_GLU_OP_SWIGLU || fusion->gate->type != src0->type ||
+            fusion->gate->nb[1] != src0->nb[1] || fusion->gate->nb[2] != src0->nb[2] || (uintptr_t) fusion->gate->data % 16 != 0) {
+            return false;
+        }
+    }
+    // one token (dst [rows, n_used, 1]); activation columns: 1 shared by all experts, or one per expert slot
+    const int64_t n_used = ids->ne[0];
+    return dst->ne[2] == 1 && dst->ne[3] == 1 && dst->ne[1] == n_used && n_used <= 65535 && ids->ne[1] >= 1 &&
+           src0->ne[0] * src1->ne[1] <= GP100_ACT_CACHE_MAX_K &&
+           ids->nb[0] == sizeof(int32_t) && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           (src1->ne[1] == 1 || src1->ne[1] == n_used) && src1->nb[0] == sizeof(float) &&
+           dst->nb[0] == sizeof(float) && src0->ne[3] == 1 && src0->ne[0] % QK_K == 0 &&
+           (src0->nb[1] % 16 == 0 || src0->type == GGML_TYPE_Q6_K) && src0->nb[1] % 2 == 0 && src0->nb[2] % 16 == 0 &&
+           (uintptr_t) src0->data % 16 == 0; // Q6_K rows are staged, so only 2-byte aligned rows are needed
+}
+
+template <ggml_type type, int R, bool GLU>
+static void gp100_launch_id(const ggml_tensor * src0, const void * G, const half * y, const float2 * ys, const float * s16, float * dst,
+                            const int32_t * ids, const int n_used, const int ncols_y, const int64_t stride_dst, cudaStream_t stream) {
+    const int nrows = src0->ne[1];
+    const dim3 grid((nrows + 4*R - 1) / (4*R), n_used);
+    if constexpr (type == GGML_TYPE_Q6_K) {
+        gp100_mmvq_q6_K_id<R, GLU><<<grid, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids, nrows,
+            src0->ne[0] / QK_K, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+    } else {
+        GGML_UNUSED(s16);
+        // short K: 2 row sets per warp (GGML_CUDA_HYBRID_ID_GS=4 turns it off)
+        static const bool gs_off = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_GS"); return e && e[0] == '4'; }();
+        const int nsb = src0->ne[0] / QK_K;
+        if (nsb <= 2 && !gs_off) {
+            const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
+            gp100_mmvq_kq_id<type, R, GLU, 2><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, dst, ids, nrows,
+                nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        } else {
+            gp100_mmvq_kq_id<type, R, GLU, 4><<<grid, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, dst, ids, nrows,
+                nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        }
+    }
+}
+
+template <ggml_type type, bool GLU>
+static void gp100_dispatch_id(const ggml_tensor * src0, const void * G, const half * y, const float2 * ys, const float * s16, float * dst,
+                              const int32_t * ids, const int n_used, const int ncols_y, const int64_t stride_dst, cudaStream_t stream) {
+    // same rows-per-warp choice as the dense kernel (expert matrices are small: qwen35moe 512 / 2048 rows)
+    const int nrows = src0->ne[1];
+    int R = gp100_rows_override(nrows, GLU);
+    if (type == GGML_TYPE_Q6_K) {
+        R = R == 0 ? (GLU ? 2 : 4) : std::min(R, GLU ? 2 : 4); // shared staging
+    } else if (R == 0) {
+        R = nrows < 2048 ? (GLU ? 1 : 2) : (GLU ? 4 : 8);
+    }
+    switch (R) {
+        case 1:  gp100_launch_id<type, 1, GLU>(src0, G, y, ys, s16, dst, ids, n_used, ncols_y, stride_dst, stream); break;
+        case 2:  gp100_launch_id<type, 2, GLU>(src0, G, y, ys, s16, dst, ids, n_used, ncols_y, stride_dst, stream); break;
+        case 4:  gp100_launch_id<type, 4, GLU>(src0, G, y, ys, s16, dst, ids, n_used, ncols_y, stride_dst, stream); break;
+        default:
+            if constexpr (type != GGML_TYPE_Q6_K) {
+                gp100_launch_id<type, 8, GLU>(src0, G, y, ys, s16, dst, ids, n_used, ncols_y, stride_dst, stream);
+            }
+            break;
+    }
+}
+
+void ggml_cuda_gp100_mmvq_id(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+                             ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion) {
+    cudaStream_t stream = ctx.stream();
+    const int64_t K       = src0->ne[0];
+    const int     ncols_y = src1->ne[1];
+    const int     n_used  = ids->ne[0];
+
+    ggml_cuda_pool_alloc<char> tmp(ctx.pool());
+    char * base = gp100_prep(ctx, src1, K, ncols_y, tmp);
+    const half   * y   = (const half   *) base;
+    const float2 * ys  = (const float2 *) (base + GP100_OFF_YS);
+    const float  * s16 = (const float  *) (base + GP100_OFF_S16);
+
+    const int32_t * ids_d      = (const int32_t *) ids->data;
+    float         * dst_d      = (float *) dst->data;
+    const int64_t   stride_dst = dst->nb[1] / sizeof(float);
+    const void    * G          = fusion ? fusion->gate->data : nullptr;
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:
+            if (fusion) { gp100_dispatch_id<GGML_TYPE_Q4_K, true >(src0, G, y, ys, s16, dst_d, ids_d, n_used, ncols_y, stride_dst, stream); }
+            else        { gp100_dispatch_id<GGML_TYPE_Q4_K, false>(src0, G, y, ys, s16, dst_d, ids_d, n_used, ncols_y, stride_dst, stream); }
+            break;
+        case GGML_TYPE_Q5_K:
+            if (fusion) { gp100_dispatch_id<GGML_TYPE_Q5_K, true >(src0, G, y, ys, s16, dst_d, ids_d, n_used, ncols_y, stride_dst, stream); }
+            else        { gp100_dispatch_id<GGML_TYPE_Q5_K, false>(src0, G, y, ys, s16, dst_d, ids_d, n_used, ncols_y, stride_dst, stream); }
+            break;
+        case GGML_TYPE_Q6_K:
+            if (fusion) { gp100_dispatch_id<GGML_TYPE_Q6_K, true >(src0, G, y, ys, s16, dst_d, ids_d, n_used, ncols_y, stride_dst, stream); }
+            else        { gp100_dispatch_id<GGML_TYPE_Q6_K, false>(src0, G, y, ys, s16, dst_d, ids_d, n_used, ncols_y, stride_dst, stream); }
+            break;
+        default: GGML_ABORT("unsupported type for the GP100 MUL_MAT_ID path");
     }
 }
 
