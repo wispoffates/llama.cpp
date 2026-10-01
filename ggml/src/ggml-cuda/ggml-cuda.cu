@@ -4847,6 +4847,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->graph_epoch++;
 
     // Node pointers are reused across evaluations with fresh data, so the cached quantized
     // activation is only valid within a single graph evaluation.

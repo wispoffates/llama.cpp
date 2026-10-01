@@ -1473,6 +1473,10 @@ struct ggml_cuda_stream_context {
 };
 
 struct ggml_backend_cuda_context {
+    // advanced on every graph_compute: lets the GP100 fp16 MMVQ path (mmvq-gp100.cu, from qr0n/p100-llama-cpp 0007)
+    // reuse an activation conversion only within one graph evaluation
+    uint64_t graph_epoch = 0;
+
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
