@@ -1498,7 +1498,8 @@ bool ggml_cuda_gp100_mmvq_id_supported(const int cc, const ggml_tensor * src0, c
     // Q6_K only for short K: 8 of 256 experts, one token, us/run ours -> this: 512x2048 (ffn_down) 41.6 -> 35.5,
     // 2048x512 (ffn_up/gate) 22.4 -> 26.2. GGML_CUDA_HYBRID_ID_Q6K=0 keeps every Q6_K expert on ours.
     static const bool q6k = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_Q6K"); return !e || e[0] != '0'; }();
-    const bool q6k_take = q6k && src0->type == GGML_TYPE_Q6_K && src0->ne[0] <= 1024;
+    static const bool q6k_all = [] { const char * e = getenv("GGML_CUDA_HYBRID_Q6K_DIRECT"); return e && e[0] == '2'; }(); // EXPERIMENT
+    const bool q6k_take = q6k && src0->type == GGML_TYPE_Q6_K && (src0->ne[0] <= 1024 || q6k_all);
     if (disabled || (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && !q6k_take)) {
         return false;
     }
@@ -1529,8 +1530,12 @@ static void gp100_launch_id(const ggml_tensor * src0, const void * G, const half
     static const bool gs_off = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_GS"); return e && e[0] == '4'; }();
     const int nsb = src0->ne[0] / QK_K;
     if constexpr (type == GGML_TYPE_Q6_K) {
-        static const bool direct = [] { const char * e = getenv("GGML_CUDA_HYBRID_Q6K_DIRECT"); return e && e[0] == '1'; }();
-        if (nsb <= 2 && !gs_off && direct) {
+        static const bool direct = [] { const char * e = getenv("GGML_CUDA_HYBRID_Q6K_DIRECT"); return e && (e[0] == '1' || e[0] == '2'); }();
+        static const bool direct4 = [] { const char * e = getenv("GGML_CUDA_HYBRID_Q6K_DIRECT"); return e && e[0] == '2'; }(); // EXPERIMENT
+        if (nsb > 2 && direct4) {
+            gp100_mmvq_q6_K_id<R, GLU, 4, true><<<grid, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
+                nrows, nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        } else if (nsb <= 2 && !gs_off && direct) {
             const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
             gp100_mmvq_q6_K_id<R, GLU, 2, true><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
                 nrows, nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
