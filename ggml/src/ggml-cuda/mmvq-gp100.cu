@@ -1529,14 +1529,11 @@ static void gp100_launch_id(const ggml_tensor * src0, const void * G, const half
     static const bool gs_off = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_GS"); return e && e[0] == '4'; }();
     const int nsb = src0->ne[0] / QK_K;
     if constexpr (type == GGML_TYPE_Q6_K) {
-        static const bool direct = [] { const char * e = getenv("GGML_CUDA_HYBRID_Q6K_DIRECT"); return e && e[0] == '1'; }();
-        if (nsb <= 2 && !gs_off && direct) {
+        // short K (ffn_down, 8 of 256 experts, us): staged 4 groups 36.0 -> staged 2 row sets 29.2 -> unstaged 2 row sets 25.4.
+        // Unstaged loses at long K (2048: 23.6 vs 22.5 staged), so the staged kernel keeps that case.
+        if (nsb <= 2 && !gs_off) {
             const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
             gp100_mmvq_q6_K_id<R, GLU, 2, true><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
-                nrows, nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
-        } else if (nsb <= 2 && !gs_off) {
-            const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
-            gp100_mmvq_q6_K_id<R, GLU, 2><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
                 nrows, nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
         } else {
             gp100_mmvq_q6_K_id<R, GLU, 4><<<grid, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
