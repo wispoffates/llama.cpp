@@ -1949,6 +1949,11 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
         return false;
     }
+    // Pascal: the hybrid sm_60 matvec has no shared-expert slot, and its re-enabled gate/up fusion would otherwise let
+    // this match through (e.g. Ornith: routed and shared experts both Q5_K 2048x512). Routed and shared run separately.
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == GGML_CUDA_CC_PASCAL) {
+        return false;
+    }
     const int nodes[] = { routed_idx, routed_idx + 1, routed_idx + 2, shared_idx, shared_idx + 1, shared_idx + 2 };
     const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
                            GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
