@@ -1502,8 +1502,8 @@ bool ggml_cuda_gp100_mmvq_id_supported(const int cc, const ggml_tensor * src0, c
     if (disabled || (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && !q6k_take)) {
         return false;
     }
-    if (fusion) { // only the plain gate/up/SWIGLU fusion: no biases, no scales
-        if (!fusion->gate || fusion->x_bias || fusion->gate_bias || fusion->x_scale || fusion->gate_scale ||
+    if (fusion) { // only the plain gate/up/SWIGLU fusion: no biases, no scales, no fused shared expert (#29184)
+        if (!fusion->gate || fusion->shared_up || fusion->x_bias || fusion->gate_bias || fusion->x_scale || fusion->gate_scale ||
             fusion->glu_op != GGML_GLU_OP_SWIGLU || fusion->gate->type != src0->type ||
             fusion->gate->nb[1] != src0->nb[1] || fusion->gate->nb[2] != src0->nb[2] || (uintptr_t) fusion->gate->data % 16 != 0) {
             return false;
