@@ -590,7 +590,8 @@ static __device__ __forceinline__ float gp100_s8_f(const uint32_t w, const int s
 // offset is removed in fp32 with the per-16 sums, once per sub-block by the even thread of each pair.
 // GS as in gp100_mmvq_kq_impl: GS = 2 splits the warp into two row sets of R rows (16 lanes, 2 super-blocks per iteration
 // each), so short-K experts (ffn_down, K = 512 = 2 super-blocks) keep all 32 lanes busy. Each set stages its own rows.
-template <int R, bool GLU, int GS = 4>
+// DIRECT: no staging; every lane reads its 34 bytes of the block straight from global memory with 4-byte loads.
+template <int R, bool GLU, int GS = 4, bool DIRECT = false>
 static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
         const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
         float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
@@ -600,7 +601,7 @@ static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
     constexpr int NSET = 4 / GS;        // row sets per warp
     constexpr int NS   = NSET * RT;     // staged rows per warp
     constexpr int STAGE_U4 = GS == 4 ? 56 : 29; // >= (15 + GS*210 + 15) / 16
-    __shared__ uint4 stage[4][NS][STAGE_U4];
+    __shared__ uint4 stage[DIRECT ? 1 : 4][DIRECT ? 1 : NS][DIRECT ? 1 : STAGE_U4];
 
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
@@ -618,7 +619,7 @@ static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
     const uint4 * gp[NS];
     int mis[NS];
 #pragma unroll
-    for (int k = 0; k < NS; k++) {
+    for (int k = 0; k < (DIRECT ? 0 : NS); k++) {
         const int r = k % RT;
         const uintptr_t a = (uintptr_t) ((const block_q6_K *) ((GLU && r >= R) ? vG : vW) +
                                          (int64_t) min(rowb + (k / RT) * R + r % R, nrows - 1) * stride_row);
@@ -640,6 +641,7 @@ static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
 
         int m[NS];
         uint4 v0[NS], v1[NS];
+        if constexpr (!DIRECT) {
 #pragma unroll
         for (int k = 0; k < NS; k++) {
             const int off = mis[k] + 210 * GS * it;
@@ -664,6 +666,7 @@ static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
             }
         }
         __syncwarp();
+        }
 
         const uint4 zero4 = make_uint4(0, 0, 0, 0);
         const uint4 * yp = (const uint4 *) (y + sb * 256 + 128 * n + 8 * c);
@@ -677,19 +680,35 @@ static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
 
 #pragma unroll
         for (int r = 0; r < RT; r++) {
-            const int        ks  = set * RT + r;
-            const uint8_t  * bb  = (const uint8_t *) &stage[warp][ks][0] + m[ks] + 210 * g; // this group's block
+            const uint8_t * bb;
+            if constexpr (DIRECT) { // blocks are 2-byte aligned; an idle group reads (and drops) the last block
+                bb = (const uint8_t *) ((const block_q6_K *) ((GLU && r >= R) ? vG : vW) +
+                                        (int64_t) min(row0 + r % R, nrows - 1) * stride_row + min(sb, nsb - 1));
+            } else {
+                const int ks = set * RT + r;
+                bb = (const uint8_t *) &stage[warp][ks][0] + m[ks] + 210 * g; // this group's block
+            }
             const uint32_t * w   = (const uint32_t *) ((uintptr_t) bb & ~(uintptr_t) 3);
             const uint32_t   shf = ((uintptr_t) bb & 3) * 8;
             auto ld8 = [&](const int byteoff) {
                 const uint32_t * q = w + byteoff / 4;
-                return make_uint2(__funnelshift_r(q[0], q[1], shf), __funnelshift_r(q[1], q[2], shf));
+                if constexpr (DIRECT) { // the third word only when the block is not 4-byte aligned (never past the block)
+                    const uint32_t q0 = __ldg(q), q1 = __ldg(q + 1), q2 = shf ? __ldg(q + 2) : 0u;
+                    return make_uint2(__funnelshift_r(q0, q1, shf), __funnelshift_r(q1, q2, shf));
+                } else {
+                    return make_uint2(__funnelshift_r(q[0], q[1], shf), __funnelshift_r(q[1], q[2], shf));
+                }
             };
             const uint2    L0 = ld8(64 * n + 8 * c);
             const uint2    L1 = ld8(64 * n + 32 + 8 * c);
             const uint2    QH = ld8(128 + 32 * n + 8 * c);
             const uint2    SC = ld8(192 + 8 * n);
-            const uint32_t DW = __funnelshift_r(w[52], w[53], shf); // d at byte 208
+            uint32_t DW; // d at byte 208
+            if constexpr (DIRECT) {
+                DW = __ldg((const unsigned short *) (bb + 208));
+            } else {
+                DW = __funnelshift_r(w[52], w[53], shf);
+            }
 
             half2 acc[4];
 #pragma unroll
@@ -760,7 +779,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K(
 }
 
 // MUL_MAT_ID form of gp100_mmvq_q6_K (see gp100_mmvq_kq_id)
-template <int R, bool GLU, int GS>
+template <int R, bool GLU, int GS, bool DIRECT = false>
 static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_id(
         const char * __restrict__ vW, const char * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys,
         const float * __restrict__ s16, float * __restrict__ dst, const int32_t * __restrict__ ids, const int nrows, const int nsb,
@@ -769,7 +788,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_id(
     const int64_t off = (int64_t) ids[e] * nb02;
     const int     c   = e % ncols_y;
     const int     K   = nsb * QK_K;
-    gp100_mmvq_q6_K_impl<R, GLU, GS>(vW + off, GLU ? vG + off : nullptr, y + (int64_t) c * K, ys + (int64_t) c * (K / 32),
+    gp100_mmvq_q6_K_impl<R, GLU, GS, DIRECT>(vW + off, GLU ? vG + off : nullptr, y + (int64_t) c * K, ys + (int64_t) c * (K / 32),
                                  s16 + (int64_t) c * (K / 16), dst + e * stride_dst, nrows, nsb, stride_row);
 }
 
@@ -1510,7 +1529,12 @@ static void gp100_launch_id(const ggml_tensor * src0, const void * G, const half
     static const bool gs_off = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_GS"); return e && e[0] == '4'; }();
     const int nsb = src0->ne[0] / QK_K;
     if constexpr (type == GGML_TYPE_Q6_K) {
-        if (nsb <= 2 && !gs_off) {
+        static const bool direct = [] { const char * e = getenv("GGML_CUDA_HYBRID_Q6K_DIRECT"); return e && e[0] == '1'; }();
+        if (nsb <= 2 && !gs_off && direct) {
+            const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
+            gp100_mmvq_q6_K_id<R, GLU, 2, true><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
+                nrows, nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        } else if (nsb <= 2 && !gs_off) {
             const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
             gp100_mmvq_q6_K_id<R, GLU, 2><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
                 nrows, nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
