@@ -588,32 +588,42 @@ static __device__ __forceinline__ float gp100_s8_f(const uint32_t w, const int s
 // Thread t of a group owns half n = t/4 and positions l = 8*(t%4)..+7 of all four 32-runs of that half,
 // i.e. 8 weights of each of 4 sixteen-wide sub-blocks. q (0..63) is used as a subnormal half; the -32
 // offset is removed in fp32 with the per-16 sums, once per sub-block by the even thread of each pair.
-template <int R, bool GLU>
+// GS as in gp100_mmvq_kq_impl: GS = 2 splits the warp into two row sets of R rows (16 lanes, 2 super-blocks per iteration
+// each), so short-K experts (ffn_down, K = 512 = 2 super-blocks) keep all 32 lanes busy. Each set stages its own rows.
+template <int R, bool GLU, int GS = 4>
 static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
         const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
         float * __restrict__ dst, const int nrows, const int nsb, const int stride_row) {
 #if __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
-    constexpr int RT = GLU ? 2*R : R; // with GLU: R rows of ffn_up, then the same R rows of ffn_gate
-    constexpr int STAGE_U4 = 56; // >= (15 + 4*210 + 15) / 16
-    __shared__ uint4 stage[4][RT][STAGE_U4];
+    static_assert(GS == 4 || GS == 2, "GS must be 4 or 2");
+    constexpr int RT   = GLU ? 2*R : R; // with GLU: R rows of ffn_up, then the same R rows of ffn_gate
+    constexpr int NSET = 4 / GS;        // row sets per warp
+    constexpr int NS   = NSET * RT;     // staged rows per warp
+    constexpr int STAGE_U4 = GS == 4 ? 56 : 29; // >= (15 + GS*210 + 15) / 16
+    __shared__ uint4 stage[4][NS][STAGE_U4];
 
     const int lane = threadIdx.x % WARP_SIZE;
     const int warp = threadIdx.x / WARP_SIZE;
-    const int row0 = (blockIdx.x * 4 + warp) * R;
-    const int g = lane / 8;
+    const int set  = (lane / 8) / GS;
+    const int rowb = (blockIdx.x * 4 + warp) * NSET * R; // first row of the warp
+    const int row0 = rowb + set * R;                     // first row of this lane's set
+    const int g = (lane / 8) % GS;
     const int t = lane % 8;
     const int n = t / 4;
     const int c = t % 4;
     const int i0 = c / 2;
     const float offm = (c & 1) ? 0.0f : -32.0f;
 
-    const uint4 * gp[RT];
-    int mis[RT];
+    // staged row k = row k % RT of set k / RT: every lane helps stage every row of the warp
+    const uint4 * gp[NS];
+    int mis[NS];
 #pragma unroll
-    for (int r = 0; r < RT; r++) {
-        const uintptr_t a = (uintptr_t) ((const block_q6_K *) ((GLU && r >= R) ? vG : vW) + (int64_t) min(row0 + r % R, nrows - 1) * stride_row);
-        gp[r]  = (const uint4 *) (a & ~(uintptr_t) 15);
-        mis[r] = a & 15;
+    for (int k = 0; k < NS; k++) {
+        const int r = k % RT;
+        const uintptr_t a = (uintptr_t) ((const block_q6_K *) ((GLU && r >= R) ? vG : vW) +
+                                         (int64_t) min(rowb + (k / RT) * R + r % R, nrows - 1) * stride_row);
+        gp[k]  = (const uint4 *) (a & ~(uintptr_t) 15);
+        mis[k] = a & 15;
     }
 
     float sum[RT];
@@ -622,29 +632,35 @@ static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
         sum[r] = 0.0f;
     }
 
-    const int nit = (nsb + 3) / 4;
+    const int nit = (nsb + GS - 1) / GS;
     for (int it = 0; it < nit; it++) {
-        const int  sb   = 4 * it + g;
+        const int  sb   = GS * it + g;
         const bool act  = sb < nsb;
-        const int  nblk = min(nsb - 4 * it, 4);
+        const int  nblk = min(nsb - GS * it, GS);
 
-        int m[RT];
-        uint4 v0[RT], v1[RT];
+        int m[NS];
+        uint4 v0[NS], v1[NS];
 #pragma unroll
-        for (int r = 0; r < RT; r++) {
-            const int off = mis[r] + 840 * it;
-            const uint4 * src = gp[r] + (off >> 4);
-            m[r] = off & 15;
-            const int nu4 = (m[r] + 210 * nblk + 15) >> 4; // only the 16-byte chunks that hold these blocks
-            v0[r] = lane      < nu4 ? __ldg(src + lane)      : make_uint4(0, 0, 0, 0);
-            v1[r] = lane + 32 < nu4 ? __ldg(src + lane + 32) : make_uint4(0, 0, 0, 0);
+        for (int k = 0; k < NS; k++) {
+            const int off = mis[k] + 210 * GS * it;
+            const uint4 * src = gp[k] + (off >> 4);
+            m[k] = off & 15;
+            const int nu4 = (m[k] + 210 * nblk + 15) >> 4; // only the 16-byte chunks that hold these blocks
+            v0[k] = lane < nu4 ? __ldg(src + lane) : make_uint4(0, 0, 0, 0);
+            if constexpr (GS == 4) {
+                v1[k] = lane + 32 < nu4 ? __ldg(src + lane + 32) : make_uint4(0, 0, 0, 0);
+            }
         }
         __syncwarp();
 #pragma unroll
-        for (int r = 0; r < RT; r++) {
-            stage[warp][r][lane] = v0[r];
-            if (lane + 32 < STAGE_U4) {
-                stage[warp][r][lane + 32] = v1[r];
+        for (int k = 0; k < NS; k++) {
+            if (lane < STAGE_U4) {
+                stage[warp][k][lane] = v0[k];
+            }
+            if constexpr (GS == 4) {
+                if (lane + 32 < STAGE_U4) {
+                    stage[warp][k][lane + 32] = v1[k];
+                }
             }
         }
         __syncwarp();
@@ -661,7 +677,8 @@ static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
 
 #pragma unroll
         for (int r = 0; r < RT; r++) {
-            const uint8_t  * bb  = (const uint8_t *) &stage[warp][r][0] + m[r] + 210 * g; // this group's block
+            const int        ks  = set * RT + r;
+            const uint8_t  * bb  = (const uint8_t *) &stage[warp][ks][0] + m[ks] + 210 * g; // this group's block
             const uint32_t * w   = (const uint32_t *) ((uintptr_t) bb & ~(uintptr_t) 3);
             const uint32_t   shf = ((uintptr_t) bb & 3) * 8;
             auto ld8 = [&](const int byteoff) {
@@ -712,7 +729,23 @@ static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
         }
     }
 
-    gp100_store<R, GLU>(sum, dst, row0, nrows, lane);
+    if constexpr (GS == 4) {
+        gp100_store<R, GLU>(sum, dst, row0, nrows, lane);
+    } else { // reduce within each row set's 16 lanes
+#pragma unroll
+        for (int r = 0; r < RT; r++) {
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) {
+                sum[r] += __shfl_xor_sync(0xFFFFFFFF, sum[r], o);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            if (lane % 16 == 0 && row0 + r < nrows) {
+                dst[row0 + r] = GLU ? ggml_cuda_op_silu_single(sum[R + r]) * sum[r] : sum[r];
+            }
+        }
+    }
 #else
     GGML_UNUSED_VARS(vW, vG, y, ys, s16, dst, nrows, nsb, stride_row);
     NO_DEVICE_CODE;
@@ -727,7 +760,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K(
 }
 
 // MUL_MAT_ID form of gp100_mmvq_q6_K (see gp100_mmvq_kq_id)
-template <int R, bool GLU>
+template <int R, bool GLU, int GS>
 static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_id(
         const char * __restrict__ vW, const char * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys,
         const float * __restrict__ s16, float * __restrict__ dst, const int32_t * __restrict__ ids, const int nrows, const int nsb,
@@ -736,7 +769,7 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q6_K_id(
     const int64_t off = (int64_t) ids[e] * nb02;
     const int     c   = e % ncols_y;
     const int     K   = nsb * QK_K;
-    gp100_mmvq_q6_K_impl<R, GLU>(vW + off, GLU ? vG + off : nullptr, y + (int64_t) c * K, ys + (int64_t) c * (K / 32),
+    gp100_mmvq_q6_K_impl<R, GLU, GS>(vW + off, GLU ? vG + off : nullptr, y + (int64_t) c * K, ys + (int64_t) c * (K / 32),
                                  s16 + (int64_t) c * (K / 16), dst + e * stride_dst, nrows, nsb, stride_row);
 }
 
@@ -1473,14 +1506,20 @@ static void gp100_launch_id(const ggml_tensor * src0, const void * G, const half
                             const int32_t * ids, const int n_used, const int ncols_y, const int64_t stride_dst, cudaStream_t stream) {
     const int nrows = src0->ne[1];
     const dim3 grid((nrows + 4*R - 1) / (4*R), n_used);
+    // short K: 2 row sets per warp (GGML_CUDA_HYBRID_ID_GS=4 turns it off)
+    static const bool gs_off = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_GS"); return e && e[0] == '4'; }();
+    const int nsb = src0->ne[0] / QK_K;
     if constexpr (type == GGML_TYPE_Q6_K) {
-        gp100_mmvq_q6_K_id<R, GLU><<<grid, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids, nrows,
-            src0->ne[0] / QK_K, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        if (nsb <= 2 && !gs_off) {
+            const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
+            gp100_mmvq_q6_K_id<R, GLU, 2><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
+                nrows, nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        } else {
+            gp100_mmvq_q6_K_id<R, GLU, 4><<<grid, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, s16, dst, ids,
+                nrows, nsb, src0->nb[1] / ggml_type_size(type), src0->nb[2], ncols_y, stride_dst);
+        }
     } else {
         GGML_UNUSED(s16);
-        // short K: 2 row sets per warp (GGML_CUDA_HYBRID_ID_GS=4 turns it off)
-        static const bool gs_off = [] { const char * e = getenv("GGML_CUDA_HYBRID_ID_GS"); return e && e[0] == '4'; }();
-        const int nsb = src0->ne[0] / QK_K;
         if (nsb <= 2 && !gs_off) {
             const dim3 grid2((nrows + 8*R - 1) / (8*R), n_used);
             gp100_mmvq_kq_id<type, R, GLU, 2><<<grid2, 128, 0, stream>>>((const char *) src0->data, (const char *) G, y, ys, dst, ids, nrows,
