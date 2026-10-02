@@ -11743,6 +11743,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 32, 8, b, 2048, 1, 512));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 6, b, 40, 1, 768));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, b, 256, 1, 1024, 1e5f));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 6, b, 40, 1, 512));  // short K, partial row sets
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 6, b, 72, 1, 256));
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 32, 8, b, false, true, false, {1, 1}));
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 40, 768, true, 16, 6, b, false, true, false, {1, 1}));
         }
