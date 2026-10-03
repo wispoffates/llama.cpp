@@ -307,7 +307,8 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
 
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+    // LLAMA_PPL_PARSE_SPECIAL=1: tokenize chat-template markers as special tokens (chat-formatted KLD sets)
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, getenv("LLAMA_PPL_PARSE_SPECIAL") != nullptr);
 
     const int n_ctx = llama_n_ctx(ctx);
 
@@ -470,7 +471,8 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     auto tim1 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+    // LLAMA_PPL_PARSE_SPECIAL=1: tokenize chat-template markers as special tokens (chat-formatted KLD sets)
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, getenv("LLAMA_PPL_PARSE_SPECIAL") != nullptr);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
