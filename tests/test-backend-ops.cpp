@@ -13711,6 +13711,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 7, 1000));
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 256, 10000));
 
+    // MoE prefill: gemma4's experts (128 x 8 used, q4_0) per GPU under tensor split (ffn_gate_up 2816 -> 704 shared input, ffn_down
+    // 704 -> 1408 per slot) at ubatch 512 / 1536; qwen35moe's (256 x 8, q6_K / q8_0) at 512
+    for (int n : {512, 1536}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  704,  n, 2816));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 1408, n, 704));
+    }
+    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, true,  512,  512, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, 512, 512));
+    }
+
     // Pascal tile GEMM range (tile-mm.cu, 9..80 columns) at a 27B dense model's per-GPU shapes under tensor split:
     // ffn_gate/up 5120 -> 8704, ffn_down 8704 -> 5120, ssm_out / attn_output 6144 -> 5120; 65 = ngram-mod verify (64 + 1)
     for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
