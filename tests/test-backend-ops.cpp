@@ -11700,6 +11700,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // Pascal tile GEMM range (tile-mm.cu, 9..80 columns) at a 27B dense model's per-GPU shapes under tensor split:
+    // ffn_gate/up 5120 -> 8704, ffn_down 8704 -> 5120, ssm_out / attn_output 6144 -> 5120; 65 = ngram-mod verify (64 + 1)
+    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n : {16, 32, 64, 65, 80}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8704, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 8704, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
+        }
+    }
+
     // qwen35moe experts at one token (256 experts, 8 used): ffn_up/ffn_gate 2048 -> 512 (shared input), ffn_down 512 -> 2048
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, true,  512,  1, 2048));
