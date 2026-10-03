@@ -5,7 +5,7 @@
 #include <cstdio>
 
 // Quantized x f32 GEMM for 9..80 columns on Pascal (sm_60), fused: the weights are read once and decoded tile by tile in shared
-// memory instead of being dequantized to a full fp16 copy for cuBLAS. Types: q6_K, q8_0, q4_0. Also a grouped MUL_MAT_ID mode for
+// memory instead of being dequantized to a full fp16 copy for cuBLAS. Types: q6_K, q5_K, q4_K, q8_0, q4_0. Also a grouped MUL_MAT_ID mode for
 // MoE prefill (one launch over all experts, token lists sorted on the device by mm_ids_helper), in place of MMQ's emulated-DP4A
 // integer path on sm_60.
 //
@@ -43,6 +43,20 @@ template <> struct tile_mm_traits<GGML_TYPE_Q6_K> {
     static constexpr bool aligned = false;
     static constexpr bool flat    = false;  // per-warp row staging (rows are long)
 };
+template <> struct tile_mm_traits<GGML_TYPE_Q5_K> {
+    static constexpr int  UV      = QK_K;   // one superblock, 176 bytes per row: always 4-aligned
+    static constexpr int  RW      = 44;
+    static constexpr int  UB      = sizeof(block_q5_K);
+    static constexpr bool aligned = true;
+    static constexpr bool flat    = false;
+};
+template <> struct tile_mm_traits<GGML_TYPE_Q4_K> {
+    static constexpr int  UV      = QK_K;   // one superblock, 144 bytes per row: always 4-aligned
+    static constexpr int  RW      = 36;
+    static constexpr int  UB      = sizeof(block_q4_K);
+    static constexpr bool aligned = true;
+    static constexpr bool flat    = false;
+};
 template <> struct tile_mm_traits<GGML_TYPE_Q8_0> {
     static constexpr int  UV      = 4*QK8_0; // four blocks: 136 bytes per row, 4-aligned when the row holds an even number of blocks
     static constexpr int  RW      = 34;
@@ -78,6 +92,30 @@ static __device__ __forceinline__ half2 tile_mm_decode(const unsigned char * rb,
         const int q0 = ((qlw >> nsh) & 0xF) | (((qhw >> hsh) & 3) << 4);
         const int q1 = (((qlw >> 8) >> nsh) & 0xF) | ((((qhw >> 8) >> hsh) & 3) << 4);
         return __floats2half2_rn(d*(q0 - 32), d*(q1 - 32));
+    } else if constexpr (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_K) {
+        // sub-block s = 2st + j/16 (low nibbles for j < 16, high nibbles for j >= 16 of the step's 32 qs bytes), values 2*(j%16), +1;
+        // x = d*sc*q - dmin*m with the 6-bit scale / min of s unpacked as in get_scale_min_k4; q5_K adds bit s of qh as 16
+        constexpr int QS = type == GGML_TYPE_Q5_K ? 48 : 16;   // offset of qs (q5_K: qh at 16)
+        const int g = lane >> 4, s = 2*st + g, q = lane & 15;
+        const unsigned char * sc6 = rb + 4;
+        int sc, m;
+        if (s < 4) {
+            sc = sc6[s] & 63;
+            m  = sc6[s + 4] & 63;
+        } else {
+            sc = (sc6[s + 4] & 0xF) | ((sc6[s - 4] >> 6) << 4);
+            m  = (sc6[s + 4] >>  4) | ((sc6[s]     >> 6) << 4);
+        }
+        const float d    = __half2float(*(const __half *) (rb + 0))*1024.0f*sc;
+        const float dmin = __half2float(*(const __half *) (rb + 2))*1024.0f*m;
+        const uint32_t qlw = *(const unsigned short *) (rb + QS + 32*st + 2*q);
+        int q0 = (qlw >> (4*g)) & 0xF, q1 = (qlw >> (8 + 4*g)) & 0xF;
+        if constexpr (type == GGML_TYPE_Q5_K) {
+            const uint32_t qhw = *(const unsigned short *) (rb + 16 + 2*q);
+            q0 |= ((qhw >> s) & 1) << 4;
+            q1 |= ((qhw >> (8 + s)) & 1) << 4;
+        }
+        return __floats2half2_rn(d*q0 - dmin, d*q1 - dmin);
     } else if constexpr (type == GGML_TYPE_Q8_0) {
         // block 2st + j/16 of the unit, quants 2*(j%16), +1
         const unsigned char * b = rb + (2*st + (lane >> 4))*sizeof(block_q8_0);
@@ -382,6 +420,8 @@ template <bool ID>
 static void tile_mm_dispatch(const ggml_type type, const int tn, const tile_mm_params & prm, const int splits_or_tiles, cudaStream_t stream) {
     switch (type) {
         case GGML_TYPE_Q6_K: tile_mm_launch_tn<GGML_TYPE_Q6_K, ID>(tn, prm, splits_or_tiles, stream); break;
+        case GGML_TYPE_Q5_K: tile_mm_launch_tn<GGML_TYPE_Q5_K, ID>(tn, prm, splits_or_tiles, stream); break;
+        case GGML_TYPE_Q4_K: tile_mm_launch_tn<GGML_TYPE_Q4_K, ID>(tn, prm, splits_or_tiles, stream); break;
         case GGML_TYPE_Q8_0: tile_mm_launch_tn<GGML_TYPE_Q8_0, ID>(tn, prm, splits_or_tiles, stream); break;
         case GGML_TYPE_Q4_0: tile_mm_launch_tn<GGML_TYPE_Q4_0, ID>(tn, prm, splits_or_tiles, stream); break;
         default: GGML_ABORT("tile_mm: unsupported type");
@@ -390,11 +430,11 @@ static void tile_mm_dispatch(const ggml_type type, const int tn, const tile_mm_p
 
 // GGML_CUDA_TILE_STATS=1 (or the older GGML_CUDA_TILE_Q6K_STATS=1): histogram of the column counts of every q6_K / q8_0 matmul
 // offered to this hook (all widths > 8 on Pascal reach it), printed to stderr at exit. Diagnostics only.
-static std::atomic<uint64_t> tmm_hist[3][2][9];   // [type: q6_K, q8_0, q4_0][taken][bucket]
+static std::atomic<uint64_t> tmm_hist[5][2][9];   // [type: q6_K, q8_0, q4_0, q5_K, q4_K][taken][bucket]
 static const char * tmm_bucket_name[9] = {"9-16", "17-32", "33-48", "49-64", "65-80", "81-128", "129-256", "257-512", ">512"};
 static void tmm_stats_print() {
-    const char * tname[3] = {"q6_K", "q8_0", "q4_0"};
-    for (int ty = 0; ty < 3; ++ty) {
+    const char * tname[5] = {"q6_K", "q8_0", "q4_0", "q5_K", "q4_K"};
+    for (int ty = 0; ty < 5; ++ty) {
         fprintf(stderr, "tile_mm stats %s (matmul calls by column count): taken / cuBLAS\n", tname[ty]);
         for (int b = 0; b < 9; ++b) {
             fprintf(stderr, "  %-8s %10llu / %10llu\n", tmm_bucket_name[b], (unsigned long long) tmm_hist[ty][1][b].load(),
@@ -418,7 +458,7 @@ static void tmm_stats_note(const ggml_type type, const int64_t n, const bool tak
         return;
     }
     const int b = n <= 16 ? 0 : n <= 32 ? 1 : n <= 48 ? 2 : n <= 64 ? 3 : n <= 80 ? 4 : n <= 128 ? 5 : n <= 256 ? 6 : n <= 512 ? 7 : 8;
-    tmm_hist[type == GGML_TYPE_Q8_0 ? 1 : type == GGML_TYPE_Q4_0 ? 2 : 0][taken][b]++;
+    tmm_hist[type == GGML_TYPE_Q8_0 ? 1 : type == GGML_TYPE_Q4_0 ? 2 : type == GGML_TYPE_Q5_K ? 3 : type == GGML_TYPE_Q4_K ? 4 : 0][taken][b]++;
 }
 
 static bool tmm_env_on(const char * name) {
@@ -429,6 +469,7 @@ static bool tmm_env_on(const char * name) {
 // the weight-layout conditions shared by both entry points (the staging reads whole 32-bit words)
 static bool tmm_weights_ok(const ggml_tensor * src0) {
     static const bool q6k_on = tmm_env_on("GGML_CUDA_TILE_Q6K"), q80_on = tmm_env_on("GGML_CUDA_TILE_Q8_0"), q40_on = tmm_env_on("GGML_CUDA_TILE_Q4_0");
+    static const bool q5k_on = tmm_env_on("GGML_CUDA_TILE_Q5K"), q4k_on = tmm_env_on("GGML_CUDA_TILE_Q4K");
     const int64_t K = src0->ne[0], M = src0->ne[1];
     switch (src0->type) {
         case GGML_TYPE_Q6_K: {
@@ -438,6 +479,12 @@ static bool tmm_weights_ok(const ggml_tensor * src0) {
             return q6k_on && K % QK_K == 0 && (M*nbk) % 2 == 0 && src0->nb[1] == (size_t) nbk*sizeof(block_q6_K) &&
                    ((uintptr_t) src0->data % 2) == 0 && src0->nb[2] % 4 == 0;
         }
+        case GGML_TYPE_Q5_K:
+            return q5k_on && K % QK_K == 0 && src0->nb[1] == (size_t) (K/QK_K)*sizeof(block_q5_K) &&
+                   ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
+        case GGML_TYPE_Q4_K:
+            return q4k_on && K % QK_K == 0 && src0->nb[1] == (size_t) (K/QK_K)*sizeof(block_q4_K) &&
+                   ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
         case GGML_TYPE_Q8_0:
             // units of four blocks: K % 128 keeps every row 4-aligned (even block count) and the units whole
             return q80_on && K % (4*QK8_0) == 0 && src0->nb[1] == (size_t) (K/QK8_0)*sizeof(block_q8_0) &&
@@ -452,16 +499,19 @@ static bool tmm_weights_ok(const ggml_tensor * src0) {
 }
 
 static int tmm_uv(const ggml_type type) {
-    return type == GGML_TYPE_Q6_K ? tile_mm_traits<GGML_TYPE_Q6_K>::UV : type == GGML_TYPE_Q8_0 ? tile_mm_traits<GGML_TYPE_Q8_0>::UV :
-           tile_mm_traits<GGML_TYPE_Q4_0>::UV;
+    switch (type) {
+        case GGML_TYPE_Q8_0: return tile_mm_traits<GGML_TYPE_Q8_0>::UV;
+        case GGML_TYPE_Q4_0: return tile_mm_traits<GGML_TYPE_Q4_0>::UV;
+        default:             return QK_K;    // q6_K, q5_K, q4_K
+    }
 }
 
 static bool tmm_type_ok(const ggml_type type) {
-    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
+    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
 }
 
 bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    // GGML_CUDA_TILE_Q6K=0 / _Q8_0=0 / _Q4_0=0 turn a type off; GGML_CUDA_TILE_MIN / _MAX (or the older _Q6K_MIN / _MAX) set the column
+    // GGML_CUDA_TILE_Q6K=0 / _Q5K=0 / _Q4K=0 / _Q8_0=0 / _Q4_0=0 turn a type off; GGML_CUDA_TILE_MIN / _MAX (or the older _Q6K_MIN / _MAX) set the column
     // range that takes this path (default 9..80)
     static const int nmin = [] { const char * e = getenv("GGML_CUDA_TILE_MIN"); if (!e) { e = getenv("GGML_CUDA_TILE_Q6K_MIN"); } return e ? atoi(e) : 9; }();
     static const int nmax = [] { const char * e = getenv("GGML_CUDA_TILE_MAX"); if (!e) { e = getenv("GGML_CUDA_TILE_Q6K_MAX"); } return e ? std::min(atoi(e), 80) : 80; }();
