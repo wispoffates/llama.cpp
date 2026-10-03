@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16.cuh"
+#include "ggml-cuda/tile-q6k.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1997,6 +1998,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // Pascal has no MMQ: q6_K batches of 9..80 columns (verify batches) take the fused tile kernel instead of dequant + hgemm
+    if (ggml_cuda_tile_q6_K_try(ctx, src0, src1, dst)) {
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
