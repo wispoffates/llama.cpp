@@ -11402,10 +11402,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, n, 2816));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, n, 704));
     }
-    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (int n : {64, 512}) {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, true,  512,  n, 2048));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+    }
+    // dense q5_K / q4_K in the tile range: every tile width, a partial row tile, the cuBLAS fallback (81 columns)
+    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
+        for (int n : {9, 33, 64, 65, 81}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4096, n, 2048, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  300, n, 2048, {1, 1}, {1, 1}));
         }
     }
 
@@ -11701,7 +11708,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  704,  n, 2816));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 1408, n, 704));
     }
-    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, true,  512,  512, 2048));
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, 512, 512));
     }
