@@ -2068,6 +2068,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
+        // Pascal: fp16 tile GEMM over all experts (tile-mm.cu) instead of MMQ's emulated-DP4A integer path
+        if (ggml_cuda_tile_mm_id_try(ctx, src0, src1, ids, dst)) {
+            return;
+        }
+
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
