@@ -12205,7 +12205,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 5, 8704, {1, 1}, {1, 1}));
     }
-    // the fused tile GEMM on Pascal (tile-q6k.cu) at 9..80 columns: every tile width (16/32/48/64/80 columns) with partial
+    // the fused tile GEMM on Pascal (tile-mm.cu) at 9..80 columns: every tile width (16/32/48/64/80 columns) with partial
     // column tiles, partial row tiles (6150, 300 rows), an odd number of q6_K blocks per row (k = 4352: rows alternate
     // between 4-aligned and 2-aligned starts), the down projection's K, and the cuBLAS fallbacks (81 columns; odd rows x odd
     // blocks per row)
@@ -12218,6 +12218,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  300, n, 5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, n, 4352, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  301, n, 4352, {1, 1}, {1, 1}));
+    }
+    // ... and its q8_0 path (four-block units, K % 128): every tile width, a partial row tile (300 rows), the K of ssm_out (6144)
+    // and of the down projection's half (8704), and the cuBLAS fallbacks (81 columns; K = 4160 is not a multiple of 128)
+    for (int n : {9, 16, 33, 49, 64, 65, 80}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8704, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  300, n, 5120, {1, 1}, {1, 1}));
+    }
+    for (int n : {16, 65, 81}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, n, 8704, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, n, 4160, {1, 1}, {1, 1}));
     }
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
