@@ -589,8 +589,9 @@ static __device__ __forceinline__ float gp100_s8_f(const uint32_t w, const int s
 // i.e. 8 weights of each of 4 sixteen-wide sub-blocks. q (0..63) is used as a subnormal half; the -32
 // offset is removed in fp32 with the per-16 sums, once per sub-block by the even thread of each pair.
 // GS as in gp100_mmvq_kq_impl: GS = 2 splits the warp into two row sets of R rows (16 lanes, 2 super-blocks per iteration
-// each), so short-K experts (ffn_down, K = 512 = 2 super-blocks) keep all 32 lanes busy. Each set stages its own rows.
-// DIRECT: no staging; every lane reads its 34 bytes of the block straight from global memory with 4-byte loads.
+// each), so short-K experts (ffn_down, K = 512 = 2 super-blocks) keep all 32 lanes busy.
+// DIRECT: no staging; every lane reads its 34 bytes of the block straight from global memory with 4-byte loads. The
+// MUL_MAT_ID launcher uses GS = 2 + DIRECT for short K and the staged GS = 4 form elsewhere.
 template <int R, bool GLU, int GS = 4, bool DIRECT = false>
 static __device__ __forceinline__ void gp100_mmvq_q6_K_impl(
         const void * __restrict__ vW, const void * __restrict__ vG, const half * __restrict__ y, const float2 * __restrict__ ys, const float * __restrict__ s16,
