@@ -13697,6 +13697,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 2, 10000));
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 7, 1000));
     test_cases.emplace_back(new test_timestep_embedding(GGML_TYPE_F32, {65, 1, 1, 1}, 256, 10000));
+
+    // Pascal tile GEMM range (tile-mm.cu, 9..80 columns) at a 27B dense model's per-GPU shapes under tensor split:
+    // ffn_gate/up 5120 -> 8704, ffn_down 8704 -> 5120, ssm_out / attn_output 6144 -> 5120; 65 = ngram-mod verify (64 + 1)
+    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n : {16, 32, 64, 65, 80}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8704, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 8704, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
+        }
+
     for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
         test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }
