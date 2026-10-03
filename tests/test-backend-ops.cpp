@@ -11395,6 +11395,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 5120, n, 8704, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  512, n, 4160, {1, 1}, {1, 1}));
     }
+    // the grouped MUL_MAT_ID tile GEMM on Pascal (tile-mm.cu): gemma4's experts (128 x 8 used, q4_0): ffn_gate_up 2816 -> 1408 with the
+    // input shared by the slots (b = true) and ffn_down 704 -> 2816 per slot; 32 tokens leaves most experts with 0..2 rows, 512 gives
+    // several column tiles per expert. qwen35moe-like experts (256 x 8, 2048 <-> 512) for q6_K / q8_0.
+    for (int n : {32, 256, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, n, 2816));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, n, 704));
+    }
+    for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n : {64, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, true,  512,  n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+        }
+    }
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
