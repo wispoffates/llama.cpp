@@ -63,8 +63,10 @@ static __global__ void tile_q6_K_prep(const float * __restrict__ X, const int64_
     }
 }
 
+// TN = 5 (80 columns) needs 34 KB of shared memory, so only one block fits per SM anyway: let it use the registers
+// (with the 2-block bound it spilled; 65-column verify batches -- ngram-mod's 64-token drafts + 1 -- land here)
 template <int TN>
-static __global__ void __launch_bounds__(256, 2) tile_q6_K(const block_q6_K * __restrict__ W, const __half * __restrict__ XS,
+static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_q6_K(const block_q6_K * __restrict__ W, const __half * __restrict__ XS,
         const float * __restrict__ S, float * __restrict__ P, const int M, const int K, const int N, const int nwin, const int sb_per) {
     constexpr int TM = 4, BM = TQ6_BM, BN = 16*TN, RPW = BM/8;
     constexpr int XI = (BN*8 + 255)/256;
