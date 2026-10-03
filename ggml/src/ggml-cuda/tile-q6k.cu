@@ -1,5 +1,8 @@
 #include "tile-q6k.cuh"
 
+#include <atomic>
+#include <cstdio>
+
 // q6_K x f32 GEMM for 9..80 columns on Pascal (sm_60), fused: the weights are read once and decoded tile by tile in shared
 // memory instead of being dequantized to a full fp16 copy for cuBLAS.
 //
@@ -228,6 +231,25 @@ static void tile_q6_K_launch(const block_q6_K * W, const __half * XS, const floa
     tile_q6_K<TN><<<grid, 256, smem, stream>>>(W, XS, S, P, M, K, N, nwin, sb_per);
 }
 
+// GGML_CUDA_TILE_Q6K_STATS=1: histogram of the column counts of every q6_K matmul offered to this hook (all widths > 8 on
+// Pascal reach it), printed to stderr at exit. Diagnostics only.
+static std::atomic<uint64_t> tq6_hist[2][9];   // [taken][bucket]
+static const char * tq6_bucket_name[9] = {"9-16", "17-32", "33-48", "49-64", "65-80", "81-128", "129-256", "257-512", ">512"};
+static void tq6_stats_print() {
+    fprintf(stderr, "tile_q6_K stats (q6_K matmul calls by column count): taken / cuBLAS\n");
+    for (int b = 0; b < 9; ++b) {
+        fprintf(stderr, "  %-8s %10llu / %10llu\n", tq6_bucket_name[b], (unsigned long long) tq6_hist[1][b].load(), (unsigned long long) tq6_hist[0][b].load());
+    }
+}
+static void tq6_stats_note(const int64_t n, const bool taken) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_TILE_Q6K_STATS"); if (e && e[0] == '1') { atexit(tq6_stats_print); return true; } return false; }();
+    if (!on) {
+        return;
+    }
+    const int b = n <= 16 ? 0 : n <= 32 ? 1 : n <= 48 ? 2 : n <= 64 ? 3 : n <= 80 ? 4 : n <= 128 ? 5 : n <= 256 ? 6 : n <= 512 ? 7 : 8;
+    tq6_hist[taken][b]++;
+}
+
 bool ggml_cuda_tile_q6_K_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     static const bool enabled = [] { const char * e = getenv("GGML_CUDA_TILE_Q6K"); return !e || e[0] != '0'; }();
     // GGML_CUDA_TILE_Q6K_MIN / _MAX: the column range that takes this path (default 9..80)
@@ -243,8 +265,12 @@ bool ggml_cuda_tile_q6_K_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src0->nb[1] != (size_t) nbk*sizeof(block_q6_K) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
             ((uintptr_t) src0->data % 2) != 0 || (src1->nb[1] % sizeof(float)) != 0 || (dst->nb[1] % sizeof(float)) != 0) {
+        if (src0->type == GGML_TYPE_Q6_K && cc == GGML_CUDA_CC_PASCAL) {
+            tq6_stats_note(N, false);
+        }
         return false;
     }
+    tq6_stats_note(N, true);
     const int tn = N <= 16 ? 1 : N <= 32 ? 2 : N <= 48 ? 3 : N <= 64 ? 4 : 5;
     const int nwin = (int) ((K + TQ6_WIN - 1)/TQ6_WIN);
     const int tiles = (int) (((M + TQ6_BM - 1)/TQ6_BM)*((N + 16*tn - 1)/(16*tn)));
