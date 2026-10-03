@@ -11242,6 +11242,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 5, 8704, {1, 1}, {1, 1}));
     }
+    // the fused tile GEMM on Pascal (tile-q6k.cu) at 9..80 columns: every tile width (16/32/48/64/80 columns) with partial
+    // column tiles, partial row tiles (6150, 300 rows), an odd number of q6_K blocks per row (k = 4352: rows alternate
+    // between 4-aligned and 2-aligned starts), the down projection's K, and the cuBLAS fallbacks (81 columns; odd rows x odd
+    // blocks per row)
+    for (int n : {9, 16, 17, 33, 49, 64, 65, 80}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 8704, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6150, n, 5120, {1, 1}, {1, 1}));
+    }
+    for (int n : {16, 65, 81}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, n, 8704, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  300, n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, n, 4352, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  301, n, 4352, {1, 1}, {1, 1}));
+    }
 
     // q8_0 KV cases: decode and prompt batches, KV pad, permuted KV, feature flags, and long context
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1},   113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
