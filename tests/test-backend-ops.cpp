@@ -12243,6 +12243,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
         }
     }
+    // one column with a short K (MMVQ small_k; on Pascal the warps then own rows): gemma4's ffn_down_exps split by K under tensor split
+    // (352 -> 2816), a partial row block (2821 rows), 3 and 31 blocks per row (one and two passes); dense with the same K
+    for (int k : {96, 352, 992}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2821, 1, k));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1003, 1, k, {1, 1}, {1, 1}));
+    }
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2051, 1, 256));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1003, 1, 512, {1, 1}, {1, 1}));
+    }
     // dense q5_K / q4_K in the tile range: every tile width, a partial row tile, the cuBLAS fallback (81 columns)
     for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q4_K}) {
         for (int n : {9, 33, 64, 65, 81}) {
@@ -12629,6 +12639,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
         }
     }
+
+    // gemma4 decode, per GPU under tensor split (q4_0): ffn_down_exps split by K (352 -> 2816 x 8 slots), ffn_down / attn_output split
+    // by K (1056 / 2048 -> 2816), attn_q (2816 -> 2048), the tied lm_head split by rows (2816 -> 131072)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, 1, 352));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2816,   1, 1056, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2816,   1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048,   1, 2816, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 131072, 1, 2816, {1, 1}, {1, 1}));
 
     // qwen35moe experts at one token (256 experts, 8 used): ffn_up/ffn_gate 2048 -> 512 (shared input), ffn_down 512 -> 2048
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
