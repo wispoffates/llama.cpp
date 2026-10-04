@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-f16.cuh"
+#include "mmvq-h1.cuh"
 #include "mmvq-gp100.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -1736,6 +1737,11 @@ void ggml_cuda_mul_mat_vec_q(
     } else if ((!fusion || ggml_cuda_hybrid_glu_enabled()) && ggml_cuda_hybrid_mmvq_take(src0, src1) &&
             ggml_cuda_gp100_mmvq_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion)) {
         ggml_cuda_gp100_mmvq(ctx, src0, src1, dst, fusion);
+        return;
+    }
+
+    // Pascal: fp16 one-column q4_0 (mmvq-h1.cu); fused launches keep the integer path
+    if (!fusion && ggml_cuda_mmvq_h1_try(ctx, src0, src1, ids, dst)) {
         return;
     }
 
