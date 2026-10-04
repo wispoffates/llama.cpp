@@ -426,6 +426,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
     static const std::regex pattern_output_draft ("output_draft\\.weight");
+    static const std::regex pattern_token_embd   ("token_embd\\.weight");
 
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
@@ -597,6 +598,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_draft)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+        }
+        // tied embeddings: with no output.weight the device-side token_embd copy is the output projection (TENSOR_DUPLICATED;
+        // the input lookup reads the CPU copy), so split it like output.weight instead of mirroring the full vocab on every device
+        if (std::regex_match(tensor_name, pattern_token_embd) && !is_dsv4 && ud->model->get_tensor("output.weight") == nullptr) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
