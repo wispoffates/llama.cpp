@@ -234,6 +234,11 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
                          ((uintptr_t) src0->data % 2) == 0 &&
                          ((row_bytes % 16 == 0 && (uintptr_t) src0->data % 16 == 0 && src0->nb[2] % 16 == 0) ||
                           (src0->view_src == nullptr && K % MATRIX_ROW_PADDING != 0));
+    // fewer than 32 blocks per row leaves lanes idle in the per-chunk layout: the integer path's short-K geometry wins there
+    // (gemma4 ffn_down_exps split by K, 352: 21.1 us integer vs 30.0 here)
+    if (K < 32*H1_QK) {
+        return false;
+    }
     if (!rows_ok || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) || src1->nb[1] % sizeof(float) != 0 ||
             dst->nb[1] % sizeof(float) != 0 || src1->ne[0] != K || dst->ne[0] != M) {
         return false;
