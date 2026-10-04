@@ -142,6 +142,14 @@ static constexpr __host__ __device__ int get_block_byte_size(ggml_type type) {
 // output rows per block on the multi-column path: the activation is re-read by every block,
 // so its total traffic scales as 1/rows
 #define P100_MMVQ_ROWS_N   16
+// one column with a short K (the dispatch's small_k: the whole K fits in one pass of the block, e.g. MoE ffn_down split by K
+// under tensor split, 352 values on gemma4): warps own rows outright instead of splitting a K that only one warp would reach
+#ifndef P100_MMVQ_NWARPS_SK
+#define P100_MMVQ_NWARPS_SK 2
+#endif
+#ifndef P100_MMVQ_ROWS_SK
+#define P100_MMVQ_ROWS_SK   8
+#endif
 // whether the multi-column path also stages the activation (it costs shared memory that rows want)
 #endif
 
@@ -505,7 +513,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 #ifdef GGML_CUDA_MMVQ_PASCAL
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         if (ncols_dst == 1) {
-            return 2;
+            return small_k ? P100_MMVQ_NWARPS_SK : 2;
         }
         if (ncols_dst <= 8) {
             return P100_MMVQ_NWARPS_N;
@@ -643,7 +651,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
         switch (ncols_dst) {
             case 1:
 #ifdef GGML_CUDA_MMVQ_PASCAL
-                return 2;
+                return small_k ? P100_MMVQ_ROWS_SK : 2;
 #else
                 return small_k ? nwarps : 1;
 #endif
@@ -693,7 +701,12 @@ static __global__ void mul_mat_vec_q(
     // grid, so letting a block cover more rows divides that traffic -- and doing it this way keeps
     // the per-thread accumulator count, and so the register pressure, unchanged. It also removes
     // the cross-warp reduction at the end.
+#ifdef GGML_CUDA_MMVQ_PASCAL
+    // ... and on Pascal also for one column with a short K (small_k), where splitting K would leave all but one warp idle
+    constexpr bool split_rows = (ncols_dst > 1 || small_k) && !has_fusion && rows_per_cuda_block % nwarps == 0;
+#else
     constexpr bool split_rows = ncols_dst > 1 && !has_fusion && rows_per_cuda_block % nwarps == 0;
+#endif
     constexpr int  rows_per_warp = split_rows ? rows_per_cuda_block/nwarps : rows_per_cuda_block;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
@@ -842,7 +855,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int y_stage_bytes     = y_blocks_per_warp * (int) sizeof(block_q8_1);
 #ifdef GGML_CUDA_MMVQ_PASCAL
     // One column, staged per warp: each warp walks its own slice of K.
-    constexpr bool stage_y_warp  = ncols_dst == 1 && y_stage_bytes <= 2048;
+    constexpr bool stage_y_warp  = ncols_dst == 1 && !split_rows && y_stage_bytes <= 2048;
     // Several columns, staged once for the whole block: with split_rows every warp walks the same
     // K, so a single copy serves them all. The activation is 44% of this kernel and its main
     // register consumer (removing it takes REG 168 -> 71), and at this geometry occupancy is capped
@@ -1277,7 +1290,12 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
-    if constexpr (c_ncols_dst == 1) {
+#ifdef GGML_CUDA_MMVQ_PASCAL
+    constexpr bool fusion_ok = c_ncols_dst == 1 && !small_k; // Pascal dispatches fused short-K launches without small_k
+#else
+    constexpr bool fusion_ok = c_ncols_dst == 1;
+#endif
+    if constexpr (fusion_ok) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
@@ -1485,7 +1503,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             };
 
-            if (should_use_small_k(c_ncols_dst)) {
+#ifdef GGML_CUDA_MMVQ_PASCAL
+            // the short-K geometry gives each warp whole rows (split_rows), which the fused path does not do
+            const bool fused = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                               fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+#else
+            const bool fused = false;
+#endif
+            if (should_use_small_k(c_ncols_dst) && !fused) {
                 launch(std::true_type{},  std::false_type{});
             } else if (should_halve_iters()) {
                 launch(std::false_type{}, std::true_type{});
