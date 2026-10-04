@@ -12173,10 +12173,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // one-column q4_0 on Pascal's fp16 path (mmvq-h1.cu): rows not 16-byte multiples (K = 1056, 352, 96: 2-byte-aligned chunks,
     // staged from the aligned address below), a partial last chunk (K = 2816 = 2.75 chunks), partial row groups (1003, 2821 rows),
     // MUL_MAT_ID with the input shared by the slots (b = true) and per slot
-    for (int k : {96, 352, 1056, 2816, 4096}) {
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1003, 1, k, {1, 1}, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 4, true,  1003, 1, k));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 4, false, 1003, 1, k));
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int k : {96, 352, 1056, 2816, 4096}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1003, 1, k, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, true,  1003, 1, k));
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, false, 1003, 1, k));
+        }
     }
     // one column with a short K (MMVQ small_k; on Pascal the warps then own rows): gemma4's ffn_down_exps split by K under tensor split
     // (352 -> 2816), a partial row block (2821 rows), 3 and 31 blocks per row (one and two passes); dense with the same K
@@ -12562,6 +12564,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
         }
     }
+
+    // q8_0 one column at qwen36 / glimmer per-GPU shapes: attn_qkv 2048 -> 4096, the lm_head 2048 -> 124160, glimmer ffn_down
+    // 9984 -> 6656 and attn_q 6656 -> 2048
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096,   1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 124160, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6656,   1, 9984, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2048,   1, 6656, {1, 1}, {1, 1}));
 
     // gemma4 decode, per GPU under tensor split (q4_0): ffn_down_exps split by K (352 -> 2816 x 8 slots), ffn_down / attn_output split
     // by K (1056 / 2048 -> 2816), attn_q (2816 -> 2048), the tied lm_head split by rows (2816 -> 131072)
