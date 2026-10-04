@@ -12232,6 +12232,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
         }
     }
+    // one-column q4_0 on Pascal's fp16 path (mmvq-h1.cu): rows not 16-byte multiples (K = 1056, 352, 96: 2-byte-aligned chunks,
+    // staged from the aligned address below), a partial last chunk (K = 2816 = 2.75 chunks), partial row groups (1003, 2821 rows),
+    // MUL_MAT_ID with the input shared by the slots (b = true) and per slot
+    for (int k : {96, 352, 1056, 2816, 4096}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 1003, 1, k, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 4, true,  1003, 1, k));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 4, false, 1003, 1, k));
+    }
     // one column with a short K (MMVQ small_k; on Pascal the warps then own rows): gemma4's ffn_down_exps split by K under tensor split
     // (352 -> 2816), a partial row block (2821 rows), 3 and 31 blocks per row (one and two passes); dense with the same K
     for (int k : {96, 352, 992}) {
