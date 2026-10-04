@@ -10042,6 +10042,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+    // rms_norm block widths on CUDA: 512 threads up to 4096 columns (row held in registers), 1024 above
+    for (int64_t n : {2816, 4096, 4097}) {
+        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {n, 3, 2, 1}, false, 1e-6f));
+        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 3, 2, 1}, 1e-6f, false));
+        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 3, 2, 1}, 1e-6f, false, false, true));
+    }
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
@@ -11574,6 +11580,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
         }
     }
+
+    // gemma4 decode: one 2816-wide row per norm (rms_norm, + mul, + mul + add)
+    test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {2816, 1, 1, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {2816, 1, 1, 1}, 1e-6f, false));
 
     // gemma4 decode, per GPU under tensor split (q4_0): ffn_down_exps split by K (352 -> 2816 x 8 slots), ffn_down / attn_output split
     // by K (1056 / 2048 -> 2816), attn_q (2816 -> 2048), the tied lm_head split by rows (2816 -> 131072)
