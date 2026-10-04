@@ -2,7 +2,7 @@
 
 #include <unordered_map>
 
-// q4_0 x f32 matvec for ONE column on Pascal, in fp16 (decode: dense matmuls and the one-token MUL_MAT_ID of MoE experts).
+// q4_0 / q8_0 x f32 matvec for ONE column on Pascal, in fp16 (decode: dense matmuls and the one-token MUL_MAT_ID of MoE experts).
 //
 // The integer path (mmvq.cu) multiplies against q8_1 activations with DP4A, which sm_60 lacks; its emulation costs several
 // instructions per multiply-add and, together with the shared-memory staging, holds a big matvec at 300-350 GB/s of the ~570 a
@@ -28,7 +28,7 @@
 #define MMVQ_H1_U   2   // rows staged at a time
 #define MMVQ_H1_RPW 4   // rows per warp
 
-static constexpr int H1_QK = 32, H1_BB = 18;   // block_q4_0: half d + 16 bytes of nibbles
+static constexpr int H1_QK = 32;   // values per block (q4_0 and q8_0)
 
 // per 32-value block: s = max|x| (1 if 0), x' = x/s as half. One thread per value, grid (ceil(K/256), rows of x).
 static __global__ void mmvq_h1_prep(const float * __restrict__ X, const int64_t sx, __half * __restrict__ XH, float * __restrict__ XS,
@@ -60,6 +60,52 @@ static __device__ __forceinline__ void mmvq_h1_nib(const uint32_t b, half2 & h01
     h23 = __hsub2(*(half2 *) &r23, off);
 }
 
+// int8 bytes -> two half2, exact: q ^ 0x80 = q + 128 in 0..255, 0x64uu = 1024 + u, minus 1152
+static __device__ __forceinline__ void mmvq_h1_i8(const uint32_t q, half2 & h01, half2 & h23) {
+    const uint32_t u = q ^ 0x80808080u, m = 0x64646464u;
+    uint32_t r01 = __byte_perm(u, m, 0x4140), r23 = __byte_perm(u, m, 0x4342);
+    const half2 off = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));   // 1152
+    h01 = __hsub2(*(half2 *) &r01, off);
+    h23 = __hsub2(*(half2 *) &r23, off);
+}
+
+template <ggml_type type> struct mmvq_h1_traits;
+template <> struct mmvq_h1_traits<GGML_TYPE_Q4_0> { static constexpr int BB = 18, NWD = 5; };   // half d + 16 nibble bytes
+template <> struct mmvq_h1_traits<GGML_TYPE_Q8_0> { static constexpr int BB = 34, NWD = 9; };   // half d + 32 int8
+
+// one block from its NWD staged words (hi: d in the high half of wd[0], quants word-aligned from wd[1]; else d low, quants at
+// +2 bytes); returns d * sum(q * x') in fp32 from a 16-HFMA2 fp16 chain (|x'| <= 1: q4_0 |chain| <= 256, q8_0 <= 4096)
+template <ggml_type type>
+static __device__ __forceinline__ float mmvq_h1_block(const uint32_t * wd, const bool hi, const half2 * xv) {
+    const float d = __half2float(__ushort_as_half((unsigned short) (hi ? wd[0] >> 16 : wd[0] & 0xffff)));
+    const int sh = hi ? 32 : 16;
+    half2 h = __float2half2_rn(0.0f);
+    if constexpr (type == GGML_TYPE_Q4_0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t q = __funnelshift_rc(wd[i], wd[i + 1], sh);
+            half2 a, b;
+            mmvq_h1_nib(q & 0x0f0f0f0fu, a, b);
+            h = __hfma2(a, xv[2*i], h);
+            h = __hfma2(b, xv[2*i + 1], h);
+            mmvq_h1_nib((q >> 4) & 0x0f0f0f0fu, a, b);
+            h = __hfma2(a, xv[8 + 2*i], h);
+            h = __hfma2(b, xv[8 + 2*i + 1], h);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t q = __funnelshift_rc(wd[i], wd[i + 1], sh);
+            half2 a, b;
+            mmvq_h1_i8(q, a, b);
+            h = __hfma2(a, xv[2*i], h);
+            h = __hfma2(b, xv[2*i + 1], h);
+        }
+    }
+    const float2 f = __half22float2(h);
+    return d*(f.x + f.y);
+}
+
 // row r of the warp's group: S-step of the transposed butterfly (lanes with bit S set keep the upper half of the rows)
 template <int S>
 static __device__ __forceinline__ void mmvq_h1_bfly(float * acc, const int lane) {
@@ -73,12 +119,15 @@ static __device__ __forceinline__ void mmvq_h1_bfly(float * acc, const int lane)
 }
 
 // grid (ceil(M/(WPB*RPW)), slots); ID: slot y -> expert ids[y], activation row (nxr == 1 ? 0 : y), dst row y
-template <int WPB, int U, int RPW, bool ID>
-static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q4_0(
+template <ggml_type type, int WPB, int U, int RPW, bool ID>
+static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
         const uint8_t * __restrict__ W, const int64_t row_bytes, const int64_t expert_bytes, const int32_t * __restrict__ ids,
         const __half * __restrict__ XH, const float * __restrict__ XS, const int nxr, float * __restrict__ Y, const int64_t sy,
         const int M, const int K) {
-    __shared__ uint4 stage[WPB][U][37];
+    constexpr int BB  = mmvq_h1_traits<type>::BB, NWD = mmvq_h1_traits<type>::NWD;
+    constexpr int STG = (32*BB + 15 + 15)/16;      // a 32-block chunk + slack for the aligned-down start
+    constexpr int NLD = (STG + 31)/32;             // 16-byte loads per lane per row
+    __shared__ uint4 stage[WPB][U][STG];
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     const int r0 = (blockIdx.x*WPB + wid)*RPW;
     if (r0 >= M) {
@@ -119,60 +168,44 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q4_0(
         }
 #pragma unroll
         for (int rr = 0; rr < RPW; rr += U) {
-            uint4 v0[U], v1[U];
+            uint4 v[U][NLD];
             int   mis[U], nu4[U];
 #pragma unroll
             for (int u = 0; u < U; ++u) {
                 // rows past M re-read the last row; their results are never written
                 const int row = min(r0 + rr + u, M - 1);
-                const uintptr_t a = (uintptr_t) (W + (int64_t) row*row_bytes + (int64_t) cb*H1_BB);
+                const uintptr_t a = (uintptr_t) (W + (int64_t) row*row_bytes + (int64_t) cb*BB);
                 mis[u] = (int) (a & 15);
-                nu4[u] = (mis[u] + nblk*H1_BB + 15)/16;
+                nu4[u] = (mis[u] + nblk*BB + 15)/16;
                 const uint4 * src = (const uint4 *) (a - mis[u]);
-                if (lane < nu4[u]) {
-                    v0[u] = __ldg(src + lane);
-                }
-                if (lane + 32 < nu4[u]) {
-                    v1[u] = __ldg(src + lane + 32);
+#pragma unroll
+                for (int j = 0; j < NLD; ++j) {
+                    if (lane + 32*j < nu4[u]) {
+                        v[u][j] = __ldg(src + lane + 32*j);
+                    }
                 }
             }
 #pragma unroll
             for (int u = 0; u < U; ++u) {
-                if (lane < nu4[u]) {
-                    stage[wid][u][lane] = v0[u];
-                }
-                if (lane + 32 < nu4[u]) {
-                    stage[wid][u][lane + 32] = v1[u];
+#pragma unroll
+                for (int j = 0; j < NLD; ++j) {
+                    if (lane + 32*j < nu4[u]) {
+                        stage[wid][u][lane + 32*j] = v[u][j];
+                    }
                 }
             }
             __syncwarp();
             if (lane < nblk) {
 #pragma unroll
                 for (int u = 0; u < U; ++u) {
-                    const int o = mis[u] + H1_BB*lane;   // byte offset of this lane's block in the stage (even)
+                    const int o = mis[u] + BB*lane;   // byte offset of this lane's block in the stage (even)
                     const uint32_t * p = (const uint32_t *) ((const char *) stage[wid][u] + (o & ~3));
-                    uint32_t wd[5];
+                    uint32_t wd[NWD];
 #pragma unroll
-                    for (int i = 0; i < 5; ++i) {
+                    for (int i = 0; i < NWD; ++i) {
                         wd[i] = p[i];
                     }
-                    const bool hi = o & 2;   // d in the high half of wd[0], nibbles word-aligned from wd[1]
-                    const float d = __half2float(__ushort_as_half((unsigned short) (hi ? wd[0] >> 16 : wd[0] & 0xffff)));
-                    const int sh = hi ? 32 : 16;
-                    half2 h = __float2half2_rn(0.0f);
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        const uint32_t q = __funnelshift_rc(wd[i], wd[i + 1], sh);
-                        half2 a, b;
-                        mmvq_h1_nib(q & 0x0f0f0f0fu, a, b);
-                        h = __hfma2(a, xv[2*i], h);
-                        h = __hfma2(b, xv[2*i + 1], h);
-                        mmvq_h1_nib((q >> 4) & 0x0f0f0f0fu, a, b);
-                        h = __hfma2(a, xv[8 + 2*i], h);
-                        h = __hfma2(b, xv[8 + 2*i + 1], h);
-                    }
-                    const float2 f = __half22float2(h);
-                    acc[rr + u] += (d*s)*(f.x + f.y);
+                    acc[rr + u] += s*mmvq_h1_block<type>(wd, o & 2, xv);
                 }
             }
             __syncwarp();
@@ -221,16 +254,21 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     // GGML_CUDA_MMVQ_H1=0: leave one-column q4_0 to the integer path (A/B)
     static const bool enabled = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1"); return !s || atoi(s) != 0; }();
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || src0->type != GGML_TYPE_Q4_0 ||
+    // GGML_CUDA_MMVQ_H1_Q8=0: leave q8_0 to the integer path
+    static const bool q8_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_Q8"); return !s || atoi(s) != 0; }();
+    const ggml_type type = src0->type;
+    if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) ||
+            !(type == GGML_TYPE_Q4_0 || (type == GGML_TYPE_Q8_0 && q8_on)) ||
             src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
     const int64_t K = src0->ne[0], M = src0->ne[1];
-    const int64_t row_bytes = (K/H1_QK)*H1_BB;
+    const int64_t BB = type == GGML_TYPE_Q4_0 ? mmvq_h1_traits<GGML_TYPE_Q4_0>::BB : mmvq_h1_traits<GGML_TYPE_Q8_0>::BB;
+    const int64_t row_bytes = (K/H1_QK)*BB;
     // the staging reads whole 16-byte units from the 16-byte-aligned address at or below each chunk, so it can run up to 15
     // bytes past a row's end: fine when rows are 16-byte multiples on a 16-byte-aligned base (no overrun at all), or when the
     // tensor owns its allocation and K is not a multiple of MATRIX_ROW_PADDING (the last row is padded to the next multiple)
-    const bool rows_ok = K % H1_QK == 0 && src0->nb[0] == (size_t) H1_BB && src0->nb[1] == (size_t) row_bytes && src0->ne[3] == 1 &&
+    const bool rows_ok = K % H1_QK == 0 && src0->nb[0] == (size_t) BB && src0->nb[1] == (size_t) row_bytes && src0->ne[3] == 1 &&
                          ((uintptr_t) src0->data % 2) == 0 &&
                          ((row_bytes % 16 == 0 && (uintptr_t) src0->data % 16 == 0 && src0->nb[2] % 16 == 0) ||
                           (src0->view_src == nullptr && K % MATRIX_ROW_PADDING != 0));
@@ -295,13 +333,21 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     constexpr int RB = MMVQ_H1_WPB*MMVQ_H1_RPW;
     const dim3 grid((unsigned) ((M + RB - 1)/RB), (unsigned) slots);
     const int64_t sy = ids ? (int64_t) (dst->nb[1]/sizeof(float)) : 0;
-    if (ids) {
-        mmvq_h1_q4_0<MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW, true><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(
-            (const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2], (const int32_t *) ids->data, xh, xs, (int) nxr,
-            (float *) dst->data, sy, (int) M, (int) K);
+    auto launch = [&](auto type_tag) {
+        constexpr ggml_type T = decltype(type_tag)::value;
+        if (ids) {
+            mmvq_h1_q<T, MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW, true><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(
+                (const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2], (const int32_t *) ids->data, xh, xs, (int) nxr,
+                (float *) dst->data, sy, (int) M, (int) K);
+        } else {
+            mmvq_h1_q<T, MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW, false><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(
+                (const uint8_t *) src0->data, row_bytes, 0, nullptr, xh, xs, 1, (float *) dst->data, 0, (int) M, (int) K);
+        }
+    };
+    if (type == GGML_TYPE_Q4_0) {
+        launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{});
     } else {
-        mmvq_h1_q4_0<MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW, false><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(
-            (const uint8_t *) src0->data, row_bytes, 0, nullptr, xh, xs, 1, (float *) dst->data, 0, (int) M, (int) K);
+        launch(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
