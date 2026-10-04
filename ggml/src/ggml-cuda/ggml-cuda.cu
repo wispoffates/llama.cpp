@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16.cuh"
+#include "ggml-cuda/mmvq-h1.cuh"
 #include "ggml-cuda/tile-mm.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -4870,6 +4871,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // activation is only valid within a single graph evaluation.
     cuda_ctx->mmvq_q8_1_invalidate();
     ggml_cuda_mmvq_f16_invalidate(*cuda_ctx);
+    ggml_cuda_mmvq_h1_invalidate(*cuda_ctx);
 
     ggml_cuda_set_device(cuda_ctx->device);
 
