@@ -1,4 +1,4 @@
-// GP100 (sm_60) fp16 matrix-vector path at batch size 1 (Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, IQ4_NL).
+// GP100 (sm_60) fp16 matrix-vector path at batch size 1 (Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS, Q8_0, IQ4_NL, Q4_0).
 //
 // sm_60 has no __dp4a: the generic MMVQ emulates every int8 dot with four scalar multiplies and is
 // instruction-issue bound at ~45% of HBM2 bandwidth. GP100 does have full-rate half2 FMA, so here:
@@ -1082,14 +1082,16 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_q3_K(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_PASCAL
 }
 
-// Blocks of 32 weights with one fp16 scale: Q8_0 (34 bytes) and IQ4_NL (18 bytes). For K % 256 == 0 a row
+// Blocks of 32 weights with one fp16 scale: Q8_0 (34 bytes), IQ4_NL and Q4_0 (18 bytes). For K % 256 == 0 a row
 // is 16-byte aligned and so is every run of 32 blocks (1088 / 576 bytes), so a warp stages 32 blocks of a
 // row with aligned 16-byte loads and each lane takes one block from shared memory (2-byte aligned there,
 // read with funnel shifts). Values are used +128 as unsigned subnormal halves (Q8_0: q ^ 0x80; IQ4_NL: the
-// kvalues_iq4nl table stored +128, looked up like IQ4_XS); the 128 * sum(x) this adds is removed in fp32.
+// kvalues_iq4nl table stored +128, looked up like IQ4_XS); the 128 * sum(x) this adds is removed in fp32. Q4_0's nibbles
+// are already unsigned (q = n - 8): they go straight into subnormal halves and 8 * sum(x) is removed instead.
 template <ggml_type type> struct gp100_b32;
 template <> struct gp100_b32<GGML_TYPE_Q8_0>   { typedef block_q8_0   block; };
 template <> struct gp100_b32<GGML_TYPE_IQ4_NL> { typedef block_iq4_nl block; };
+template <> struct gp100_b32<GGML_TYPE_Q4_0>   { typedef block_q4_0   block; };
 
 // KS: how many of the block's four warps cooperate on one row group, each taking every KS-th chunk of K.
 // KS = 1 is one warp per R rows over the whole K; KS = 4 shortens that chain fourfold for short matrices.
@@ -1176,6 +1178,20 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
                     acc = __hfma2(*(const half2 *) &p0, Y[2*k + 0], acc);
                     acc = __hfma2(*(const half2 *) &p1, Y[2*k + 1], acc);
                 }
+            } else if constexpr (type == GGML_TYPE_Q4_0) { // qs[j] low nibble = weight j, high = weight j+16
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const uint32_t q  = __funnelshift_r(w[qo + k], w[qo + k + 1], qsh);
+                    const uint32_t lo = q & 0x0F0F0F0Fu, hi = (q >> 4) & 0x0F0F0F0Fu;
+                    const uint32_t pa = __byte_perm(lo, 0, 0x4140); // w(4k),    w(4k+1)
+                    const uint32_t pb = __byte_perm(lo, 0, 0x4342); // w(4k+2),  w(4k+3)
+                    const uint32_t pc = __byte_perm(hi, 0, 0x4140); // w(16+4k), w(17+4k)
+                    const uint32_t pd = __byte_perm(hi, 0, 0x4342); // w(18+4k), w(19+4k)
+                    acc = __hfma2(*(const half2 *) &pa, Y[2*k + 0],     acc);
+                    acc = __hfma2(*(const half2 *) &pb, Y[2*k + 1],     acc);
+                    acc = __hfma2(*(const half2 *) &pc, Y[8 + 2*k + 0], acc);
+                    acc = __hfma2(*(const half2 *) &pd, Y[8 + 2*k + 1], acc);
+                }
             } else { // IQ4_NL: qs[j] low nibble = weight j, high = weight j+16 (same as an IQ4_XS sub-block)
 #pragma unroll
                 for (int k = 0; k < 4; k++) {
@@ -1196,7 +1212,8 @@ static __global__ void __launch_bounds__(128) gp100_mmvq_b32(
             }
             const float s = __half2float(__hadd(__low2half(acc), __high2half(acc)));
             if (act) {
-                sum[r] = fmaf(__half2float(d), fmaf(s, sc.x, -128.0f * sc.y), sum[r]);
+                constexpr float off = type == GGML_TYPE_Q4_0 ? 8.0f : 128.0f; // the unsigned encoding's offset
+                sum[r] = fmaf(__half2float(d), fmaf(s, sc.x, -off * sc.y), sum[r]);
             }
         }
     }
@@ -1236,6 +1253,7 @@ bool ggml_cuda_gp100_mmvq_supported(const int cc, const ggml_tensor * src0, cons
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_0:
             break;
         default:
             return false;
@@ -1333,6 +1351,12 @@ static void gp100_dispatch_r(const ggml_type type, const void * W, const void * 
                 break;
             }
             GGML_ABORT("IQ4_NL supports at most 4 rows per warp");
+        case GGML_TYPE_Q4_0:
+            if constexpr (R <= 4) {
+                GP100_LAUNCH_B32(GGML_TYPE_Q4_0);
+                break;
+            }
+            GGML_ABORT("Q4_0 supports at most 4 rows per warp");
         case GGML_TYPE_Q6_K:
             if constexpr (R <= 4) {
                 GP100_LAUNCH((gp100_mmvq_q6_K<R, GLU>));
@@ -1349,13 +1373,13 @@ template <bool GLU>
 static void gp100_dispatch(const ggml_type type, const void * W, const void * G, const half * y, const float2 * ys,
                            const float * s16, float * dst, const int nrows, const int nsb, const int stride_row, cudaStream_t stream) {
     int R = gp100_rows_override(nrows, GLU);
-    if (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q3_K) {
+    if (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_0) {
         R = std::min(R, GLU ? 2 : 4); // shared staging: 4 warps x RT rows x 896 (Q6_K) or 1088 (Q8_0) bytes
     }
     if (R == 0) {
         if (type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q3_K) {
             R = GLU ? 2 : 4;
-        } else if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL) {
+        } else if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q4_0) {
             R = nrows < 2048 ? 1 : (GLU ? 2 : 4);
         } else {
             R = nrows < 2048 ? (GLU ? 1 : 2) : (GLU ? 4 : 8);

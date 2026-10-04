@@ -1713,6 +1713,11 @@ static bool ggml_cuda_hybrid_mmvq_take(const ggml_tensor * src0, const ggml_tens
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K: return true;
         case GGML_TYPE_Q8_0: return src1->ne[1] == 1;
+        case GGML_TYPE_Q4_0: {
+            // GGML_CUDA_GP100_Q4_0=0: leave one-column q4_0 to mmvq-h1 (A/B)
+            static const bool q40 = [] { const char * e = getenv("GGML_CUDA_GP100_Q4_0"); return !e || atoi(e) != 0; }();
+            return q40 && src1->ne[1] == 1;
+        }
         default:             return false;
     }
 }
