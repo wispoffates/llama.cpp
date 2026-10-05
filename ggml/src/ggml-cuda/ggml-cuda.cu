@@ -119,26 +119,34 @@ static int ggml_cuda_get_physical_device(int device) {
     return info.devices[device].physical_device;
 }
 
+// p100-series: the current CUDA device of this thread, as last set through ggml_cuda_set_device (-1 = unknown, ask the
+// runtime). Saves a cudaGetDevice per op on the host-bound decode path (perf 10-05: get/set device ~4 % of the main thread).
+// Raw cudaSetDevice calls (ggml_cuda_init) reset it to -1.
+static thread_local int ggml_cuda_cur_device = -1;
+
 // this is faster on Windows
 // probably because the Windows CUDA libraries forget to make this check before invoking the drivers
 void ggml_cuda_set_device(int device) {
     // translate the (possibly virtual) device id to the physical CUDA device that backs it
     const int physical_device = ggml_cuda_get_physical_device(device);
 
-    int current_device;
-    CUDA_CHECK(cudaGetDevice(&current_device));
+    if (ggml_cuda_cur_device < 0) {
+        CUDA_CHECK(cudaGetDevice(&ggml_cuda_cur_device));
+    }
 
-    if (physical_device == current_device) {
+    if (physical_device == ggml_cuda_cur_device) {
         return;
     }
 
     CUDA_CHECK(cudaSetDevice(physical_device));
+    ggml_cuda_cur_device = physical_device;
 }
 
 int ggml_cuda_get_device() {
-    int id;
-    CUDA_CHECK(cudaGetDevice(&id));
-    return id;
+    if (ggml_cuda_cur_device < 0) {
+        CUDA_CHECK(cudaGetDevice(&ggml_cuda_cur_device));
+    }
+    return ggml_cuda_cur_device;
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -402,6 +410,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
     }
 
+    ggml_cuda_cur_device = -1; // raw cudaSetDevice calls above
     return info;
 }
 
