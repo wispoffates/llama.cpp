@@ -470,3 +470,87 @@ bool ggml_cuda_mmvq_h1_rms_norm_mul_try(ggml_backend_cuda_context & ctx, const g
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// ---- other Pascal decode fusions (fewer launches: decode under tensor split is host-bound, perf 10-05) ----
+
+// out[:, e, t] = res[:, e, t] * scale[ids[e, t]]: the per-expert weight scale of a MUL_MAT_ID (llama-graph's reshape -> repeat ->
+// get_rows -> mul, 3 launches) in one, read straight from the scale tensor. Same single multiply, so bit-identical.
+static __global__ void mmid_slot_scale(const float * __restrict__ res, const float * __restrict__ scale, const int32_t * __restrict__ ids,
+                                       float * __restrict__ out, const int M, const int64_t res_s1, const int64_t res_s2,
+                                       const int64_t out_s1, const int64_t out_s2, const int64_t ids_s1) {
+    const int e = blockIdx.x, t = blockIdx.y;
+    const float s = scale[ids[t*ids_s1 + e]];
+    const float * r = res + t*res_s2 + e*res_s1;
+    float       * o = out + t*out_s2 + e*out_s1;
+    for (int i = threadIdx.x; i < M; i += blockDim.x) {
+        o[i] = r[i] * s;
+    }
+}
+
+void ggml_cuda_mmid_slot_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * res, const ggml_tensor * scale,
+                               const ggml_tensor * ids, ggml_tensor * out) {
+    const dim3 grid((unsigned) res->ne[1], (unsigned) res->ne[2]);
+    mmid_slot_scale<<<grid, 256, 0, ctx.stream()>>>((const float *) res->data, (const float *) scale->data,
+        (const int32_t *) ids->data, (float *) out->data, (int) res->ne[0], res->nb[1]/sizeof(float), res->nb[2]/sizeof(float),
+        out->nb[1]/sizeof(float), out->nb[2]/sizeof(float), ids->nb[1]/sizeof(int32_t));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// (scale_out * (rms_norm(x))) * w for one row: the gemma4 MoE router input (rms_norm -> scale 1/sqrt(n_embd) -> mul
+// ffn_gate_inp_s), the register path and expression order of rms_norm_f32<..., do_scale> followed by the flat mul, so the
+// result is bit-identical; 1 launch instead of 2.
+template <int block_size>
+static __global__ void __launch_bounds__(block_size) rms_norm_scale_mul(
+        const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ dst, const int ncols, const float eps,
+        const float scale_out) {
+    constexpr int max_regs = 8;
+    __shared__ float s_sum[32];
+    const int tid = threadIdx.x;
+
+    float xv[max_regs];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        xv[u] = col < ncols ? x[col] : 0.0f;
+        tmp += xv[u] * xv[u];
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        if (col < ncols) {
+            const float v = scale_out * (scale * xv[u]);
+            dst[col] = v * w[col];
+        }
+    }
+}
+
+bool ggml_cuda_rms_norm_scale_mul_try(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * scl,
+                                      ggml_tensor * mul) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc)) {
+        return false;
+    }
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mul->src[0] == scl ? mul->src[1] : mul->src[0];
+    const int64_t K = x->ne[0];
+    float scale_out, bias;
+    memcpy(&scale_out, (const float *) scl->op_params + 0, sizeof(float));
+    memcpy(&bias,      (const float *) scl->op_params + 1, sizeof(float));
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || ggml_nrows(x) != 1 || bias != 0.0f ||
+            !ggml_is_contiguous(x) || !ggml_is_contiguous(w) || !ggml_is_contiguous(mul) || !ggml_are_same_shape(w, x) ||
+            !ggml_are_same_shape(mul, x) || K < 1024 || K > 1024*8) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    rms_norm_scale_mul<1024><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul->data,
+        (int) K, eps, scale_out);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
