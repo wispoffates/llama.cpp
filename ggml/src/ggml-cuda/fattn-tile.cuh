@@ -788,6 +788,28 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
+// p100-series: true if every mask entry of the KV tile [k_VKQ_0, min(k_VKQ_0 + nbatch_fa, k_VKQ_sup)) is -inf for the ncols1
+// query rows of this block. Such a tile adds exp(-inf) = 0 to KQ_sum/VKQ and leaves KQ_max unchanged, so skipping it is exact.
+// It pays off for sliding-window layers: with a unified KV cache their view spans n_swa*n_seq + n_ubatch cells, of which only
+// the last n_swa positions of the sequence are visible (gemma4 serving: ~4.6k cells scanned for a 1024 window).
+template<int warp_size, int nthreads, int ncols1, int nbatch_fa>
+static __device__ __forceinline__ bool flash_attn_tile_masked_out(
+        const half * const __restrict__ mask, const int stride_mask, const int col_Q_0, const uint3 ne01,
+        const int k_VKQ_0, const int k_VKQ_sup) {
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+    bool visible = false;
+#pragma unroll
+    for (int e0 = 0; e0 < ncols1*nbatch_fa; e0 += nthreads) {
+        const int e = e0 + tid;
+        const int i = e % nbatch_fa;
+        if ((ncols1*nbatch_fa % nthreads == 0 || e < ncols1*nbatch_fa) && k_VKQ_0 + i < k_VKQ_sup) {
+            const int j = fastmodulo(col_Q_0 + e/nbatch_fa, ne01);
+            visible |= __half_as_ushort(mask[j*stride_mask + k_VKQ_0 + i]) != 0xFC00; // 0xFC00 = -inf
+        }
+    }
+    return !__syncthreads_or(visible);
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
@@ -952,17 +974,27 @@ static __global__ void flash_attn_tile(
 
     // Main loop over KV cache:
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    // p100-series: skip KV tiles that are fully masked for this block's queries (exact, see flash_attn_tile_masked_out).
+    // Only for long KV views: the check costs a dependent load + barrier per tile, which short views (decode at small depth,
+    // one or two tiles per block) cannot win back (llama-bench tg128 -1.2 % unconditional).
+    const bool skip_masked = maskh && ne11 >= 2048;
+    auto masked_out = [&](const int k_VKQ_0) {
+        return skip_masked && flash_attn_tile_masked_out<warp_size, nwarps*warp_size, ncols1, nbatch_fa>(
+            maskh, stride_mask, col_Q_0, ne01, k_VKQ_0, k_VKQ_max);
+    };
     if (ncols2 == 1) {
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            if (!masked_out(k_VKQ_0)) {
+                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+            }
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
-        if (k_VKQ_0 < k_VKQ_max) {
+        if (k_VKQ_0 < k_VKQ_max && !masked_out(k_VKQ_0)) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
@@ -971,6 +1003,9 @@ static __global__ void flash_attn_tile(
     } else {
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+            if (masked_out(k_VKQ_0)) {
+                continue;
+            }
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
