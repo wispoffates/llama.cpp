@@ -4555,8 +4555,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // p100-series: GGML_CUDA_GRAPHS_PASCAL=1 allows CUDA graphs on sm_60. Decode under tensor split became host-bound
+    // (perf 10-05: cudaLaunchKernel 44 % of the main thread, stream syncs ~6 %), which graph replay removes.
+    static const bool graphs_pascal = [] {
+        const char * env = getenv("GGML_CUDA_GRAPHS_PASCAL");
+        return env != nullptr && atoi(env) == 1;
+    }();
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (cc < GGML_CUDA_CC_VOLTA && !(graphs_pascal && cc >= GGML_CUDA_CC_PASCAL)) {
             if (!graph->disable_due_to_gpu_arch) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }
