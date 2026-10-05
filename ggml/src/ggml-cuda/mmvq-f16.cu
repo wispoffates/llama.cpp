@@ -377,18 +377,7 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         }
     };
     using I = std::integral_constant<int, 1>;
-    // GGML_CUDA_MMVQ_F16_RPW=8 (experiment): 8 rows per warp halves the per-warp re-reads of the NC columns' activation
-    static const int rpw8 = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_RPW"); return s && atoi(s) == 8; }();
-    if (rows >= 3072 && rpw8) {
-        static const int minb = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MINB"); return s ? atoi(s) : 4; }();
-        if (minb == 3) {
-            launch(std::integral_constant<int, 8>{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 3>{});
-        } else if (minb == 5) {
-            launch(std::integral_constant<int, 8>{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 5>{});
-        } else {
-            launch(std::integral_constant<int, 8>{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 4>{});
-        }
-    } else if (rows >= 3072) {
+    if (rows >= 3072) {
         // 6 or 7 blocks per SM (168 or 128 registers): take 7 when it needs fewer waves over the
         // SMs (3072 rows: 2 -> 1 wave, 49 vs 57 us at 5 columns; 6144: 3 -> 2; 8704: 4 -> 3).
         const int64_t nblk = (rows + MMVQ_F16_NW*MMVQ_F16_RPW - 1)/(MMVQ_F16_NW*MMVQ_F16_RPW);
