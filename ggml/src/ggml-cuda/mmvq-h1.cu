@@ -229,6 +229,161 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
     }
 }
 
+// NC columns (dense, 2..8: speculative verify, parallel decode): mmvq_h1_q's layout and staging, but each block's weights are
+// decoded to half once and then meet every column's activation (NC 16-HFMA2 chains, per-column per-block scale s), so the weights
+// are still read once. Per column the arithmetic is mmvq_h1_q's (same chain order, same fp32 fold). grid ceil(M/(WPB*RPW)).
+template <ggml_type type>
+static __device__ __forceinline__ void mmvq_h1_decode(const uint32_t * wd, const bool hi, float & d, half2 (&w)[16]) {
+    d = __half2float(__ushort_as_half((unsigned short) (hi ? wd[0] >> 16 : wd[0] & 0xffff)));
+    const int sh = hi ? 32 : 16;
+    if constexpr (type == GGML_TYPE_Q4_0) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t q = __funnelshift_rc(wd[i], wd[i + 1], sh);
+            mmvq_h1_nib(q & 0x0f0f0f0fu, w[2*i], w[2*i + 1]);
+            mmvq_h1_nib((q >> 4) & 0x0f0f0f0fu, w[8 + 2*i], w[8 + 2*i + 1]);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t q = __funnelshift_rc(wd[i], wd[i + 1], sh);
+            mmvq_h1_i8(q, w[2*i], w[2*i + 1]);
+        }
+    }
+}
+
+template <ggml_type type, int NC, int WPB, int U, int RPW>
+static __global__ void __launch_bounds__(WPB*32) mmvq_h1_qn(
+        const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XH, const float * __restrict__ XS,
+        float * __restrict__ Y, const int64_t sy, const int M, const int K) {
+    constexpr int BB  = mmvq_h1_traits<type>::BB, NWD = mmvq_h1_traits<type>::NWD;
+    constexpr int STG = (32*BB + 15 + 15)/16;
+    constexpr int NLD = (STG + 31)/32;
+    __shared__ uint4 stage[WPB][U][STG];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int r0 = (blockIdx.x*WPB + wid)*RPW;
+    if (r0 >= M) {
+        return;
+    }
+    const int nb = K/H1_QK;
+
+    float acc[NC][RPW];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            acc[c][i] = 0.0f;
+        }
+    }
+    for (int cb = 0; cb < nb; cb += 32) {
+        const int nblk = min(32, nb - cb);
+        half2 xv[NC][16];
+        float s[NC];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            s[c] = 0.0f;
+            if (lane < nblk) {
+                const uint4 * xp = (const uint4 *) (XH + (int64_t) c*K + (int64_t) (cb + lane)*H1_QK);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint4 v = xp[i];
+                    xv[c][4*i + 0] = *(const half2 *) &v.x; xv[c][4*i + 1] = *(const half2 *) &v.y;
+                    xv[c][4*i + 2] = *(const half2 *) &v.z; xv[c][4*i + 3] = *(const half2 *) &v.w;
+                }
+                s[c] = XS[(int64_t) c*nb + cb + lane];
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    xv[c][i] = __float2half2_rn(0.0f);
+                }
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < RPW; rr += U) {
+            uint4 v[U][NLD];
+            int   mis[U], nu4[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int row = min(r0 + rr + u, M - 1);
+                const uintptr_t a = (uintptr_t) (W + (int64_t) row*row_bytes + (int64_t) cb*BB);
+                mis[u] = (int) (a & 15);
+                nu4[u] = (mis[u] + nblk*BB + 15)/16;
+                const uint4 * src = (const uint4 *) (a - mis[u]);
+#pragma unroll
+                for (int j = 0; j < NLD; ++j) {
+                    if (lane + 32*j < nu4[u]) {
+                        v[u][j] = __ldg(src + lane + 32*j);
+                    }
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+#pragma unroll
+                for (int j = 0; j < NLD; ++j) {
+                    if (lane + 32*j < nu4[u]) {
+                        stage[wid][u][lane + 32*j] = v[u][j];
+                    }
+                }
+            }
+            __syncwarp();
+            if (lane < nblk) {
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+                    const int o = mis[u] + BB*lane;
+                    const uint32_t * p = (const uint32_t *) ((const char *) stage[wid][u] + (o & ~3));
+                    uint32_t wd[NWD];
+#pragma unroll
+                    for (int i = 0; i < NWD; ++i) {
+                        wd[i] = p[i];
+                    }
+                    float d;
+                    half2 w[16];
+                    mmvq_h1_decode<type>(wd, o & 2, d, w);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        // mmvq_h1_block's chain: (w[0], w[1]) .. in its order
+                        half2 h = __float2half2_rn(0.0f);
+                        if constexpr (type == GGML_TYPE_Q4_0) {
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                h = __hfma2(w[2*i],         xv[c][2*i],         h);
+                                h = __hfma2(w[2*i + 1],     xv[c][2*i + 1],     h);
+                                h = __hfma2(w[8 + 2*i],     xv[c][8 + 2*i],     h);
+                                h = __hfma2(w[8 + 2*i + 1], xv[c][8 + 2*i + 1], h);
+                            }
+                        } else {
+#pragma unroll
+                            for (int i = 0; i < 16; ++i) {
+                                h = __hfma2(w[i], xv[c][i], h);
+                            }
+                        }
+                        const float2 f = __half22float2(h);
+                        acc[c][rr + u] += s[c]*(d*(f.x + f.y));
+                    }
+                }
+            }
+            __syncwarp();
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int sft = 16; sft >= RPW; sft >>= 1) {
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) {
+                acc[c][i] += __shfl_xor_sync(0xffffffffu, acc[c][i], sft);
+            }
+        }
+        if constexpr (RPW >= 16) { mmvq_h1_bfly<8>(acc[c], lane); }
+        if constexpr (RPW >= 8)  { mmvq_h1_bfly<4>(acc[c], lane); }
+        if constexpr (RPW >= 4)  { mmvq_h1_bfly<2>(acc[c], lane); }
+        if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc[c], lane); }
+        if (lane < RPW && r0 + lane < M) {
+            Y[(int64_t) c*sy + r0 + lane] = acc[c][0];
+        }
+    }
+}
+
 // The fp16 activation (+ scales) is cached across consecutive matvecs that read the same src1 (q/k/v, an expert's gate/up); the
 // contents are fixed within one graph evaluation, cleared at the start of each. A few entries per CUDA context (per device), so
 // that an activation written ahead by the fused rms_norm (below) survives a second norm issued before its matvecs (gemma4: the
@@ -341,10 +496,14 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         nxr = src1->ne[1];
         slots = n_used;
     } else {
-        if (src0->ne[2] != 1 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        // GGML_CUDA_MMVQ_H1_NC=0: 2..8 columns back to the integer path (A/B)
+        static const bool nc_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_NC"); return !s || atoi(s) != 0; }();
+        const int64_t ncols = src1->ne[1];
+        if (src0->ne[2] != 1 || ncols < 1 || ncols > 8 || (ncols > 1 && !nc_on) || dst->ne[1] != ncols || src1->ne[2] != 1 ||
+                src1->ne[3] != 1 || (ncols > 1 && (src1->nb[1] % 16 != 0 || (uintptr_t) src1->data % 16 != 0))) {
             return false;
         }
-        nxr = 1;
+        nxr = ncols;
         slots = 1;
     }
     cudaStream_t stream = ctx.stream();
@@ -359,6 +518,47 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         mmvq_h1_prep<<<pg, 256, 0, stream>>>((const float *) src1->data, sx, xh, xs, (int) K);
     }
     constexpr int RB = MMVQ_H1_WPB*MMVQ_H1_RPW;
+    if (!ids && nxr > 1) {
+        // 8 rows per warp: each warp re-reads the NC columns' activation per chunk, so more rows per warp cut that L2 traffic (4 rows,
+        // 4 columns: 89 MB of activation reads vs 47 MB of weights at 8704 x 5120 q8_0). q8_0 at 4 columns, rows x K, 4 -> 8 rows:
+        // 8704x5120 145 -> 131 us, 5120x8704 145 -> 126, 5120x5120 87 -> 77, 5120x3072 55 -> 49 (integer path 175/173/106/66);
+        // 16 rows leaves too few blocks. GGML_CUDA_MMVQ_H1_NC_RPW=4/16 for A/B.
+        static const int rpw_n = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_NC_RPW"); return s ? atoi(s) : 8; }();
+        const int64_t syn = (int64_t) (dst->nb[1]/sizeof(float));
+        auto launchn = [&](auto type_tag, auto nc_tag) {
+            constexpr ggml_type T = decltype(type_tag)::value;
+            constexpr int NC = decltype(nc_tag)::value;
+            auto go = [&](auto rpw_tag) {
+                constexpr int R = decltype(rpw_tag)::value;
+                const dim3 gridn((unsigned) ((M + MMVQ_H1_WPB*R - 1)/(MMVQ_H1_WPB*R)));
+                mmvq_h1_qn<T, NC, MMVQ_H1_WPB, MMVQ_H1_U, R><<<gridn, MMVQ_H1_WPB*32, 0, stream>>>(
+                    (const uint8_t *) src0->data, row_bytes, xh, xs, (float *) dst->data, syn, (int) M, (int) K);
+            };
+            switch (rpw_n) {
+                case 16: go(std::integral_constant<int, 16>{}); break;
+                case 8:  go(std::integral_constant<int, 8>{});  break;
+                default: go(std::integral_constant<int, 4>{});  break;
+            }
+        };
+        auto bytype = [&](auto type_tag) {
+            switch (nxr) {
+                case 2:  launchn(type_tag, std::integral_constant<int, 2>{}); break;
+                case 3:  launchn(type_tag, std::integral_constant<int, 3>{}); break;
+                case 4:  launchn(type_tag, std::integral_constant<int, 4>{}); break;
+                case 5:  launchn(type_tag, std::integral_constant<int, 5>{}); break;
+                case 6:  launchn(type_tag, std::integral_constant<int, 6>{}); break;
+                case 7:  launchn(type_tag, std::integral_constant<int, 7>{}); break;
+                default: launchn(type_tag, std::integral_constant<int, 8>{}); break;
+            }
+        };
+        if (type == GGML_TYPE_Q4_0) {
+            bytype(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{});
+        } else {
+            bytype(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     const dim3 grid((unsigned) ((M + RB - 1)/RB), (unsigned) slots);
     const int64_t sy = ids ? (int64_t) (dst->nb[1]/sizeof(float)) : 0;
     auto launch = [&](auto type_tag) {
