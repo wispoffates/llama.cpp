@@ -1631,6 +1631,24 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             s01 *= src0_bs;
             s02 *= src0_bs;
             s03 *= src0_bs;
+        } else if (traits::convert_nc(src0->type) == nullptr && ggml_is_quantized(src0->type)) {
+            // p100-series: no strided converter for this type (K-quants, ...) -> pack the rows (whole blocks) into a contiguous copy and
+            // convert that. Stock asserts here when MMQ does not take the matmul (Pascal in an sm_60-only build: K-quant row views)
+            const size_t row_size = ggml_row_size(src0->type, ne00);
+            ggml_cuda_pool_alloc<char> src0_packed(ctx.pool(), row_size*ne01*ne02*ne03);
+            for (int64_t i03 = 0; i03 < ne03; ++i03) {
+                for (int64_t i02 = 0; i02 < ne02; ++i02) {
+                    CUDA_CHECK(cudaMemcpy2DAsync(src0_packed.get() + (i03*ne02 + i02)*ne01*row_size, row_size,
+                        (const char *) src0->data + i03*nb03 + i02*nb02, nb01, row_size, ne01, cudaMemcpyDeviceToDevice, main_stream));
+                }
+            }
+            const auto convert_func = traits::convert(src0->type);
+            GGML_ASSERT(convert_func != nullptr);
+            convert_func(src0_packed.get(), src0_alloc.get(), ggml_nelements(src0), main_stream);
+            s01 = ne00;
+            s02 = ne01*s01;
+            s03 = ne02*s02;
+            is_src0_cont_2 = true;
         } else {
             const auto convert_func = traits::convert_nc(src0->type);
             GGML_ASSERT(convert_func != nullptr);
