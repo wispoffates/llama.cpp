@@ -4410,6 +4410,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// p100-series diagnostics (exp/fusion-acc): GGML_CUDA_FUSION_STATS=1 prints how often each fused pattern ran (at exit);
+// GGML_CUDA_FUSION_SKIP=OP[,OP...] (ggml_op_name, e.g. RMS_NORM,SOFT_MAX,SCALE) leaves nodes of those ops unfused
+static bool ggml_cuda_fusion_skip_op(const ggml_tensor * node) {
+    static const std::string skip = [] { const char * e = getenv("GGML_CUDA_FUSION_SKIP"); return e ? "," + std::string(e) + "," : std::string(); }();
+    return !skip.empty() && skip.find("," + std::string(ggml_op_name(node->op)) + ",") != std::string::npos;
+}
+
+struct ggml_cuda_fusion_stats {
+    std::mutex mtx;
+    std::map<std::string, long> n;
+    ~ggml_cuda_fusion_stats() {
+        for (const auto & kv : n) {
+            fprintf(stderr, "FUSION_STATS %-48s %ld\n", kv.first.c_str(), kv.second);
+        }
+    }
+};
+
+static void ggml_cuda_fusion_note(const ggml_tensor * first, const ggml_tensor * last, int count) {
+    static const bool on = getenv("GGML_CUDA_FUSION_STATS") != nullptr && atoi(getenv("GGML_CUDA_FUSION_STATS"));
+    if (!on) {
+        return;
+    }
+    static ggml_cuda_fusion_stats stats;
+    char key[160];
+    snprintf(key, sizeof(key), "%s..%s/%d%s", ggml_op_name(first->op), ggml_op_name(last->op), count,
+             first->ne[1] == 1 && first->ne[2] <= 1 ? " (1 row)" : "");
+    std::lock_guard<std::mutex> lock(stats.mtx);
+    stats.n[key]++;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4550,9 +4580,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_fusion_skip_op(node) ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    ggml_cuda_fusion_note(node, cgraph->nodes[i + nodes_to_skip], nodes_to_skip + 1);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
