@@ -519,9 +519,11 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     constexpr int RB = MMVQ_H1_WPB*MMVQ_H1_RPW;
     if (!ids && nxr > 1) {
-        // GGML_CUDA_MMVQ_H1_NC_RPW (experiment): rows per warp; each warp re-reads the NC columns' activation per chunk, so more rows
-        // per warp cut that L2 traffic (4 rows, 4 columns: 89 MB of activation reads vs 47 MB of weights at 8704 x 5120 q8_0)
-        static const int rpw_n = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_NC_RPW"); return s ? atoi(s) : 4; }();
+        // 8 rows per warp: each warp re-reads the NC columns' activation per chunk, so more rows per warp cut that L2 traffic (4 rows,
+        // 4 columns: 89 MB of activation reads vs 47 MB of weights at 8704 x 5120 q8_0). q8_0 at 4 columns, rows x K, 4 -> 8 rows:
+        // 8704x5120 145 -> 131 us, 5120x8704 145 -> 126, 5120x5120 87 -> 77, 5120x3072 55 -> 49 (integer path 175/173/106/66);
+        // 16 rows leaves too few blocks. GGML_CUDA_MMVQ_H1_NC_RPW=4/16 for A/B.
+        static const int rpw_n = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_NC_RPW"); return s ? atoi(s) : 8; }();
         const int64_t syn = (int64_t) (dst->nb[1]/sizeof(float));
         auto launchn = [&](auto type_tag, auto nc_tag) {
             constexpr ggml_type T = decltype(type_tag)::value;
