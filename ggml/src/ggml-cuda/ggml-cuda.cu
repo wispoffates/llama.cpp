@@ -4166,6 +4166,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // p100-series: MUL_MAT_ID with a per-expert weight scale (reshape -> repeat -> get_rows -> mul) on Pascal, any weight type:
+    // the matvec runs unfused (keeps the short-K geometry), the scale is one launch instead of three (gemma4 ffn_down_exps_s)
+    if (node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_PASCAL) {
+        const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
+        const int out_nodes[] = { i + 4 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 5, ops, out_nodes, 1) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 5, out_nodes, 1)) {
+            const ggml_tensor * reshape = cgraph->nodes[i + 1];
+            const ggml_tensor * repeat  = cgraph->nodes[i + 2];
+            const ggml_tensor * getrows = cgraph->nodes[i + 3];
+            ggml_tensor *       mul     = cgraph->nodes[i + 4];
+            const ggml_tensor * scale   = reshape->src[0];
+            const ggml_tensor * ids     = node->src[2];
+            if (repeat->src[0] == reshape && getrows->src[0] == repeat && getrows->src[1] == ids &&
+                    ((mul->src[0] == node && mul->src[1] == getrows) || (mul->src[0] == getrows && mul->src[1] == node)) &&
+                    scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) && ggml_nelements(scale) == node->src[0]->ne[2] &&
+                    node->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_are_same_shape(mul, node) &&
+                    node->nb[0] == sizeof(float) && mul->nb[0] == sizeof(float) && ids->type == GGML_TYPE_I32 &&
+                    ids->ne[0] == node->ne[1] && ids->ne[1] == node->ne[2]) {
+                ggml_cuda_mul_mat_id(*cuda_ctx, node);
+                ggml_cuda_mmid_slot_scale(*cuda_ctx, node, scale, ids, mul);
+                return 4;
+            }
+        }
+    }
+
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
 
@@ -4338,6 +4364,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         }
         return 1;
+    }
+
+    // p100-series: rms_norm -> scale -> mul(w) in one launch (gemma4 MoE router input)
+    if (ggml_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE, GGML_OP_MUL }) &&
+            ggml_cuda_rms_norm_scale_mul_try(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
