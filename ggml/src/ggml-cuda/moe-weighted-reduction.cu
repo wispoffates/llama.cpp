@@ -33,27 +33,58 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
 // p100-series: one token, one block. The router weights (and expert scales) are staged in shared memory before any thread writes,
 // so they may alias dst -- the allocator reuses their buffer for dst once the unfused graph's first mul has read them, and without
 // graph_optimize's alloc deps (-sm tensor) that is the common case (gemma4 decode: the fusion was rejected 93 % of the time).
-static __global__ void moe_weighted_reduction_f32_1tok(const float * __restrict__ experts,
+// VEC4: each thread owns 4 columns and issues all experts' float4 loads before the math (one SM has to stream ~90 KB at decode).
+template <bool VEC4, int MAX_E>
+static __global__ void __launch_bounds__(1024) moe_weighted_reduction_f32_1tok(const float * __restrict__ experts,
                                                        const float * expert_scale,
                                                        const float * weights,
                                                        float * dst,
                                                        const int64_t n_embd,
                                                        const int     n_expert_used) {
-    __shared__ float w_s[32];
-    __shared__ float s_s[32];
+    __shared__ float w_s[MAX_E];
+    __shared__ float s_s[MAX_E];
     if (threadIdx.x < n_expert_used) {
         w_s[threadIdx.x] = weights[threadIdx.x];
         s_s[threadIdx.x] = expert_scale != nullptr ? expert_scale[threadIdx.x] : 1.0f;
     }
     __syncthreads();
 
-    for (int64_t col = threadIdx.x; col < n_embd; col += blockDim.x) {
-        float sum = __fmul_rn(expert_scale != nullptr ? __fmul_rn(experts[col], s_s[0]) : experts[col], w_s[0]);
-        for (int expert = 1; expert < n_expert_used; ++expert) {
-            const float e = experts[(int64_t) expert * n_embd + col];
-            sum = __fadd_rn(sum, __fmul_rn(expert_scale != nullptr ? __fmul_rn(e, s_s[expert]) : e, w_s[expert]));
+    const bool scaled = expert_scale != nullptr;
+    if constexpr (VEC4) {
+        const int64_t c4 = threadIdx.x;
+        if (c4 * 4 >= n_embd) {
+            return;
         }
-        dst[col] = sum;
+        const float4 * e4 = (const float4 *) experts;
+        const int64_t  s4 = n_embd / 4;
+        float4 v[MAX_E];
+#pragma unroll
+        for (int e = 0; e < MAX_E; ++e) {
+            if (e < n_expert_used) {
+                v[e] = e4[e * s4 + c4];
+            }
+        }
+        auto term = [&](const float x, const int e) { return __fmul_rn(scaled ? __fmul_rn(x, s_s[e]) : x, w_s[e]); };
+        float4 sum = make_float4(term(v[0].x, 0), term(v[0].y, 0), term(v[0].z, 0), term(v[0].w, 0));
+#pragma unroll
+        for (int e = 1; e < MAX_E; ++e) {
+            if (e < n_expert_used) {
+                sum.x = __fadd_rn(sum.x, term(v[e].x, e));
+                sum.y = __fadd_rn(sum.y, term(v[e].y, e));
+                sum.z = __fadd_rn(sum.z, term(v[e].z, e));
+                sum.w = __fadd_rn(sum.w, term(v[e].w, e));
+            }
+        }
+        ((float4 *) dst)[c4] = sum;
+    } else {
+        for (int64_t col = threadIdx.x; col < n_embd; col += blockDim.x) {
+            float sum = __fmul_rn(scaled ? __fmul_rn(experts[col], s_s[0]) : experts[col], w_s[0]);
+            for (int expert = 1; expert < n_expert_used; ++expert) {
+                const float e = experts[(int64_t) expert * n_embd + col];
+                sum = __fadd_rn(sum, __fmul_rn(scaled ? __fmul_rn(e, s_s[expert]) : e, w_s[expert]));
+            }
+            dst[col] = sum;
+        }
     }
 }
 
@@ -66,8 +97,17 @@ static void launch_moe_weighted_reduction(const float * experts,
                                           int           n_expert_used,
                                           cudaStream_t  stream) {
     if (n_tokens == 1) {
-        GGML_ASSERT(n_expert_used <= 32);
-        moe_weighted_reduction_f32_1tok<<<1, 1024, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+        GGML_ASSERT(n_expert_used <= 16);
+        const bool vec4 = n_embd % 4 == 0 && n_embd / 4 <= 1024 && ((uintptr_t) experts % 16) == 0 && ((uintptr_t) dst % 16) == 0;
+        if (vec4 && n_expert_used <= 8) {
+            const int threads = (int) ((n_embd / 4 + 31) / 32 * 32);
+            moe_weighted_reduction_f32_1tok<true, 8><<<1, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+        } else if (vec4 && n_embd / 4 <= 512) {  // 16 float4 per thread: keep the block small enough for the register file
+            const int threads = (int) ((n_embd / 4 + 31) / 32 * 32);
+            moe_weighted_reduction_f32_1tok<true, 16><<<1, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+        } else {
+            moe_weighted_reduction_f32_1tok<false, 16><<<1, 1024, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+        }
         return;
     }
     constexpr int threads = 256;
