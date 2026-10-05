@@ -12251,6 +12251,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1003, n, k, {1, 1}, {1, 1}));
             }
         }
+        // q6_K with an odd number of blocks per row (Swift's ffn_down split by K: 33 / 35 blocks), mid-size and big row counts
+        for (int k : {768, 3328, 8448}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1003, n, k, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 3077, n, k, {1, 1}, {1, 1}));
+        }
     }
     // one column with a short K (MMVQ small_k; on Pascal the warps then own rows): gemma4's ffn_down_exps split by K under tensor split
     // (352 -> 2816), a partial row block (2821 rows), 3 and 31 blocks per row (one and two passes); dense with the same K
@@ -12651,6 +12656,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 5120, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 3072, {1, 1}, {1, 1}));
         }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, n, 8448, {1, 1}, {1, 1})); // 33 blocks (GPU0)
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 5120, n, 8960, {1, 1}, {1, 1})); // 35 blocks (GPU1)
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
     }
 
