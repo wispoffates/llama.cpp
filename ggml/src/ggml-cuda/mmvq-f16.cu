@@ -17,8 +17,10 @@
 // Against a double-precision reference on this model's real weights: NMSE ~4.6e-7, where the
 // integer path's q8_1 activations give ~1.3e-4 (OPTLOG 203, 206).
 //
-// Layout constraints: each row must hold an even number of q6_K blocks, so that every row and every
-// 4-block window starts 4-byte aligned and block b's 2-byte phase (b & 1) is known at compile time.
+// Layout constraints: block b's 2-byte phase within a 4-block window (b & 1) is known at compile time. With an even number of
+// q6_K blocks per row every row and window starts 4-byte aligned; with an odd number (ODD; p100-series: Swift's ffn_down split by
+// K under -ts 49.3,50.7 gets 33 + 35 blocks per GPU) row r starts 2*(r & 1) bytes past a 4-byte boundary. The launches give every
+// warp an even first row, so row i of the warp has phase 2*(i & 1), again a compile-time constant after unrolling.
 
 #define MMVQ_F16_NW  2   // warps per block
 #define MMVQ_F16_RPW 4   // rows per warp
@@ -83,7 +85,7 @@ static __device__ __forceinline__ uint32_t mmvq_f16_fld(const uint32_t * wb, con
     }
 }
 
-template <int NC, int RPW, int NBLK, int B = 0>
+template <int NC, int RPW, int NBLK, bool ODD, int B = 0>
 static __device__ __forceinline__ void mmvq_f16_blocks(
         const uint32_t * const * wb, const uint2 * const * scs, const __half * const * xw, __half2 (&t)[NC][RPW],
         const int P, const int ql_w, const int qh_w, const int vh_shift, const int sp) {
@@ -99,8 +101,10 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
         }
 #pragma unroll
         for (int i = 0; i < RPW; ++i) {
-            const uint32_t vl = mmvq_f16_fld<B, 0>(wb[i], ql_w);
-            const uint32_t vh = mmvq_f16_fld<B, 128>(wb[i], qh_w) >> vh_shift;
+            // ODD rows with i odd: wb[i] points 2 bytes before the block start (see the layout note)
+            const bool ph = ODD && (i & 1);
+            const uint32_t vl = ph ? mmvq_f16_fld<B, 2>(wb[i], ql_w) : mmvq_f16_fld<B, 0>(wb[i], ql_w);
+            const uint32_t vh = (ph ? mmvq_f16_fld<B, 130>(wb[i], qh_w) : mmvq_f16_fld<B, 128>(wb[i], qh_w)) >> vh_shift;
             // scales so and so+4, precomputed per window by mmvq_f16_scales (the same half ops)
             const uint2 sAB = scs[i][B*8 + sp];
             const __half2 sA = *(const __half2 *) &sAB.x, sB = *(const __half2 *) &sAB.y;
@@ -121,7 +125,7 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
                 t[c][i] = __hfma2(w3, xb[c][1], u);
             }
         }
-        mmvq_f16_blocks<NC, RPW, NBLK, B + 1>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp);
+        mmvq_f16_blocks<NC, RPW, NBLK, ODD, B + 1>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp);
     }
 }
 
@@ -129,7 +133,7 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
 // p = l % 8 (scales j and j + 4, j = p < 4 ? p : p + 4) of block l / 8 of the window, once, instead
 // of every lane recomputing its pair for every block (~12 instructions per lane, block and row).
 // The half arithmetic is exactly the per-lane version's: sc2 = (half(1152 + sc) - 1152) * (d*1024).
-template <int RPW>
+template <int RPW, bool ODD>
 static __device__ __forceinline__ void mmvq_f16_scales(const uint32_t * const * wb, uint2 (*scst)[MMVQ_F16_NBF*8],
                                                        const int nblk, const int lane) {
     const int B = lane >> 3, p = lane & 7, j = p < 4 ? p : p + 4;
@@ -139,7 +143,7 @@ static __device__ __forceinline__ void mmvq_f16_scales(const uint32_t * const * 
     const __half2 k1152 = __float2half2_rn(1152.0f), k1024 = __float2half2_rn(1024.0f);
 #pragma unroll
     for (int i = 0; i < RPW; ++i) {
-        const uint8_t * bb = (const uint8_t *) wb[i] + 210*B;
+        const uint8_t * bb = (const uint8_t *) wb[i] + 210*B + (ODD && (i & 1) ? 2 : 0);
         const uint32_t sab = (uint32_t) bb[192 + j] | ((uint32_t) bb[196 + j] << 8);
         const uint32_t sh  = __byte_perm(sab ^ 0x8080u, 0x64646464u, 0x5140); // half(1024 + 128 + sc)
         const uint32_t d16 = *(const uint16_t *) (bb + 208);
@@ -151,7 +155,7 @@ static __device__ __forceinline__ void mmvq_f16_scales(const uint32_t * const * 
     }
 }
 
-template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT>
+template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT, bool ODD = false>
 __launch_bounds__(NWT*WARP_SIZE, MINB) // 12/NWT: 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
 static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XS,
                                      const float * __restrict__ S, float * __restrict__ Y, const int64_t sy,
@@ -215,12 +219,20 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
             }
         }
         __syncwarp();
-        mmvq_f16_scales<RPW>(wb, scst[wid], nblk, lane);
+        mmvq_f16_scales<RPW, ODD>(wb, scst[wid], nblk, lane);
         __syncwarp();
         __half2 t[NC][RPW];
-        switch (nblk) {
-            case 4: mmvq_f16_blocks<NC, RPW, 4>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break;
-            default: mmvq_f16_blocks<NC, RPW, 2>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break; // nb % 4 == 2
+        if constexpr (ODD) {
+            switch (nblk) {
+                case 4:  mmvq_f16_blocks<NC, RPW, 4, true>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break;
+                case 3:  mmvq_f16_blocks<NC, RPW, 3, true>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break;
+                default: mmvq_f16_blocks<NC, RPW, 1, true>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break; // nb % 4 == 1
+            }
+        } else {
+            switch (nblk) {
+                case 4: mmvq_f16_blocks<NC, RPW, 4, false>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break;
+                default: mmvq_f16_blocks<NC, RPW, 2, false>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break; // nb % 4 == 2
+            }
         }
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
@@ -317,7 +329,7 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // 5120x8704 161 -> 146, 5120x3072 61 -> 57. K must hold an even number of q6_K blocks.
     if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || src0->type != GGML_TYPE_Q6_K ||
             src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < 2 || ncols > 5 ||
-            K % 512 != 0 || rows < min_rows || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            K % 256 != 0 || rows < min_rows || ((K/256) % 2 != 0 && rows < 256) || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src0->nb[1] != (size_t) (K/256)*210 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
             (src1->nb[1] % 16) != 0 || ((uintptr_t) src1->data % 16) != 0 || ((uintptr_t) src0->data % 4) != 0) {
         return false;
@@ -362,6 +374,8 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     float * Y = (float *) dst->data;
     // big matrices: 2 warps x 4 rows per block; mid-size: 1 row per warp; small (< 256 rows): the 4
     // warps of a block split K over one row, so there are enough blocks and warps to cover the GPU
+    // an odd number of blocks per row (ODD) needs an even first row per warp: true for the non-KS launches (rows >= 256)
+    const bool odd = (K/256) % 2 != 0;
     auto launch = [&](auto rpw, auto nwt, auto ks, auto minb) {
         constexpr int  RPW  = decltype(rpw)::value;
         constexpr int  NWT  = decltype(nwt)::value;
@@ -369,11 +383,19 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         constexpr int  MINB = decltype(minb)::value;
         const dim3 bdk(WARP_SIZE, NWT);
         const int g = KS ? (int) ((rows + RPW - 1)/RPW) : (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
-        switch (ncols) {
-            case 2:  mmvq_f16_q6_K<2, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-            case 3:  mmvq_f16_q6_K<3, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-            case 4:  mmvq_f16_q6_K<4, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-            default: mmvq_f16_q6_K<5, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+        auto go = [&](auto odd_tag) {
+            constexpr bool O = decltype(odd_tag)::value && !KS && RPW % 2 == 0;
+            switch (ncols) {
+                case 2:  mmvq_f16_q6_K<2, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                case 3:  mmvq_f16_q6_K<3, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                case 4:  mmvq_f16_q6_K<4, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                default: mmvq_f16_q6_K<5, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+            }
+        };
+        if (odd) {
+            go(std::true_type{});
+        } else {
+            go(std::false_type{});
         }
     };
     using I = std::integral_constant<int, 1>;
@@ -394,7 +416,7 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         // arithmetic doesn't depend on the grouping, so the results are identical.
         // GGML_CUDA_MMVQ_F16_MID=0 restores 2 warps x 1 row.
         static const bool mid2 = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MID"); return !s || atoi(s) != 0; }();
-        if (mid2) {
+        if (mid2 || odd) { // the 1-row-per-warp variant has odd first rows, which ODD cannot take
             launch(std::integral_constant<int, 2>{}, I{}, std::false_type{}, std::integral_constant<int, 16>{});
         } else {
             launch(I{}, std::integral_constant<int, MMVQ_F16_NW>{}, std::false_type{}, std::integral_constant<int, 12/MMVQ_F16_NW>{});
