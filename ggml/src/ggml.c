@@ -7831,16 +7831,15 @@ bool ggml_can_fuse_subgraph_ext(const struct ggml_cgraph * cgraph,
                                 int                        num_outputs) {
     GGML_ASSERT(outputs && num_outputs > 0);
 
+    // p100-series: match the whole op sequence first (cheap), see ggml_can_fuse_ext
     for (int i = 0; i < count; ++i) {
-        if (node_idxs[i] >= cgraph->n_nodes) {
+        if (node_idxs[i] >= cgraph->n_nodes || cgraph->nodes[node_idxs[i]]->op != ops[i]) {
             return false;
         }
+    }
 
+    for (int i = 0; i < count; ++i) {
         const struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
-
-        if (node->op != ops[i]) {
-            return false;
-        }
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             return false;
