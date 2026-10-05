@@ -3953,7 +3953,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+            // p100-series: the fused kernel reads only experts, expert_scale and weights (the elided mul / views / adds may alias
+            // dst freely). dst must never overlap experts; for one token the kernel stages weights + expert_scale in shared memory
+            // before writing, so those may alias dst (their buffer is reused once the unfused graph's mul has read them)
+            auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+                return a0 < b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b) && b0 < a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+            };
+            const ggml_tensor * dst = cgraph->nodes[output_idx];
+            const bool one_token = match.experts->ne[2] * match.experts->ne[3] == 1;
+            const bool mem_ok = !overlaps(dst, match.experts) &&
+                (one_token || (!overlaps(dst, match.weights) && (match.expert_scale == nullptr || !overlaps(dst, match.expert_scale))));
+            if (mem_ok) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
