@@ -2522,7 +2522,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it
-    const bool has_mixed = llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    // p100-series: only a MIXED ubatch gets the mixed branch (allow_reuse keys on is_mixed(), so the topology may depend on it):
+    // token-only / embd-only ubatches keep the 2-way select, which saves the extra nodes on every decode step
+    const bool has_mixed = ubatch.is_mixed() && llm_arch_supports_mixed_batch(arch) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
     if (has_mixed) {
         const int64_t n_tok_rows = llm_graph_n_tok_rows(ubatch);
 
@@ -2569,7 +2571,14 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // scale the token rows only, applied after the select so that the graph is the same for any batch contents
     inp->scale_tok = tok_scale*(scale_tok_only ? hparams.f_embedding_scale : 1.0f);
-    if (inp->scale_tok != 1.0f) {
+    if (inp->scale_tok != 1.0f && !ubatch.is_mixed()) {
+        // p100-series: a non-mixed ubatch is all tokens or all embd rows -> constant scale (no per-row input to upload each step;
+        // same graph and numerics as before #29622). allow_reuse separates token from embd ubatches, so the constant is safe
+        if (!ggml_is_contiguous(cur)) {
+            cur = ggml_cont(ctx0, cur);
+        }
+        cur = ggml_scale(ctx0, cur, ubatch.token ? inp->scale_tok : 1.0f);
+    } else if (inp->scale_tok != 1.0f) {
         inp->scale_rows = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens);
         cb(inp->scale_rows, "inp_scale_rows", -1);
         ggml_set_input(inp->scale_rows);
