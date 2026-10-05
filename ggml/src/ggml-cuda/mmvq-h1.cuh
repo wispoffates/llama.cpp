@@ -13,3 +13,11 @@ void ggml_cuda_mmvq_h1_invalidate(ggml_backend_cuda_context & ctx);
 // rms_norm(x) * w for one row (decode) that also writes the fp16 activation cache entry for the h1 matvecs reading the result.
 // nodes[i] = RMS_NORM, nodes[i + 1] = MUL (already checked fusable). Returns false if it does not apply.
 bool ggml_cuda_mmvq_h1_rms_norm_mul_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+// out = res * scale[ids] per expert slot (MUL_MAT_ID per-expert weight scale), one launch.
+void ggml_cuda_mmid_slot_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * res, const ggml_tensor * scale,
+                               const ggml_tensor * ids, ggml_tensor * out);
+
+// RMS_NORM -> SCALE -> MUL(w) for one row in one launch (Pascal). Returns false if it does not apply.
+bool ggml_cuda_rms_norm_scale_mul_try(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * scl,
+                                      ggml_tensor * mul);
