@@ -816,6 +816,11 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (cc >= GGML_CUDA_CC_TURING) {
                     return ne11 <= 4;
                 }
+                // p100-series: Pascal keeps up to 8 columns here; cuBLAS' gemv for 4+ columns of a short matrix runs on a few blocks
+                // (Swift's ssm_alpha/beta, 5120 -> 48, 4-column MTP verify: 31 us vs 8.5 for 3 columns)
+                if (cc == GGML_CUDA_CC_PASCAL) {
+                    return ne11 <= 8;
+                }
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
