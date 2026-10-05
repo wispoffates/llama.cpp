@@ -9,3 +9,7 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 
 // Forget the cached fp16 activation (called at the start of every graph compute, like the q8_1 cache).
 void ggml_cuda_mmvq_h1_invalidate(ggml_backend_cuda_context & ctx);
+
+// rms_norm(x) * w for one row (decode) that also writes the fp16 activation cache entry for the h1 matvecs reading the result.
+// nodes[i] = RMS_NORM, nodes[i + 1] = MUL (already checked fusable). Returns false if it does not apply.
+bool ggml_cuda_mmvq_h1_rms_norm_mul_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
