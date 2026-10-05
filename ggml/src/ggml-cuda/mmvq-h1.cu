@@ -230,23 +230,72 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
 }
 
 // The fp16 activation (+ scales) is cached across consecutive matvecs that read the same src1 (q/k/v, an expert's gate/up); the
-// contents are fixed within one graph evaluation, cleared at the start of each. One buffer per CUDA context (per device).
-struct mmvq_h1_cache {
+// contents are fixed within one graph evaluation, cleared at the start of each. A few entries per CUDA context (per device), so
+// that an activation written ahead by the fused rms_norm (below) survives a second norm issued before its matvecs (gemma4: the
+// dense-MLP and MoE pre-norms). Keys use the view base at offset 0, so a reshape of the norm output finds the norm's entry.
+struct mmvq_h1_entry {
     const ggml_tensor * src1 = nullptr;
     const void *        data = nullptr;
     int64_t             nxr = 0, K = 0, sx = 0;
     void *              buf  = nullptr;
     size_t              cap  = 0;
-    int                 device = -1;
+};
+static constexpr int MMVQ_H1_NCACHE = 4;
+struct mmvq_h1_cache {
+    mmvq_h1_entry e[MMVQ_H1_NCACHE];
+    int           next   = 0;
+    int           device = -1;
 };
 static std::unordered_map<const ggml_backend_cuda_context *, mmvq_h1_cache> mmvq_h1_caches;
 
 void ggml_cuda_mmvq_h1_invalidate(ggml_backend_cuda_context & ctx) {
     auto it = mmvq_h1_caches.find(&ctx);
     if (it != mmvq_h1_caches.end()) {
-        it->second.src1 = nullptr;
-        it->second.data = nullptr;
+        for (mmvq_h1_entry & e : it->second.e) {
+            e.src1 = nullptr;
+            e.data = nullptr;
+        }
     }
+}
+
+static const ggml_tensor * mmvq_h1_key(const ggml_tensor * t) {
+    return t->view_src != nullptr && t->view_offs == 0 ? t->view_src : t;
+}
+
+// entry for (key, data, nxr, K, sx): hit = already holds that activation; otherwise the next entry round robin, sized for it
+static mmvq_h1_entry & mmvq_h1_slot(ggml_backend_cuda_context & ctx, const ggml_tensor * key, const void * data, const int64_t nxr,
+                                    const int64_t K, const int64_t sx, bool & hit) {
+    mmvq_h1_cache & cache = mmvq_h1_caches[&ctx];
+    if (cache.device != ctx.device) {
+        for (mmvq_h1_entry & e : cache.e) {
+            if (e.buf) {
+                ggml_cuda_set_device(cache.device);
+                CUDA_CHECK(cudaFree(e.buf));
+                ggml_cuda_set_device(ctx.device);
+            }
+        }
+        cache = mmvq_h1_cache();
+        cache.device = ctx.device;
+    }
+    for (mmvq_h1_entry & e : cache.e) {
+        if (e.src1 == key && e.data == data && e.nxr == nxr && e.K == K && e.sx == sx) {
+            hit = true;
+            return e;
+        }
+    }
+    hit = false;
+    mmvq_h1_entry & e = cache.e[cache.next];
+    cache.next = (cache.next + 1) % MMVQ_H1_NCACHE;
+    const size_t need = (size_t) nxr*K*sizeof(__half) + (size_t) nxr*(K/H1_QK)*sizeof(float);
+    if (e.cap < need) {
+        if (e.buf) {
+            CUDA_CHECK(cudaFree(e.buf)); // synchronizes; only when the buffer grows
+        }
+        CUDA_CHECK(cudaMalloc(&e.buf, need));
+        e.cap = need;
+    }
+    e.src1 = key; e.data = data; e.nxr = nxr; e.K = K; e.sx = sx;
+    return e;
 }
 
 bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -301,31 +350,10 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     cudaStream_t stream = ctx.stream();
     const int64_t sx = nxr > 1 ? (int64_t) (src1->nb[1]/sizeof(float)) : 0;
 
-    mmvq_h1_cache & cache = mmvq_h1_caches[&ctx];
-    if (cache.device != ctx.device) {
-        if (cache.buf) {
-            ggml_cuda_set_device(cache.device);
-            CUDA_CHECK(cudaFree(cache.buf));
-            ggml_cuda_set_device(ctx.device);
-        }
-        cache = mmvq_h1_cache();
-        cache.device = ctx.device;
-    }
-    const size_t xh_bytes = (size_t) nxr*K*sizeof(__half);
-    const size_t need     = xh_bytes + (size_t) nxr*(K/H1_QK)*sizeof(float);
-    const bool hit = cache.src1 == src1 && cache.data == src1->data && cache.nxr == nxr && cache.K == K && cache.sx == sx;
-    if (!hit) {
-        if (cache.cap < need) {
-            if (cache.buf) {
-                CUDA_CHECK(cudaFree(cache.buf)); // synchronizes; only when the buffer grows
-            }
-            CUDA_CHECK(cudaMalloc(&cache.buf, need));
-            cache.cap = need;
-        }
-        cache.src1 = src1; cache.data = src1->data; cache.nxr = nxr; cache.K = K; cache.sx = sx;
-    }
-    __half * xh = (__half *) cache.buf;
-    float  * xs = (float *) ((char *) cache.buf + xh_bytes);
+    bool hit;
+    mmvq_h1_entry & entry = mmvq_h1_slot(ctx, mmvq_h1_key(src1), src1->data, nxr, K, sx, hit);
+    __half * xh = (__half *) entry.buf;
+    float  * xs = (float *) ((char *) entry.buf + (size_t) nxr*K*sizeof(__half));
     if (!hit) {
         const dim3 pg((unsigned) ((K + 255)/256), (unsigned) nxr);
         mmvq_h1_prep<<<pg, 256, 0, stream>>>((const float *) src1->data, sx, xh, xs, (int) K);
@@ -349,6 +377,96 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     } else {
         launch(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
     }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// rms_norm * weight with the h1 activation prep fused in: one row of K (decode), the register path of rms_norm_f32 (same
+// arithmetic, so dst is bit-identical), and each warp's 32 consecutive outputs -- one h1 block -- also written as x/s in fp16 with
+// s = max|x| (mmvq_h1_prep's arithmetic). Saves the prep launch of every matvec fed by a norm (gemma4: 91 per GPU per token).
+template <int block_size>
+static __global__ void __launch_bounds__(block_size) mmvq_h1_rms_norm_mul(
+        const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ dst, __half * __restrict__ XH,
+        float * __restrict__ XS, const int ncols, const float eps) {
+    constexpr int max_regs = 8;
+    __shared__ float s_sum[32];
+    const int tid = threadIdx.x;
+
+    float xv[max_regs];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        xv[u] = col < ncols ? x[col] : 0.0f;
+        tmp += xv[u] * xv[u];
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        if (col < ncols) {   // ncols % 32 == 0: whole warps
+            const float v = scale * xv[u] * w[col];
+            dst[col] = v;
+            float m = fabsf(v);
+#pragma unroll
+            for (int o = 16; o >= 1; o >>= 1) {
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            }
+            const float s = m > 0.0f ? m : 1.0f;
+            XH[col] = __float2half(v/s);
+            if ((col & 31) == 0) {
+                XS[col/32] = s;
+            }
+        }
+    }
+}
+
+bool ggml_cuda_mmvq_h1_rms_norm_mul_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    // GGML_CUDA_MMVQ_H1_NORM=0: keep the separate prep (A/B)
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_CUDA_MMVQ_H1");
+        const char * n = getenv("GGML_CUDA_MMVQ_H1_NORM");
+        return (!s || atoi(s) != 0) && (!n || atoi(n) != 0);
+    }();
+    static const bool q8_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_Q8"); return !s || atoi(s) != 0; }();
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc)) {
+        return false;
+    }
+    const ggml_tensor * rms = cgraph->nodes[i];
+    const ggml_tensor * mul = cgraph->nodes[i + 1];
+    const ggml_tensor * x   = rms->src[0];
+    const ggml_tensor * w   = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const int64_t K = x->ne[0];
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || ggml_nrows(x) != 1 ||
+            !ggml_is_contiguous(x) || !ggml_is_contiguous(w) || !ggml_is_contiguous(mul) || w->ne[0] != K || ggml_nrows(w) != 1 ||
+            !ggml_are_same_shape(mul, x) || K % H1_QK != 0 || K < 32*H1_QK || K > 1024*8) {
+        return false;
+    }
+    // only when an h1-eligible matvec reads the output soon (else the cache entry would be wasted work)
+    bool consumed = false;
+    for (int j = i + 2; j < cgraph->n_nodes && j < i + 16 && !consumed; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && mmvq_h1_key(t->src[1]) == mul && t->src[0]->ne[0] == K &&
+                (t->src[0]->type == GGML_TYPE_Q4_0 || (t->src[0]->type == GGML_TYPE_Q8_0 && q8_on))) {
+            consumed = true;
+        }
+    }
+    if (!consumed) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    bool hit;
+    mmvq_h1_entry & entry = mmvq_h1_slot(ctx, mul, mul->data, 1, K, 0, hit);
+    __half * xh = (__half *) entry.buf;
+    float  * xs = (float *) ((char *) entry.buf + (size_t) K*sizeof(__half));
+    mmvq_h1_rms_norm_mul<1024><<<1, 1024, 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) w->data, (float *) mul->data, xh, xs, (int) K, eps);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
