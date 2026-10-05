@@ -11939,6 +11939,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, false, 1003, 1, k));
         }
     }
+    // few columns (speculative verify): F32 at Swift's ssm_alpha/beta shape (48 rows), q8_0 / q6_K with a partial row block (1003 rows)
+    for (int n = 2; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48,   n, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1003, n, 512,  {1, 1}, {1, 1}));
+        for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K}) {
+            for (int k : {256, 3072, 5120}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1003, n, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
     // one column with a short K (MMVQ small_k; on Pascal the warps then own rows): gemma4's ffn_down_exps split by K under tensor split
     // (352 -> 2816), a partial row block (2821 rows), 3 and 31 blocks per row (one and two passes); dense with the same K
     for (int k : {96, 352, 992}) {
@@ -12310,6 +12320,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 8704, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
         }
+    }
+
+    // Swift (27B dense, tensor split) MTP verify = 4 columns (3 drafts + 1), also 1/2/3/8. Per-GPU shapes: ffn_gate/up 5120 -> 8704,
+    // ffn_down 8704 -> 5120, attn_qkv 5120 -> 5120, ssm_out / attn_output 3072 -> 5120 (split by K), ssm_alpha/beta (F32) 5120 -> 48
+    for (int n : {1, 2, 3, 4, 8}) {
+        for (ggml_type type : {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 8704, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 8704, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 3072, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
     }
 
     // q8_0 one column at qwen36 / glimmer per-GPU shapes: attn_qkv 2048 -> 4096, the lm_head 2048 -> 124160, glimmer ffn_down
