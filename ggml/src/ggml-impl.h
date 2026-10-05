@@ -679,15 +679,15 @@ static inline bool ggml_node_has_n_uses(const struct ggml_cgraph * cgraph, int n
 // - all nodes are the same shape.
 // TODO: Consider allowing GGML_OP_NONE nodes in between
 static inline bool ggml_can_fuse_ext(const struct ggml_cgraph * cgraph, const int * node_idxs, const enum ggml_op * ops, int num_ops) {
+    // p100-series: match the whole op sequence first (cheap) before the use-count hash lookups; same result, but most
+    // patterns are tried on every node and fail on the op sequence (host-bound decode, perf 10-05)
     for (int i = 0; i < num_ops; ++i) {
-        if (node_idxs[i] >= cgraph->n_nodes) {
+        if (node_idxs[i] >= cgraph->n_nodes || cgraph->nodes[node_idxs[i]]->op != ops[i]) {
             return false;
         }
-
+    }
+    for (int i = 0; i < num_ops; ++i) {
         struct ggml_tensor * node = cgraph->nodes[node_idxs[i]];
-        if (node->op != ops[i]) {
-            return false;
-        }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             return false;
         }
