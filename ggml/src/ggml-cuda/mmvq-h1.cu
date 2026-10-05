@@ -374,6 +374,8 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_qn(
                 acc[c][i] += __shfl_xor_sync(0xffffffffu, acc[c][i], sft);
             }
         }
+        if constexpr (RPW >= 16) { mmvq_h1_bfly<8>(acc[c], lane); }
+        if constexpr (RPW >= 8)  { mmvq_h1_bfly<4>(acc[c], lane); }
         if constexpr (RPW >= 4)  { mmvq_h1_bfly<2>(acc[c], lane); }
         if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc[c], lane); }
         if (lane < RPW && r0 + lane < M) {
@@ -517,13 +519,24 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     constexpr int RB = MMVQ_H1_WPB*MMVQ_H1_RPW;
     if (!ids && nxr > 1) {
-        const dim3 gridn((unsigned) ((M + RB - 1)/RB));
+        // GGML_CUDA_MMVQ_H1_NC_RPW (experiment): rows per warp; each warp re-reads the NC columns' activation per chunk, so more rows
+        // per warp cut that L2 traffic (4 rows, 4 columns: 89 MB of activation reads vs 47 MB of weights at 8704 x 5120 q8_0)
+        static const int rpw_n = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_NC_RPW"); return s ? atoi(s) : 4; }();
         const int64_t syn = (int64_t) (dst->nb[1]/sizeof(float));
         auto launchn = [&](auto type_tag, auto nc_tag) {
             constexpr ggml_type T = decltype(type_tag)::value;
             constexpr int NC = decltype(nc_tag)::value;
-            mmvq_h1_qn<T, NC, MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW><<<gridn, MMVQ_H1_WPB*32, 0, stream>>>(
-                (const uint8_t *) src0->data, row_bytes, xh, xs, (float *) dst->data, syn, (int) M, (int) K);
+            auto go = [&](auto rpw_tag) {
+                constexpr int R = decltype(rpw_tag)::value;
+                const dim3 gridn((unsigned) ((M + MMVQ_H1_WPB*R - 1)/(MMVQ_H1_WPB*R)));
+                mmvq_h1_qn<T, NC, MMVQ_H1_WPB, MMVQ_H1_U, R><<<gridn, MMVQ_H1_WPB*32, 0, stream>>>(
+                    (const uint8_t *) src0->data, row_bytes, xh, xs, (float *) dst->data, syn, (int) M, (int) K);
+            };
+            switch (rpw_n) {
+                case 16: go(std::integral_constant<int, 16>{}); break;
+                case 8:  go(std::integral_constant<int, 8>{});  break;
+                default: go(std::integral_constant<int, 4>{});  break;
+            }
         };
         auto bytype = [&](auto type_tag) {
             switch (nxr) {
