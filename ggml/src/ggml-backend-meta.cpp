@@ -1860,6 +1860,9 @@ struct ggml_backend_meta_context {
         bool (*ar_can_norm)(void * ar, const ggml_tensor * t)                           = nullptr;
         void (*ar_run_norm)(void * ar, int rank, ggml_backend_t backend, ggml_tensor * t, const float * res, float * x_out,
                             const float * w, const float * add2, float * y, float eps)  = nullptr;
+        // GGML_META_AR_STATS=1: per-rank counts printed at teardown (fused AllReduce, + norm chain, peer copy + ADD)
+        bool                 stats = false;
+        std::atomic<int64_t> n_ar{0}, n_ar_norm{0}, n_copy{0};
 
         static inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__)
@@ -2003,6 +2006,7 @@ struct ggml_backend_meta_context {
             if (env_spin != nullptr) {
                 disp.spin_us = atoll(env_spin);
             }
+            disp.stats = getenv("GGML_META_AR_STATS") != nullptr && atoi(getenv("GGML_META_AR_STATS")) != 0;
             const char * env_ar = getenv("GGML_META_AR");
             if (env_ar == nullptr || atoi(env_ar) != 0) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
@@ -2039,6 +2043,10 @@ struct ggml_backend_meta_context {
             }
             disp.cv.notify_all();
             disp.worker.join();
+            if (disp.stats) {
+                fprintf(stderr, "%s: AllReduce stats (both ranks): in-kernel %lld (+ norm chain %lld), peer copy + ADD %lld\n", name.c_str(),
+                        (long long) disp.n_ar.load(), (long long) disp.n_ar_norm.load(), (long long) disp.n_copy.load());
+            }
             if (disp.ar != nullptr) {
                 disp.ar_destroy(disp.ar);
             }
@@ -2766,10 +2774,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             meta_match_ar_norm(me.cgraphs[i + 1].cgraph_main, node_dst, m)) {
                         backend_ctx->disp.ar_run_norm(backend_ctx->disp.ar, (int) j, me.backend, node_dst, m.res, m.x_out, m.w, m.add2, m.y, m.eps);
                         skip = m.skip;
+                        if (backend_ctx->disp.stats) {
+                            backend_ctx->disp.n_ar_norm++;
+                        }
                     } else {
                         backend_ctx->disp.ar_run(backend_ctx->disp.ar, (int) j, me.backend, node_dst);
                     }
+                    if (backend_ctx->disp.stats) {
+                        backend_ctx->disp.n_ar++;
+                    }
                     continue;
+                }
+                if (backend_ctx->disp.stats) {
+                    backend_ctx->disp.n_copy++;
                 }
                 backend_ctx->disp.barrier(); // A
 
