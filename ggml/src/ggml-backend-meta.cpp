@@ -1856,6 +1856,10 @@ struct ggml_backend_meta_context {
         bool (*ar_can)(void * ar, const ggml_tensor * t)                               = nullptr;
         void (*ar_run)(void * ar, int rank, ggml_backend_t backend, ggml_tensor * t)    = nullptr;
         void (*ar_destroy)(void * ar)                                                   = nullptr;
+        // AllReduce fused with the RMS norm (+ MUL, residual ADDs) that opens the next subgraph; GGML_META_AR_NORM=0 disables
+        bool (*ar_can_norm)(void * ar, const ggml_tensor * t)                           = nullptr;
+        void (*ar_run_norm)(void * ar, int rank, ggml_backend_t backend, ggml_tensor * t, const float * res, float * x_out,
+                            const float * w, const float * add2, float * y, float eps)  = nullptr;
 
         static inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__)
@@ -2009,10 +2013,21 @@ struct ggml_backend_meta_context {
                 if (ar_create && disp.ar_can && disp.ar_run && disp.ar_destroy) {
                     disp.ar = ar_create(simple_backends[0], simple_backends[1]);
                 }
+                const char * env_arn = getenv("GGML_META_AR_NORM");
+                if (disp.ar != nullptr && (env_arn == nullptr || atoi(env_arn) != 0)) {
+                    disp.ar_can_norm = (bool (*)(void *, const ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_can_norm");
+                    disp.ar_run_norm = (void (*)(void *, int, ggml_backend_t, ggml_tensor *, const float *, float *, const float *, const float *, float *, float))
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_run_norm");
+                    if (disp.ar_can_norm == nullptr || disp.ar_run_norm == nullptr) {
+                        disp.ar_can_norm = nullptr;
+                        disp.ar_run_norm = nullptr;
+                    }
+                }
             }
             disp.worker  = std::thread([this] { disp.worker_loop(); });
             fprintf(stderr, "%s: threaded dispatch: one host thread per device (GGML_META_THREADS=0 to disable), AllReduce: %s\n", name.c_str(),
-                disp.ar ? "in-kernel P2P handshake (GGML_META_AR=0 to disable)" : "peer copy + ADD");
+                disp.ar ? (disp.ar_run_norm ? "in-kernel P2P handshake + fused RMS norm (GGML_META_AR=0 / GGML_META_AR_NORM=0 to disable)"
+                                            : "in-kernel P2P handshake (GGML_META_AR=0 to disable)") : "peer copy + ADD");
         }
     }
 
@@ -2148,6 +2163,71 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
+}
+
+// p100-series: does the subgraph after an AllReduce open with [ADD(ar, res)] RMS_NORM MUL(w) [ADD(other)] -- a chain the CUDA backend
+// would run as one rms_norm(+mul+add) kernel -- so the AllReduce kernel can compute it? Fills the fused kernel's operands and the
+// number of leading nodes it replaces.
+struct meta_ar_norm_match {
+    int           skip  = 0;
+    const float * res   = nullptr;
+    float *       x_out = nullptr;
+    const float * w     = nullptr;
+    const float * add2  = nullptr;
+    float *       y     = nullptr;
+    float         eps   = 0.0f;
+};
+
+static bool meta_match_ar_norm(const ggml_cgraph * g, const ggml_tensor * ar, meta_ar_norm_match & m) {
+    auto f32c = [&](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->data != nullptr && ggml_are_same_shape(t, ar);
+    };
+    const int n = g->n_nodes;
+    int k = 0;
+    const ggml_tensor * x = ar;
+    if (n >= 1 && g->nodes[0]->op == GGML_OP_ADD && (g->nodes[0]->src[0] == ar || g->nodes[0]->src[1] == ar)) {
+        ggml_tensor *       add = g->nodes[0];
+        const ggml_tensor * res = add->src[0] == ar ? add->src[1] : add->src[0];
+        if (res == ar || !f32c(res) || !f32c(add)) {
+            return false;
+        }
+        m.res   = (const float *) res->data;
+        m.x_out = (float *) add->data;
+        x = add;
+        k = 1;
+    }
+    if (k + 2 > n) {
+        return false;
+    }
+    ggml_tensor * nrm = g->nodes[k];
+    ggml_tensor * mul = g->nodes[k + 1];
+    if (nrm->op != GGML_OP_RMS_NORM || nrm->src[0] != x || mul->op != GGML_OP_MUL || mul->src[0] != nrm || !f32c(mul)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[1];
+    if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->data == nullptr || w->ne[0] != ar->ne[0] ||
+        ggml_nelements(w) != ar->ne[0]) {
+        return false;
+    }
+    if (!ggml_can_fuse(g, k, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        return false; // the norm's output has another consumer
+    }
+    memcpy(&m.eps, nrm->op_params, sizeof(float));
+    m.w    = (const float *) w->data;
+    m.y    = (float *) mul->data;
+    m.skip = k + 2;
+    if (k + 2 < n && ggml_can_fuse(g, k, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        ggml_tensor * a2 = g->nodes[k + 2];
+        if (a2->src[0] == mul || a2->src[1] == mul) {
+            const ggml_tensor * o = a2->src[0] == mul ? a2->src[1] : a2->src[0];
+            if (o != mul && f32c(o) && f32c(a2)) {
+                m.add2 = (const float *) o->data;
+                m.y    = (float *) a2->data;
+                m.skip = k + 3;
+            }
+        }
+    }
+    return true;
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -2648,8 +2728,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 return ret;
             };
+            int skip = 0; // leading nodes of subgraph i already computed by the previous AllReduce kernel
             for (size_t i = 0; i < n_sub; i++) {
-                ggml_status st = ggml_backend_graph_compute_async(me.backend, me.cgraphs[i].cgraph_main);
+                ggml_cgraph * gi = me.cgraphs[i].cgraph_main;
+                ggml_status st = GGML_STATUS_SUCCESS;
+                if (skip == 0) {
+                    st = ggml_backend_graph_compute_async(me.backend, gi);
+                } else if (skip < gi->n_nodes) {
+                    ggml_cgraph view = ggml_graph_view(gi, skip, gi->n_nodes);
+                    st = ggml_backend_graph_compute_async(me.backend, &view);
+                }
+                skip = 0;
                 GGML_ASSERT(st == GGML_STATUS_SUCCESS && "threaded dispatch: subgraph compute failed");
                 if (i + 1 == n_sub) {
                     break;
@@ -2671,8 +2760,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     GGML_ASSERT(st == GGML_STATUS_SUCCESS);
                 }
                 if (backend_ctx->disp.ar != nullptr && backend_ctx->disp.ar_can(backend_ctx->disp.ar, node_dst)) {
-                    // same decision on both threads (identical shapes): the GPUs pair up inside the kernel
-                    backend_ctx->disp.ar_run(backend_ctx->disp.ar, (int) j, me.backend, node_dst);
+                    // same decision on both threads (identical shapes and graphs): the GPUs pair up inside the kernel
+                    meta_ar_norm_match m;
+                    if (backend_ctx->disp.ar_run_norm != nullptr && backend_ctx->disp.ar_can_norm(backend_ctx->disp.ar, node_dst) &&
+                            meta_match_ar_norm(me.cgraphs[i + 1].cgraph_main, node_dst, m)) {
+                        backend_ctx->disp.ar_run_norm(backend_ctx->disp.ar, (int) j, me.backend, node_dst, m.res, m.x_out, m.w, m.add2, m.y, m.eps);
+                        skip = m.skip;
+                    } else {
+                        backend_ctx->disp.ar_run(backend_ctx->disp.ar, (int) j, me.backend, node_dst);
+                    }
                     continue;
                 }
                 backend_ctx->disp.barrier(); // A
