@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -1843,16 +1844,38 @@ struct ggml_backend_meta_context {
         std::thread                         worker;
         std::mutex                          mtx;
         std::condition_variable             cv;
-        uint64_t                            job_gen  = 0;
-        uint64_t                            done_gen = 0;
-        bool                                quit     = false;
+        std::atomic<uint64_t>               job_gen{0};
+        std::atomic<uint64_t>               done_gen{0};
+        bool                                quit = false;
         std::function<ggml_status(size_t)> job;
         ggml_status                         worker_status = GGML_STATUS_SUCCESS;
+        int64_t                             spin_us = 2000; // GGML_META_SPIN_US: spin this long before sleeping on the cv
 
         std::atomic<int>                    bar_count{0};
         std::atomic<int>                    bar_gen{0};
 
-        // two-party spin barrier: the devices' subgraphs are issued in lock step, so waits are short
+        static inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
+        }
+
+        // spin (with pause) until pred() or spin_us elapsed; condvar wake-ups cost ~50-100 us each (buun-llama-cpp's measurement),
+        // two per graph compute = 1-2 % of a decode step
+        template <typename P> bool spin_until(P pred) const {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int k = 1;; ++k) {
+                if (pred()) {
+                    return true;
+                }
+                cpu_relax();
+                if ((k & 1023) == 0 && std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count() > spin_us) {
+                    return false;
+                }
+            }
+        }
+
+        // two-party spin barrier: the devices' subgraphs are issued in lock step, so waits are short; pause, rarely yield
         void barrier() {
             const int g = bar_gen.load(std::memory_order_acquire);
             if (bar_count.fetch_add(1, std::memory_order_acq_rel) == 1) {
@@ -1860,8 +1883,9 @@ struct ggml_backend_meta_context {
                 bar_gen.fetch_add(1, std::memory_order_release);
                 return;
             }
-            for (int spin = 0; bar_gen.load(std::memory_order_acquire) == g; ++spin) {
-                if (spin > 4096) {
+            for (int spin = 1; bar_gen.load(std::memory_order_acquire) == g; ++spin) {
+                cpu_relax();
+                if ((spin & ((1 << 20) - 1)) == 0) {
                     std::this_thread::yield();
                 }
             }
@@ -1870,36 +1894,47 @@ struct ggml_backend_meta_context {
         void worker_loop() {
             uint64_t seen = 0;
             for (;;) {
-                std::function<ggml_status(size_t)> f;
-                {
+                if (!spin_until([&] { return job_gen.load(std::memory_order_acquire) != seen; })) {
                     std::unique_lock<std::mutex> lock(mtx);
-                    cv.wait(lock, [&] { return quit || job_gen != seen; });
+                    cv.wait(lock, [&] { return quit || job_gen.load(std::memory_order_acquire) != seen; });
                     if (quit) {
                         return;
                     }
-                    seen = job_gen;
+                }
+                std::function<ggml_status(size_t)> f;
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    if (quit) {
+                        return;
+                    }
+                    seen = job_gen.load(std::memory_order_acquire);
                     f    = job;
                 }
                 const ggml_status st = f(1);
                 {
                     std::lock_guard<std::mutex> lock(mtx);
                     worker_status = st;
-                    done_gen      = seen;
+                    done_gen.store(seen, std::memory_order_release);
                 }
                 cv.notify_all();
             }
         }
 
         ggml_status run(const std::function<ggml_status(size_t)> & f) {
+            uint64_t g;
             {
                 std::lock_guard<std::mutex> lock(mtx);
                 job = f;
-                job_gen++;
+                g   = job_gen.load(std::memory_order_relaxed) + 1;
+                job_gen.store(g, std::memory_order_release);
             }
             cv.notify_all();
             const ggml_status st0 = f(0);
-            std::unique_lock<std::mutex> lock(mtx);
-            cv.wait(lock, [&] { return done_gen == job_gen; });
+            if (!spin_until([&] { return done_gen.load(std::memory_order_acquire) == g; })) {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [&] { return done_gen.load(std::memory_order_acquire) == g; });
+            }
+            std::lock_guard<std::mutex> lock(mtx);
             return st0 != GGML_STATUS_SUCCESS ? st0 : worker_status;
         }
     } disp;
@@ -1956,6 +1991,10 @@ struct ggml_backend_meta_context {
         // peer-copy + ADD AllReduce (= that fallback) and never calls comm_allreduce.
         if (env_threads != nullptr && atoi(env_threads) == 1 && n_devs == 2) {
             disp.enabled = true;
+            const char * env_spin = getenv("GGML_META_SPIN_US");
+            if (env_spin != nullptr) {
+                disp.spin_us = atoll(env_spin);
+            }
             disp.worker  = std::thread([this] { disp.worker_loop(); });
             fprintf(stderr, "%s: threaded dispatch: one host thread per device (GGML_META_THREADS=1)\n", name.c_str());
         }
