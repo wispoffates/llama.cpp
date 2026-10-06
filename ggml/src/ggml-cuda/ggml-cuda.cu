@@ -3198,6 +3198,32 @@ static bool ggml_cuda_check_fusion_memory_ranges_counted(int line, const ggml_cg
         const int * out_nodes, const int out_count, const bool is_topk_moe = false) {
     const bool ok = ggml_cuda_check_fusion_memory_ranges_impl(cgraph, node_idx, node_count, out_nodes, out_count, is_topk_moe);
     ggml_cuda_memchk_note(line, ok);
+    // GGML_CUDA_MEMCHK_DEBUG=<line>:<count> prints what overlaps on rejection
+    static int dbg_line = 0, dbg_left = 0;
+    static bool dbg_init = [] { const char * e = getenv("GGML_CUDA_MEMCHK_DEBUG"); if (e) { sscanf(e, "%d:%d", &dbg_line, &dbg_left); } return true; }();
+    GGML_UNUSED(dbg_init);
+    if (!ok && line == dbg_line && dbg_left > 0) {
+        dbg_left--;
+        for (int o = 0; o < out_count; ++o) {
+            const ggml_tensor * dst = cgraph->nodes[out_nodes[o]];
+            const size_t dsz = ggml_backend_buft_get_alloc_size(dst->buffer->buft, dst);
+            fprintf(stderr, "MEMCHK_DEBUG line %d reject: dst=%s(%s) [%p +%zu]\n", line, dst->name, ggml_op_name(dst->op), dst->data, dsz);
+            for (int j = node_idx; j < node_idx + node_count; ++j) {
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    const ggml_tensor * src = cgraph->nodes[j]->src[k];
+                    if (!src || src->op == GGML_OP_NONE) continue;
+                    const size_t ssz = ggml_backend_buft_get_alloc_size(src->buffer->buft, src);
+                    const char * a = (const char *) src->data, * b = (const char *) dst->data;
+                    bool inner = false;
+                    for (int q = node_idx; q < j; ++q) inner |= cgraph->nodes[q] == src;
+                    if (a < b + dsz && b < a + ssz && !inner) {
+                        fprintf(stderr, "MEMCHK_DEBUG   node %d %s(%s) src%d=%s(%s) [%p +%zu] type=%s\n", j - node_idx, cgraph->nodes[j]->name,
+                                ggml_op_name(cgraph->nodes[j]->op), k, src->name, ggml_op_name(src->op), src->data, ssz, ggml_type_name(src->type));
+                    }
+                }
+            }
+        }
+    }
     return ok;
 }
 #define ggml_cuda_check_fusion_memory_ranges(...) ggml_cuda_check_fusion_memory_ranges_counted(__LINE__, __VA_ARGS__)
