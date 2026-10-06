@@ -12113,6 +12113,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48, n, 5120, {1, 1}, {1, 1}));
     }
 
+    // gemma4 26B-A4B decode (one token) at per-GPU tensor-split shapes, q4_0: attn k/v 2816 -> 1024 (512 on full-attention layers),
+    // q 2816 -> 2048 (4096), attn_output 2048 (4096) -> 2816 split by K, dense ffn gate/up 2816 -> 1056 (split 1088 / 1024 today),
+    // dense ffn_down 1056 -> 2816 split by K, lm_head 2816 -> 131072; experts: gate_up 2816 -> 704 per GPU (split 896 / 512 today),
+    // down 352 -> 2816 split by K, 8 of 128 used
+    for (auto mk : std::vector<std::pair<int, int>>{{1024, 2816}, {512, 2816}, {1088, 2816}, {1056, 2816}, {2048, 2816}, {4096, 2816},
+                                                    {2816, 2048}, {2816, 4096}, {2816, 1056}, {131072, 2816}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, mk.first, 1, mk.second, {1, 1}, {1, 1}));
+    }
+    for (int m : {896, 704, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, m, 1, 2816));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, 1, 352));
+
     // q8_0 one column at qwen36 / glimmer per-GPU shapes: attn_qkv 2048 -> 4096, the lm_head 2048 -> 124160, glimmer ffn_down
     // 9984 -> 6656 and attn_q 6656 -> 2048
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 4096,   1, 2048, {1, 1}, {1, 1}));
