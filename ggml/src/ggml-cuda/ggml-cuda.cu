@@ -3110,7 +3110,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 }
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
-static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+static bool ggml_cuda_check_fusion_memory_ranges_impl(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
                                                  const int           node_count,
                                                  const int *         out_nodes,
@@ -3173,6 +3173,34 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 
     return is_ok;
 }
+
+// diag (exp/fusion audit): GGML_CUDA_FUSION_STATS=1 also counts overlap-check pass / fail per call site (source line)
+struct ggml_cuda_memchk_stats {
+    std::mutex mtx;
+    std::map<int, std::pair<long, long>> n;
+    ~ggml_cuda_memchk_stats() {
+        for (const auto & kv : n) {
+            fprintf(stderr, "FUSION_MEMCHK line=%d pass=%ld fail=%ld\n", kv.first, kv.second.first, kv.second.second);
+        }
+    }
+};
+static void ggml_cuda_memchk_note(int line, bool ok) {
+    static const bool on = getenv("GGML_CUDA_FUSION_STATS") != nullptr && atoi(getenv("GGML_CUDA_FUSION_STATS"));
+    if (!on) {
+        return;
+    }
+    static ggml_cuda_memchk_stats stats;
+    std::lock_guard<std::mutex> lock(stats.mtx);
+    auto & e = stats.n[line];
+    (ok ? e.first : e.second)++;
+}
+static bool ggml_cuda_check_fusion_memory_ranges_counted(int line, const ggml_cgraph * cgraph, const int node_idx, const int node_count,
+        const int * out_nodes, const int out_count, const bool is_topk_moe = false) {
+    const bool ok = ggml_cuda_check_fusion_memory_ranges_impl(cgraph, node_idx, node_count, out_nodes, out_count, is_topk_moe);
+    ggml_cuda_memchk_note(line, ok);
+    return ok;
+}
+#define ggml_cuda_check_fusion_memory_ranges(...) ggml_cuda_check_fusion_memory_ranges_counted(__LINE__, __VA_ARGS__)
 
 // The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
 // 31 nodes, so k <= 15; larger values use the per-operation path.
@@ -3630,6 +3658,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const bool one_token = match.experts->ne[2] * match.experts->ne[3] == 1;
             const bool mem_ok = !overlaps(dst, match.experts) &&
                 (one_token || (!overlaps(dst, match.weights) && (match.expert_scale == nullptr || !overlaps(dst, match.expert_scale))));
+            ggml_cuda_memchk_note(-1, mem_ok);  // -1 = MoE weighted reduction (own check)
             if (mem_ok) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
