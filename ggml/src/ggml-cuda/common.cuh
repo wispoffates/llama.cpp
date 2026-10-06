@@ -1306,6 +1306,11 @@ struct ggml_backend_cuda_context {
     // reuse an activation conversion only within one graph evaluation
     uint64_t graph_epoch = 0;
 
+    // p100-series: per-context activation caches of mmvq-h1.cu / mmvq-f16.cu (owned there; were global maps keyed by the context,
+    // which two dispatch threads -- one per device -- would race on)
+    void * mmvq_h1_cache  = nullptr;
+    void * mmvq_f16_cache = nullptr;
+
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

@@ -824,6 +824,12 @@ bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
 
     const int device = ggml_cuda_get_device();
 
+    // p100-series: no PDL below Hopper -- answer before the global mutex + hash lookup below, which every kernel launch through
+    // ggml_cuda_kernel_launch paid (~5 % of the decode host thread on the P100s) and which dispatch threads would contend on
+    if (ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_HOPPER) {
+        return false;
+    }
+
     struct cache_key {
         int          device;
         const void * kernel;
