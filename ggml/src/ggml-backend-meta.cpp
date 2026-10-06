@@ -1817,14 +1817,15 @@ struct ggml_backend_meta_context {
     // is bound by it); with a thread per device it is the max. The main thread drives device 0, a persistent worker device 1.
     struct threaded_dispatch {
         bool                                enabled = false;
-        std::thread                         worker;
+        int                                 n_workers = 1;  // 1: main thread = device 0, worker = device 1; 2: a worker per device
+        std::thread                         workers[2];
         std::mutex                          mtx;
         std::condition_variable             cv;
         std::atomic<uint64_t>               job_gen{0};
-        std::atomic<uint64_t>               done_gen{0};
+        std::atomic<uint64_t>               done_gen[2] = {{0}, {0}};
         bool                                quit = false;
         std::function<ggml_status(size_t)> job;
-        ggml_status                         worker_status = GGML_STATUS_SUCCESS;
+        ggml_status                         worker_status[2] = {GGML_STATUS_SUCCESS, GGML_STATUS_SUCCESS};
         int64_t                             spin_us = 2000; // GGML_META_SPIN_US: spin this long before sleeping on the cv
 
         std::atomic<int>                    bar_count{0};
@@ -1836,8 +1837,7 @@ struct ggml_backend_meta_context {
 #endif
         }
 
-        // spin (with pause) until pred() or spin_us elapsed; condvar wake-ups cost ~50-100 us each (buun-llama-cpp's measurement),
-        // two per graph compute = 1-2 % of a decode step
+        // spin (with pause) until pred() or spin_us elapsed; condvar wake-ups cost ~50-100 us each (buun-llama-cpp's measurement)
         template <typename P> bool spin_until(P pred) const {
             const auto t0 = std::chrono::steady_clock::now();
             for (int k = 1;; ++k) {
@@ -1867,7 +1867,7 @@ struct ggml_backend_meta_context {
             }
         }
 
-        void worker_loop() {
+        void worker_loop(const size_t j) {
             uint64_t seen = 0;
             for (;;) {
                 if (!spin_until([&] { return job_gen.load(std::memory_order_acquire) != seen; })) {
@@ -1886,13 +1886,32 @@ struct ggml_backend_meta_context {
                     seen = job_gen.load(std::memory_order_acquire);
                     f    = job;
                 }
-                const ggml_status st = f(1);
+                const ggml_status st = f(j);
                 {
                     std::lock_guard<std::mutex> lock(mtx);
-                    worker_status = st;
-                    done_gen.store(seen, std::memory_order_release);
+                    worker_status[j] = st;
+                    done_gen[j].store(seen, std::memory_order_release);
                 }
                 cv.notify_all();
+            }
+        }
+
+        void start(const int nw) {
+            n_workers = nw;
+            for (int w = 0; w < nw; ++w) {
+                const size_t j = nw == 2 ? (size_t) w : 1;
+                workers[w] = std::thread([this, j] { worker_loop(j); });
+            }
+        }
+
+        void stop() {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                quit = true;
+            }
+            cv.notify_all();
+            for (int w = 0; w < n_workers; ++w) {
+                workers[w].join();
             }
         }
 
@@ -1905,13 +1924,22 @@ struct ggml_backend_meta_context {
                 job_gen.store(g, std::memory_order_release);
             }
             cv.notify_all();
-            const ggml_status st0 = f(0);
-            if (!spin_until([&] { return done_gen.load(std::memory_order_acquire) == g; })) {
+            const ggml_status st0 = n_workers == 2 ? GGML_STATUS_SUCCESS : f(0);
+            auto all_done = [&] {
+                return done_gen[1].load(std::memory_order_acquire) == g && (n_workers == 1 || done_gen[0].load(std::memory_order_acquire) == g);
+            };
+            if (!spin_until(all_done)) {
                 std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [&] { return done_gen.load(std::memory_order_acquire) == g; });
+                cv.wait(lock, all_done);
             }
             std::lock_guard<std::mutex> lock(mtx);
-            return st0 != GGML_STATUS_SUCCESS ? st0 : worker_status;
+            if (st0 != GGML_STATUS_SUCCESS) {
+                return st0;
+            }
+            if (n_workers == 2 && worker_status[0] != GGML_STATUS_SUCCESS) {
+                return worker_status[0];
+            }
+            return worker_status[1];
         }
     } disp;
     std::string                 name;
@@ -1965,25 +1993,22 @@ struct ggml_backend_meta_context {
         // note: the CUDA backend always returns a comm context (mode "none" when neither NCCL nor its internal AllReduce can run,
         // e.g. below Volta: comm_allreduce then declines and the butterfly fallback runs). The threaded path does its own
         // peer-copy + ADD AllReduce (= that fallback) and never calls comm_allreduce.
-        if (env_threads != nullptr && atoi(env_threads) == 1 && n_devs == 2) {
+        // GGML_META_THREADS=1: the main thread issues device 0, a worker device 1; =2: a worker per device (main thread only waits)
+        const int n_thr_mode = env_threads != nullptr ? atoi(env_threads) : 0;
+        if ((n_thr_mode == 1 || n_thr_mode == 2) && n_devs == 2) {
             disp.enabled = true;
             const char * env_spin = getenv("GGML_META_SPIN_US");
             if (env_spin != nullptr) {
                 disp.spin_us = atoll(env_spin);
             }
-            disp.worker  = std::thread([this] { disp.worker_loop(); });
-            fprintf(stderr, "%s: threaded dispatch: one host thread per device (GGML_META_THREADS=1)\n", name.c_str());
+            disp.start(n_thr_mode);
+            fprintf(stderr, "%s: threaded dispatch: one host thread per device (GGML_META_THREADS=%d)\n", name.c_str(), n_thr_mode);
         }
     }
 
     ~ggml_backend_meta_context() {
         if (disp.enabled) {
-            {
-                std::lock_guard<std::mutex> lock(disp.mtx);
-                disp.quit = true;
-            }
-            disp.cv.notify_all();
-            disp.worker.join();
+            disp.stop();
         }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
