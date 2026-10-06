@@ -6,7 +6,13 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <condition_variable>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -1820,7 +1826,78 @@ struct ggml_backend_meta_context {
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
         }
+
+        ggml_backend_buffer_ptr bufs_par[2]; // threaded dispatch: AllReduce receive buffers, alternating by subgraph parity
     };
+
+    // p100-series: GGML_META_THREADS=1 (2 devices, no comm backend) -> one host thread per device issues that device's subgraphs and
+    // its half of each AllReduce. Single-threaded, the host time per token is the SUM of the devices' launch work (decode on 2 P100s
+    // is bound by it); with a thread per device it is the max. The main thread drives device 0, a persistent worker device 1.
+    struct threaded_dispatch {
+        bool                                enabled = false;
+        std::thread                         worker;
+        std::mutex                          mtx;
+        std::condition_variable             cv;
+        uint64_t                            job_gen  = 0;
+        uint64_t                            done_gen = 0;
+        bool                                quit     = false;
+        std::function<ggml_status(size_t)> job;
+        ggml_status                         worker_status = GGML_STATUS_SUCCESS;
+
+        std::atomic<int>                    bar_count{0};
+        std::atomic<int>                    bar_gen{0};
+
+        // two-party spin barrier: the devices' subgraphs are issued in lock step, so waits are short
+        void barrier() {
+            const int g = bar_gen.load(std::memory_order_acquire);
+            if (bar_count.fetch_add(1, std::memory_order_acq_rel) == 1) {
+                bar_count.store(0, std::memory_order_relaxed);
+                bar_gen.fetch_add(1, std::memory_order_release);
+                return;
+            }
+            for (int spin = 0; bar_gen.load(std::memory_order_acquire) == g; ++spin) {
+                if (spin > 4096) {
+                    std::this_thread::yield();
+                }
+            }
+        }
+
+        void worker_loop() {
+            uint64_t seen = 0;
+            for (;;) {
+                std::function<ggml_status(size_t)> f;
+                {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] { return quit || job_gen != seen; });
+                    if (quit) {
+                        return;
+                    }
+                    seen = job_gen;
+                    f    = job;
+                }
+                const ggml_status st = f(1);
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    worker_status = st;
+                    done_gen      = seen;
+                }
+                cv.notify_all();
+            }
+        }
+
+        ggml_status run(const std::function<ggml_status(size_t)> & f) {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                job = f;
+                job_gen++;
+            }
+            cv.notify_all();
+            const ggml_status st0 = f(0);
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [&] { return done_gen == job_gen; });
+            return st0 != GGML_STATUS_SUCCESS ? st0 : worker_status;
+        }
+    } disp;
     std::string                 name;
     std::vector<backend_config> backend_configs;
     ggml_context_ptr            ctx;
@@ -1867,9 +1944,24 @@ struct ggml_backend_meta_context {
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
         }
+
+        const char * env_threads = getenv("GGML_META_THREADS");
+        if (env_threads != nullptr && atoi(env_threads) == 1 && n_devs == 2 && comm_ctx == nullptr) {
+            disp.enabled = true;
+            disp.worker  = std::thread([this] { disp.worker_loop(); });
+            GGML_LOG_INFO("%s: threaded dispatch: one host thread per device (GGML_META_THREADS=1)\n", name.c_str());
+        }
     }
 
     ~ggml_backend_meta_context() {
+        if (disp.enabled) {
+            {
+                std::lock_guard<std::mutex> lock(disp.mtx);
+                disp.quit = true;
+            }
+            disp.cv.notify_all();
+            disp.worker.join();
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2465,6 +2557,85 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+
+    if (backend_ctx->disp.enabled && n_backends == 2) {
+        // Device j issues its subgraphs and pulls the peer's partial sum for each AllReduce (2 devices = one butterfly step):
+        //   compute(i) -> [barrier A: both partials enqueued] -> copy peer -> recv[i % 2] (enqueued on the PEER's stream, plus a
+        //   wait on ours) -> [barrier B: both pulls enqueued before either in-place ADD overwrites its partial] -> ADD(i) -> ...
+        // The receive buffer alternates by parity: the peer's copy(i) runs after its wait on our copy-out(i - 1), which our stream
+        // issues after ADD(i - 2) -- the last reader of recv[i % 2]. Each device uses its own slice of the aux node / graph pools.
+        const size_t n_sub = backend_ctx->n_subgraphs;
+        const size_t ms    = backend_ctx->max_subgraphs;
+        auto run = [&](const size_t j) -> ggml_status {
+            auto & me   = backend_ctx->backend_configs[j];
+            auto & peer = backend_ctx->backend_configs[j ^ 1];
+            size_t ina_j = j * 3 * backend_ctx->n_reduce_steps * ms;
+            size_t iga_j = j * 2 * backend_ctx->n_reduce_steps * ms;
+            auto node_aux = [&](const ggml_tensor * t) -> ggml_tensor * {
+                ggml_tensor * ret = backend_ctx->nodes_aux[ina_j++];
+                memset(ret, 0, sizeof(ggml_tensor));
+                ret->op   = GGML_OP_NONE;
+                ret->type = t->type;
+                for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
+                    ret->ne[k] = t->ne[k];
+                    ret->nb[k] = t->nb[k];
+                }
+                return ret;
+            };
+            for (size_t i = 0; i < n_sub; i++) {
+                ggml_status st = ggml_backend_graph_compute_async(me.backend, me.cgraphs[i].cgraph_main);
+                GGML_ASSERT(st == GGML_STATUS_SUCCESS && "threaded dispatch: subgraph compute failed");
+                if (i + 1 == n_sub) {
+                    break;
+                }
+                ggml_tensor * node_dst = me.cgraphs[i].cgraph_main->nodes[me.cgraphs[i].cgraph_main->n_nodes - 1];
+                if (!(node_dst->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_nelements(node_dst) > 0) {
+                    // zero-sized slice on this device: its partial is zero
+                    ggml_tensor * node_zero = node_aux(node_dst);
+                    node_zero->op = GGML_OP_FILL;
+                    node_zero->src[0] = node_dst;
+                    ggml_set_op_params_f32(node_zero, 0, 0.0f);
+                    node_zero->data   = node_dst->data;
+                    node_zero->buffer = node_dst->buffer;
+                    node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                    ggml_cgraph * g = backend_ctx->cgraphs_aux[iga_j++];
+                    g->nodes[0] = node_zero;
+                    g->n_nodes  = 1;
+                    st = ggml_backend_graph_compute_async(me.backend, g);
+                    GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+                }
+                backend_ctx->disp.barrier(); // A
+
+                ggml_tensor * node_src = peer.cgraphs[i].cgraph_main->nodes[peer.cgraphs[i].cgraph_main->n_nodes - 1];
+                GGML_ASSERT(ggml_is_contiguous(node_src) && ggml_is_contiguous(node_dst));
+                ggml_backend_buffer_ptr & rb = me.bufs_par[i & 1];
+                if (!rb || ggml_backend_buffer_get_size(rb.get()) < backend_ctx->max_tmp_size) {
+                    rb.reset(ggml_backend_alloc_buffer(me.backend, backend_ctx->max_tmp_size));
+                }
+                ggml_tensor * node_tmp = node_aux(node_dst);
+                node_tmp->buffer = rb.get();
+                node_tmp->data   = ggml_backend_buffer_get_base(rb.get());
+                ggml_backend_tensor_copy_async(peer.backend, me.backend, node_src, node_tmp);
+                backend_ctx->disp.barrier(); // B
+
+                ggml_tensor * node_red = node_aux(node_dst);
+                node_red->view_src  = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
+                node_red->view_offs = node_dst->view_offs;
+                node_red->op        = GGML_OP_ADD;
+                node_red->src[0]    = node_dst;
+                node_red->src[1]    = node_tmp;
+                node_red->flags    |= GGML_TENSOR_FLAG_COMPUTE;
+                ggml_backend_view_init(node_red);
+                ggml_cgraph * g = backend_ctx->cgraphs_aux[iga_j++];
+                g->nodes[0] = node_red;
+                g->n_nodes  = 1;
+                st = ggml_backend_graph_compute_async(me.backend, g);
+                GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+            }
+            return GGML_STATUS_SUCCESS;
+        };
+        return backend_ctx->disp.run(run);
+    }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
