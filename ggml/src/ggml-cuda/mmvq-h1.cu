@@ -401,12 +401,17 @@ struct mmvq_h1_cache {
     int           next   = 0;
     int           device = -1;
 };
-static std::unordered_map<const ggml_backend_cuda_context *, mmvq_h1_cache> mmvq_h1_caches;
+// lives in ctx.mmvq_h1_cache (one per backend context, so one per dispatch thread); never freed, like the context's other pools
+static mmvq_h1_cache & mmvq_h1_cache_of(ggml_backend_cuda_context & ctx) {
+    if (ctx.mmvq_h1_cache == nullptr) {
+        ctx.mmvq_h1_cache = new mmvq_h1_cache();
+    }
+    return *(mmvq_h1_cache *) ctx.mmvq_h1_cache;
+}
 
 void ggml_cuda_mmvq_h1_invalidate(ggml_backend_cuda_context & ctx) {
-    auto it = mmvq_h1_caches.find(&ctx);
-    if (it != mmvq_h1_caches.end()) {
-        for (mmvq_h1_entry & e : it->second.e) {
+    if (ctx.mmvq_h1_cache != nullptr) {
+        for (mmvq_h1_entry & e : ((mmvq_h1_cache *) ctx.mmvq_h1_cache)->e) {
             e.src1 = nullptr;
             e.data = nullptr;
         }
@@ -420,7 +425,7 @@ static const ggml_tensor * mmvq_h1_key(const ggml_tensor * t) {
 // entry for (key, data, nxr, K, sx): hit = already holds that activation; otherwise the next entry round robin, sized for it
 static mmvq_h1_entry & mmvq_h1_slot(ggml_backend_cuda_context & ctx, const ggml_tensor * key, const void * data, const int64_t nxr,
                                     const int64_t K, const int64_t sx, bool & hit) {
-    mmvq_h1_cache & cache = mmvq_h1_caches[&ctx];
+    mmvq_h1_cache & cache = mmvq_h1_cache_of(ctx);
     if (cache.device != ctx.device) {
         for (mmvq_h1_entry & e : cache.e) {
             if (e.buf) {
