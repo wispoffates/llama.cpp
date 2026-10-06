@@ -304,13 +304,18 @@ struct mmvq_f16_cache {
     size_t              cap  = 0;
     int                 device = -1; // the buffer's device: a freed context's address can be reused by one on another GPU
 };
-static std::unordered_map<const ggml_backend_cuda_context *, mmvq_f16_cache> mmvq_f16_caches;
+// lives in ctx.mmvq_f16_cache (one per backend context, so one per dispatch thread)
+static mmvq_f16_cache & mmvq_f16_cache_of(ggml_backend_cuda_context & ctx) {
+    if (ctx.mmvq_f16_cache == nullptr) {
+        ctx.mmvq_f16_cache = new mmvq_f16_cache();
+    }
+    return *(mmvq_f16_cache *) ctx.mmvq_f16_cache;
+}
 
 void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx) {
-    auto it = mmvq_f16_caches.find(&ctx);
-    if (it != mmvq_f16_caches.end()) {
-        it->second.src1 = nullptr;
-        it->second.data = nullptr;
+    if (ctx.mmvq_f16_cache != nullptr) {
+        ((mmvq_f16_cache *) ctx.mmvq_f16_cache)->src1 = nullptr;
+        ((mmvq_f16_cache *) ctx.mmvq_f16_cache)->data = nullptr;
     }
 }
 
@@ -337,7 +342,7 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
     cudaStream_t stream = ctx.stream();
 
-    mmvq_f16_cache & cache = mmvq_f16_caches[&ctx];
+    mmvq_f16_cache & cache = mmvq_f16_cache_of(ctx);
     if (cache.device != ctx.device) {
         // a stale entry from a destroyed context on another device: its buffer is not usable here
         if (cache.buf) {
