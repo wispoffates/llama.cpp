@@ -11418,6 +11418,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, false, 1003, 1, k));
         }
     }
+    // one column, small M, K >= 1024: mmvq-h1's split-K path (2..4 warps per row group, balanced block ranges, partial row block)
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
+        for (int m : {1003, 512, 2816}) {
+            for (int k : {1056, 2048, 2816, 4096}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
     // few columns (speculative verify): F32 at Swift's ssm_alpha/beta shape (48 rows), q8_0 / q6_K with a partial row block (1003 rows)
     for (int n = 2; n <= 8; ++n) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 48,   n, 5120, {1, 1}, {1, 1}));

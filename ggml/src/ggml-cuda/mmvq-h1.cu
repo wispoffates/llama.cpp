@@ -229,6 +229,117 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
     }
 }
 
+// split-K variant for SMALL dense matrices (one column): the plain layout gives a 1024 x 2816 matvec 64 blocks of 4 warps
+// (~4 warps per SM) and reaches ~175 GB/s. Here a block is KS warps on the SAME RPW rows; warp w takes a contiguous, balanced
+// range of blocks [w*nb/KS, (w+1)*nb/KS) (in chunks of <= 32, lane = block as above), so a row's K is read by KS warps in
+// parallel without re-reading the activation. Partial row sums meet in shared memory and are added in warp order:
+// deterministic, but not the plain kernel's summation order. grid ceil(M/RPW).
+template <ggml_type type, int KS, int U, int RPW>
+static __global__ void __launch_bounds__(KS*32) mmvq_h1_qs(
+        const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XH, const float * __restrict__ XS,
+        float * __restrict__ Y, const int M, const int K) {
+    constexpr int BB  = mmvq_h1_traits<type>::BB, NWD = mmvq_h1_traits<type>::NWD;
+    constexpr int STG = (32*BB + 15 + 15)/16;
+    constexpr int NLD = (STG + 31)/32;
+    __shared__ uint4 stage[KS][U][STG];
+    __shared__ float part[KS][RPW];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int r0 = blockIdx.x*RPW;
+    const int nb = K/H1_QK;
+    const int b0 = (int) ((int64_t) wid*nb/KS), b1 = (int) ((int64_t) (wid + 1)*nb/KS);
+
+    float acc[RPW];
+#pragma unroll
+    for (int i = 0; i < RPW; ++i) {
+        acc[i] = 0.0f;
+    }
+    for (int cb = b0; cb < b1; cb += 32) {
+        const int nblk = min(32, b1 - cb);
+        half2 xv[16];
+        float s = 0.0f;
+        if (lane < nblk) {
+            const uint4 * xp = (const uint4 *) (XH + (int64_t) (cb + lane)*H1_QK);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint4 v = xp[i];
+                xv[4*i + 0] = *(const half2 *) &v.x; xv[4*i + 1] = *(const half2 *) &v.y;
+                xv[4*i + 2] = *(const half2 *) &v.z; xv[4*i + 3] = *(const half2 *) &v.w;
+            }
+            s = XS[cb + lane];
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                xv[i] = __float2half2_rn(0.0f);
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < RPW; rr += U) {
+            uint4 v[U][NLD];
+            int   mis[U], nu4[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int row = min(r0 + rr + u, M - 1);
+                const uintptr_t a = (uintptr_t) (W + (int64_t) row*row_bytes + (int64_t) cb*BB);
+                mis[u] = (int) (a & 15);
+                nu4[u] = (mis[u] + nblk*BB + 15)/16;
+                const uint4 * src = (const uint4 *) (a - mis[u]);
+#pragma unroll
+                for (int j = 0; j < NLD; ++j) {
+                    if (lane + 32*j < nu4[u]) {
+                        v[u][j] = __ldg(src + lane + 32*j);
+                    }
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+#pragma unroll
+                for (int j = 0; j < NLD; ++j) {
+                    if (lane + 32*j < nu4[u]) {
+                        stage[wid][u][lane + 32*j] = v[u][j];
+                    }
+                }
+            }
+            __syncwarp();
+            if (lane < nblk) {
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+                    const int o = mis[u] + BB*lane;
+                    const uint32_t * p = (const uint32_t *) ((const char *) stage[wid][u] + (o & ~3));
+                    uint32_t wd[NWD];
+#pragma unroll
+                    for (int i = 0; i < NWD; ++i) {
+                        wd[i] = p[i];
+                    }
+                    acc[rr + u] += s*mmvq_h1_block<type>(wd, o & 2, xv);
+                }
+            }
+            __syncwarp();
+        }
+    }
+#pragma unroll
+    for (int sft = 16; sft >= RPW; sft >>= 1) {
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            acc[i] += __shfl_xor_sync(0xffffffffu, acc[i], sft);
+        }
+    }
+    if constexpr (RPW >= 8)  { mmvq_h1_bfly<4>(acc, lane); }
+    if constexpr (RPW >= 4)  { mmvq_h1_bfly<2>(acc, lane); }
+    if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc, lane); }
+    if (lane < RPW) {
+        part[wid][lane] = acc[0];
+    }
+    __syncthreads();
+    if (wid == 0 && lane < RPW && r0 + lane < M) {
+        float sum = part[0][lane];
+#pragma unroll
+        for (int w = 1; w < KS; ++w) {
+            sum += part[w][lane];
+        }
+        Y[r0 + lane] = sum;
+    }
+}
+
 // NC columns (dense, 2..8: speculative verify, parallel decode): mmvq_h1_q's layout and staging, but each block's weights are
 // decoded to half once and then meet every column's activation (NC 16-HFMA2 chains, per-column per-block scale s), so the weights
 // are still read once. Per column the arithmetic is mmvq_h1_q's (same chain order, same fp32 fold). grid ceil(M/(WPB*RPW)).
@@ -560,6 +671,29 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             bytype(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{});
         } else {
             bytype(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+    // small dense one-column matrices: split K across 2..4 warps per row group when the plain grid would give fewer than 4 blocks
+    // per SM (GGML_CUDA_MMVQ_H1_SPLITK=0 for A/B)
+    static const bool splitk_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_SPLITK"); return !s || atoi(s) != 0; }();
+    const int64_t nchunks = (K/H1_QK + 31)/32;
+    if (splitk_on && !ids && nxr == 1 && nchunks >= 2 && (M + RB - 1)/RB < 4*ggml_cuda_info().devices[ctx.device].nsm) {
+        const int ks = (int) std::min<int64_t>(nchunks, 4);
+        const dim3 grids((unsigned) ((M + MMVQ_H1_RPW - 1)/MMVQ_H1_RPW));
+        auto launchs = [&](auto type_tag) {
+            constexpr ggml_type T = decltype(type_tag)::value;
+            switch (ks) {
+                case 2:  mmvq_h1_qs<T, 2, MMVQ_H1_U, MMVQ_H1_RPW><<<grids, 2*32, 0, stream>>>((const uint8_t *) src0->data, row_bytes, xh, xs, (float *) dst->data, (int) M, (int) K); break;
+                case 3:  mmvq_h1_qs<T, 3, MMVQ_H1_U, MMVQ_H1_RPW><<<grids, 3*32, 0, stream>>>((const uint8_t *) src0->data, row_bytes, xh, xs, (float *) dst->data, (int) M, (int) K); break;
+                default: mmvq_h1_qs<T, 4, MMVQ_H1_U, MMVQ_H1_RPW><<<grids, 4*32, 0, stream>>>((const uint8_t *) src0->data, row_bytes, xh, xs, (float *) dst->data, (int) M, (int) K); break;
+            }
+        };
+        if (type == GGML_TYPE_Q4_0) {
+            launchs(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{});
+        } else {
+            launchs(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
         }
         CUDA_CHECK(cudaGetLastError());
         return true;
