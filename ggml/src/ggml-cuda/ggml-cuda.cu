@@ -6290,6 +6290,19 @@ static void ggml_backend_cuda_ar_rank_run(void * c, int rank, ggml_backend_t bac
     ggml_cuda_ar_rank_reduce((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), t);
 }
 
+static bool ggml_backend_cuda_ar_rank_can_norm(void * c, const ggml_tensor * t) {
+    return ggml_cuda_ar_rank_norm_eligible((const ggml_cuda_ar_rank_ctx *) c, t);
+}
+
+static void ggml_backend_cuda_ar_rank_run_norm(void * c, int rank, ggml_backend_t backend, ggml_tensor * t, const float * res, float * x_out,
+                                               const float * w, const float * add2, float * y, float eps) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_ar_rank_norm_args a;
+    a.res = res; a.x_out = x_out; a.w = w; a.add2 = add2; a.y = y; a.eps = eps;
+    ggml_cuda_ar_rank_reduce_norm((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), t, a);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6312,6 +6325,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_ar_rank_run") == 0) {
         return (void *)ggml_backend_cuda_ar_rank_run;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_can_norm") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_can_norm;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_run_norm") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_run_norm;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
