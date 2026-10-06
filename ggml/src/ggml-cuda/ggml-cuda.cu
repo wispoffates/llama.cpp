@@ -3142,7 +3142,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const ggml_tensor * src_may_alias = nullptr) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3175,7 +3176,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias || src == src_may_alias) {
                     continue;
                 }
 
@@ -3388,7 +3389,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
         if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu)) {
             int out_nodes[] = { node_idx + 2 };
-            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+            // p100-series: with quantized weights the fused launch is MMVQ (integer path or the Pascal hybrid), which reads a q8_1 /
+            // fp16 copy of the shared activation made by an earlier kernel, never src1 itself -> the GLU output may reuse src1's
+            // buffer (the allocator does exactly that once gate/up are its last readers; gemma4's dense FFN: rejected 100 %)
+            const ggml_tensor * act = is_equal(mul_mat_glu_ops, ops) && ggml_is_quantized(ffn_up->src[0]->type) &&
+                ffn_up->src[1] == ffn_gate->src[1] ? ffn_up->src[1] : nullptr;
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1, false, act);
         }
     }
 
