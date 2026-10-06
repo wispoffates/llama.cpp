@@ -1851,6 +1851,13 @@ struct ggml_backend_meta_context {
         std::atomic<int>                    bar_count{0};
         std::atomic<int>                    bar_gen{0};
 
+        // backend-provided per-device AllReduce (CUDA: ar-rank.cu, P2P + in-kernel handshake): each thread enqueues its device's
+        // half and continues -- no host barriers. nullptr -> peer copy + ADD with two barriers. GGML_META_AR=0 disables.
+        void * ar = nullptr;
+        bool (*ar_can)(void * ar, const ggml_tensor * t)                               = nullptr;
+        void (*ar_run)(void * ar, int rank, ggml_backend_t backend, ggml_tensor * t)    = nullptr;
+        void (*ar_destroy)(void * ar)                                                   = nullptr;
+
         static inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__)
             __builtin_ia32_pause();
@@ -1993,8 +2000,20 @@ struct ggml_backend_meta_context {
             if (env_spin != nullptr) {
                 disp.spin_us = atoll(env_spin);
             }
+            const char * env_ar = getenv("GGML_META_AR");
+            if (env_ar == nullptr || atoi(env_ar) != 0) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+                auto ar_create  = (void * (*)(ggml_backend_t, ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_create");
+                disp.ar_can     = (bool (*)(void *, const ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_can");
+                disp.ar_run     = (void (*)(void *, int, ggml_backend_t, ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_run");
+                disp.ar_destroy = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_destroy");
+                if (ar_create && disp.ar_can && disp.ar_run && disp.ar_destroy) {
+                    disp.ar = ar_create(simple_backends[0], simple_backends[1]);
+                }
+            }
             disp.worker  = std::thread([this] { disp.worker_loop(); });
-            fprintf(stderr, "%s: threaded dispatch: one host thread per device (GGML_META_THREADS=0 to disable)\n", name.c_str());
+            fprintf(stderr, "%s: threaded dispatch: one host thread per device (GGML_META_THREADS=0 to disable), AllReduce: %s\n", name.c_str(),
+                disp.ar ? "in-kernel P2P handshake (GGML_META_AR=0 to disable)" : "peer copy + ADD");
         }
     }
 
@@ -2006,6 +2025,9 @@ struct ggml_backend_meta_context {
             }
             disp.cv.notify_all();
             disp.worker.join();
+            if (disp.ar != nullptr) {
+                disp.ar_destroy(disp.ar);
+            }
         }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
@@ -2648,6 +2670,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     g->n_nodes  = 1;
                     st = ggml_backend_graph_compute_async(me.backend, g);
                     GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+                }
+                if (backend_ctx->disp.ar != nullptr && backend_ctx->disp.ar_can(backend_ctx->disp.ar, node_dst)) {
+                    // same decision on both threads (identical shapes): the GPUs pair up inside the kernel
+                    backend_ctx->disp.ar_run(backend_ctx->disp.ar, (int) j, me.backend, node_dst);
+                    continue;
                 }
                 backend_ctx->disp.barrier(); // A
 
