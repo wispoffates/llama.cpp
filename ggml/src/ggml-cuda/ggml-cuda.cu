@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/ar-rank.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -6258,6 +6259,37 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// p100-series: per-device AllReduce for the meta backend's threaded dispatch (ar-rank.cu). Returns nullptr unless both backends are
+// CUDA devices with peer access (GGML_CUDA_P2P). GGML_META_AR_MAX_BYTES: largest reduction taken (default 1 MiB; larger ones keep
+// the peer copy + ADD path).
+static void * ggml_backend_cuda_ar_rank_create(ggml_backend_t b0, ggml_backend_t b1) {
+    if (!ggml_backend_is_cuda(b0) || !ggml_backend_is_cuda(b1)) {
+        return nullptr;
+    }
+    const int d0 = ((ggml_backend_cuda_context *) b0->context)->device;
+    const int d1 = ((ggml_backend_cuda_context *) b1->context)->device;
+    if (d0 == d1) {
+        return nullptr;
+    }
+    const char * env = getenv("GGML_META_AR_MAX_BYTES");
+    const size_t max_bytes = env ? (size_t) strtoull(env, nullptr, 10) : (size_t) 1 << 20;
+    return max_bytes > 0 ? ggml_cuda_ar_rank_init(d0, d1, max_bytes) : nullptr;
+}
+
+static void ggml_backend_cuda_ar_rank_destroy(void * c) {
+    ggml_cuda_ar_rank_free((ggml_cuda_ar_rank_ctx *) c);
+}
+
+static bool ggml_backend_cuda_ar_rank_can(void * c, const ggml_tensor * t) {
+    return ggml_cuda_ar_rank_eligible((const ggml_cuda_ar_rank_ctx *) c, t);
+}
+
+static void ggml_backend_cuda_ar_rank_run(void * c, int rank, ggml_backend_t backend, ggml_tensor * t) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_ar_rank_reduce((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), t);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -6268,6 +6300,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_create") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_create;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_destroy") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_destroy;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_can") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_can;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_run") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_run;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
