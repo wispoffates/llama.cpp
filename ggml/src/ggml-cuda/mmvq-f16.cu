@@ -373,13 +373,16 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }();
     // GGML_CUDA_MMVQ_F16_MINROWS: the smallest row count that takes this path
     static const int64_t min_rows = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MINROWS"); return s ? (int64_t) atoll(s) : (int64_t) 16; }();
+    // GGML_CUDA_MMVQ_F16_1COL=1 (p100-series 10-06, experimental): also one column (ornith's dense q6_K attn_qkv / attn_v /
+    // ffn_down_shexp otherwise take the integer path at ~27 us each); not bit-identical to the integer path (fp16 vs q8_1)
+    static const bool one_col = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_1COL"); return s && atoi(s) != 0; }();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t K = src0->ne[0], rows = src0->ne[1];
     // Where it measured faster than the integer path (OPTLOG 206), test-backend-ops at 5 columns, rows x K:
     // 8704x5120 154 -> 133 us, 6144x5120 115 -> 97, 5120x5120 98 -> 89, 3072x5120 67 -> 61,
     // 5120x8704 161 -> 146, 5120x3072 61 -> 57. K must hold an even number of q6_K blocks.
     if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || src0->type != GGML_TYPE_Q6_K ||
-            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < 2 || ncols > 5 ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < (one_col ? 1 : 2) || ncols > 5 ||
             K % 256 != 0 || rows < min_rows || ((K/256) % 2 != 0 && rows < 256) || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src0->nb[1] != (size_t) (K/256)*210 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
             (src1->nb[1] % 16) != 0 || ((uintptr_t) src1->data % 16) != 0 || ((uintptr_t) src0->data % 4) != 0) {
@@ -441,6 +444,7 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
                 constexpr bool O  = decltype(odd_tag)::value;
                 constexpr int  MB = decltype(mb)::value;
                 switch (ncols) {
+                    case 1:  mmvq_f16_q6_K<1, RPW, NWT, false, MB, O, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                     case 2:  mmvq_f16_q6_K<2, RPW, NWT, false, MB, O, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                     case 3:  mmvq_f16_q6_K<3, RPW, NWT, false, MB, O, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                     case 4:  mmvq_f16_q6_K<4, RPW, NWT, false, MB, O, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
@@ -466,6 +470,7 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         auto go = [&](auto odd_tag) {
             constexpr bool O = decltype(odd_tag)::value && !KS && RPW % 2 == 0;
             switch (ncols) {
+                case 1:  mmvq_f16_q6_K<1, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                 case 2:  mmvq_f16_q6_K<2, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                 case 3:  mmvq_f16_q6_K<3, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                 case 4:  mmvq_f16_q6_K<4, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
