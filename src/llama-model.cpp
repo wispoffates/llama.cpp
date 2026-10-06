@@ -833,7 +833,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // of down must use the same step (each device's GLU slice is its down slice), and 64 is the K unit of the q4_0 tile kernels
             // (tile-mm.cu: 2 blocks; q8_0 needs 4 -> stays 128). 128 split gemma4's 704-wide expert FFN 448 / 256 per device (gate_up
             // 896 / 512 rows), so every MoE layer waited on the device with the bigger half; 64 gives 384 / 320.
-            const int64_t blck_size_perf = std::lcm(blck_size, type_axis_0 == GGML_TYPE_Q4_0 ? 64 : 128);
+            // dense FFN (no "_exps"): its K split (down) never meets the tile kernels' 64-unit rule (prefill takes cuBLAS, decode
+            // mmvq-h1 needs K % 32), so a 32 step balances gemma4's 2112-wide dense FFN 1056 / 1056 (64 left it 1088 / 1024)
+            const bool is_exps = tensor_name.find("_exps") != std::string::npos;
+            const int64_t blck_size_perf = std::lcm(blck_size, type_axis_0 == GGML_TYPE_Q4_0 ? (is_exps ? 64 : 32) : 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
         }
