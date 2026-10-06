@@ -3196,8 +3196,8 @@ static void ggml_cuda_memchk_note(int line, bool ok) {
     (ok ? e.first : e.second)++;
 }
 static bool ggml_cuda_check_fusion_memory_ranges_counted(int line, const ggml_cgraph * cgraph, const int node_idx, const int node_count,
-        const int * out_nodes, const int out_count, const bool is_topk_moe = false) {
-    const bool ok = ggml_cuda_check_fusion_memory_ranges_impl(cgraph, node_idx, node_count, out_nodes, out_count, is_topk_moe);
+        const int * out_nodes, const int out_count, const bool is_topk_moe = false, const ggml_tensor * src_may_alias = nullptr) {
+    const bool ok = ggml_cuda_check_fusion_memory_ranges_impl(cgraph, node_idx, node_count, out_nodes, out_count, is_topk_moe, src_may_alias);
     ggml_cuda_memchk_note(line, ok);
     // GGML_CUDA_MEMCHK_DEBUG=<line>:<count> prints what overlaps on rejection
     static int dbg_line = 0, dbg_left = 0;
