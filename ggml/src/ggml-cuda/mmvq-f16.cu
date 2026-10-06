@@ -155,7 +155,10 @@ static __device__ __forceinline__ void mmvq_f16_scales(const uint32_t * const * 
     }
 }
 
-template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT, bool ODD = false>
+// PF (p100-series 10-06): software pipelining -- the next window's weights are loaded into registers while this window is
+// computed (each warp used to load a window into shared memory and only then compute, so with ~12 warps per SM the global
+// load latency showed every window: ~300 GB/s on Swift's verify shapes). Same arithmetic, identical results.
+template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT, bool ODD = false, bool PF = false>
 __launch_bounds__(NWT*WARP_SIZE, MINB) // 12/NWT: 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
 static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XS,
                                      const float * __restrict__ S, float * __restrict__ Y, const int64_t sy,
@@ -198,23 +201,66 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
         xw[c] = XS + (int64_t) c*K + (KS ? (int64_t) wid*MMVQ_F16_WIN : 0);
     }
 
-    for (int win = KS ? wid : 0; win < nw; win += KS ? NWT : 1) {
-        const int nblk = min(MMVQ_F16_NBF, nb - win*MMVQ_F16_NBF);
-        __syncwarp();
-        const uint32_t * wb[RPW];
+    constexpr int NR = (NU + 31)/32;
+    uint4 pf[PF ? RPW : 1][NR];
+    int   pm[PF ? RPW : 1];
+    auto issue = [&](const int win_) { // PF: window win_'s bytes -> registers
+        const int nblk_ = min(MMVQ_F16_NBF, nb - win_*MMVQ_F16_NBF);
 #pragma unroll
         for (int i = 0; i < RPW; ++i) {
             const char * g = rp[i];
             rp[i] += KS ? (int64_t) NWT*WB : WB;
-            const int m = (int) ((uintptr_t) g & 15); // a multiple of 4
-            wb[i] = (const uint32_t *) wst[wid][i] + (m >> 2);
+            const int m = (int) ((uintptr_t) g & 15);
+            pm[PF ? i : 0] = m;
             const uint4 * g16 = (const uint4 *) (g - m);
-            const int nu = (m + nblk*210 + 15)/16;
+            const int nu = (m + nblk_*210 + 15)/16;
 #pragma unroll
-            for (int r = 0; r < (NU + 31)/32; ++r) {
+            for (int r = 0; r < NR; ++r) {
                 const int k = r*32 + lane;
-                if (k < nu) {
-                    wst[wid][i][k] = __ldg(g16 + k);
+                pf[PF ? i : 0][r] = k < nu ? __ldg(g16 + k) : make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+    if constexpr (PF) {
+        if ((KS ? wid : 0) < nw) {
+            issue(KS ? wid : 0);
+        }
+    }
+
+    for (int win = KS ? wid : 0; win < nw; win += KS ? NWT : 1) {
+        const int nblk = min(MMVQ_F16_NBF, nb - win*MMVQ_F16_NBF);
+        __syncwarp();
+        const uint32_t * wb[RPW];
+        if constexpr (PF) {
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) {
+                wb[i] = (const uint32_t *) wst[wid][i] + (pm[i] >> 2);
+#pragma unroll
+                for (int r = 0; r < NR; ++r) {
+                    const int k = r*32 + lane;
+                    if (k < NU) {
+                        wst[wid][i][k] = pf[i][r];
+                    }
+                }
+            }
+            if (win + (KS ? NWT : 1) < nw) {
+                issue(win + (KS ? NWT : 1));
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) {
+                const char * g = rp[i];
+                rp[i] += KS ? (int64_t) NWT*WB : WB;
+                const int m = (int) ((uintptr_t) g & 15); // a multiple of 4
+                wb[i] = (const uint32_t *) wst[wid][i] + (m >> 2);
+                const uint4 * g16 = (const uint4 *) (g - m);
+                const int nu = (m + nblk*210 + 15)/16;
+#pragma unroll
+                for (int r = 0; r < NR; ++r) {
+                    const int k = r*32 + lane;
+                    if (k < nu) {
+                        wst[wid][i][k] = __ldg(g16 + k);
+                    }
                 }
             }
         }
@@ -381,11 +427,40 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // warps of a block split K over one row, so there are enough blocks and warps to cover the GPU
     // an odd number of blocks per row (ODD) needs an even first row per warp: true for the non-KS launches (rows >= 256)
     const bool odd = (K/256) % 2 != 0;
+    // GGML_CUDA_MMVQ_F16_PF=1: software-pipelined weight loads (see the kernel); =N>1 also sets its blocks-per-SM bound
+    static const int pf_env = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_PF"); return s ? atoi(s) : 0; }();
     auto launch = [&](auto rpw, auto nwt, auto ks, auto minb) {
         constexpr int  RPW  = decltype(rpw)::value;
         constexpr int  NWT  = decltype(nwt)::value;
         constexpr bool KS   = decltype(ks)::value;
         constexpr int  MINB = decltype(minb)::value;
+        if (pf_env != 0 && !KS && NWT == MMVQ_F16_NW && RPW == MMVQ_F16_RPW) {
+            const dim3 bdk(WARP_SIZE, NWT);
+            const int g = (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
+            auto gopf = [&](auto odd_tag, auto mb) {
+                constexpr bool O  = decltype(odd_tag)::value;
+                constexpr int  MB = decltype(mb)::value;
+                switch (ncols) {
+                    case 2:  mmvq_f16_q6_K<2, RPW, NWT, false, MB, O, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                    case 3:  mmvq_f16_q6_K<3, RPW, NWT, false, MB, O, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                    case 4:  mmvq_f16_q6_K<4, RPW, NWT, false, MB, O, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                    default: mmvq_f16_q6_K<5, RPW, NWT, false, MB, O, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                }
+            };
+            auto gomb = [&](auto odd_tag) {
+                switch (pf_env) {
+                    case 4:  gopf(odd_tag, std::integral_constant<int, 4>{}); break;
+                    case 6:  gopf(odd_tag, std::integral_constant<int, 6>{}); break;
+                    default: gopf(odd_tag, std::integral_constant<int, 5>{}); break;
+                }
+            };
+            if (odd) {
+                gomb(std::true_type{});
+            } else {
+                gomb(std::false_type{});
+            }
+            return;
+        }
         const dim3 bdk(WARP_SIZE, NWT);
         const int g = KS ? (int) ((rows + RPW - 1)/RPW) : (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
         auto go = [&](auto odd_tag) {
