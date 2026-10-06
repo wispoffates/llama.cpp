@@ -717,7 +717,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {{tensor->ne[axis], 1}};
     };
 
-    auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
+    auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments, ggml_type type_axis_0) -> std::vector<int64_t> {
         // for better performance it may make sense to round up blck_size to a higher power of 2 so that more efficient kernels can be used
         if (hparams.is_recr(il)) {
             // linear attention
@@ -839,7 +839,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
-            const int64_t blck_size_perf = std::lcm(blck_size, 128);
+            // p100-series: q4_0 FFN tensors split in 64-unit steps instead of 128. The row split of gate / up / gate_up and the K split
+            // of down must use the same step (each device's GLU slice is its down slice), and 64 is the K unit of the q4_0 tile kernels
+            // (tile-mm.cu: 2 blocks; q8_0 needs 4 -> stays 128). 128 split gemma4's 704-wide expert FFN 448 / 256 per device (gate_up
+            // 896 / 512 rows), so every MoE layer waited on the device with the bigger half; 64 gives 384 / 320.
+            const int64_t blck_size_perf = std::lcm(blck_size, type_axis_0 == GGML_TYPE_Q4_0 ? 64 : 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
         }
@@ -865,7 +869,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
-        const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
+        const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments, tc.tensor_axis_0->type);
         for (size_t is = 0; is < segments.size(); is++) {
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
