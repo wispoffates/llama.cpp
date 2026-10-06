@@ -680,7 +680,9 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     static const bool splitk_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_SPLITK"); return !s || atoi(s) != 0; }();
     const int64_t nchunks = (K/H1_QK + 31)/32;
     if (splitk_on && !ids && nxr == 1 && nchunks >= 2 && (M + RB - 1)/RB < 4*ggml_cuda_info().devices[ctx.device].nsm) {
-        const int ks = (int) std::min<int64_t>(nchunks, 4);
+        // GGML_CUDA_MMVQ_H1_KS=2/3/4 forces the split (tuning)
+        static const int ks_force = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_KS"); return s ? atoi(s) : 0; }();
+        const int ks = ks_force >= 2 && ks_force <= 4 ? ks_force : (int) std::min<int64_t>(nchunks, 4);
         const dim3 grids((unsigned) ((M + MMVQ_H1_RPW - 1)/MMVQ_H1_RPW));
         auto launchs = [&](auto type_tag) {
             constexpr ggml_type T = decltype(type_tag)::value;
