@@ -675,14 +675,27 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
-    // small dense one-column matrices: split K across 2..4 warps per row group when the plain grid would give fewer than 4 blocks
-    // per SM (GGML_CUDA_MMVQ_H1_SPLITK=0 for A/B)
+    // small dense one-column matrices: split K across 2..4 warps per row group (GGML_CUDA_MMVQ_H1_SPLITK=0 for A/B). Measured on gemma4's
+    // per-GPU shapes (P100, q4_0, test-backend-ops perf): <= 72 plain blocks (<= ~1150 rows): 3 warps (4 at <= 32 blocks), -18..-20 %;
+    // 73..223 blocks: 2 warps only when each gets whole 32-block chunks or a single chunk (2816 x 1056 / 2048 / 4096: -7..-11 %;
+    // 2048 x 2816 = 44 + 44 blocks lost 4 %, 3 warps 8 %); >= 4 blocks per SM: plain.
     static const bool splitk_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_SPLITK"); return !s || atoi(s) != 0; }();
-    const int64_t nchunks = (K/H1_QK + 31)/32;
-    if (splitk_on && !ids && nxr == 1 && nchunks >= 2 && (M + RB - 1)/RB < 4*ggml_cuda_info().devices[ctx.device].nsm) {
-        // GGML_CUDA_MMVQ_H1_KS=2/3/4 forces the split (tuning)
-        static const int ks_force = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_KS"); return s ? atoi(s) : 0; }();
-        const int ks = ks_force >= 2 && ks_force <= 4 ? ks_force : (int) std::min<int64_t>(nchunks, 4);
+    // GGML_CUDA_MMVQ_H1_KS=2/3/4 forces the split (tuning)
+    static const int ks_force = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_KS"); return s ? atoi(s) : 0; }();
+    const int64_t nbk     = K/H1_QK;
+    const int64_t nchunks = (nbk + 31)/32;
+    const int64_t pblocks = (M + RB - 1)/RB;
+    int ks = 0;
+    if (splitk_on && !ids && nxr == 1 && nchunks >= 2 && pblocks < 4*ggml_cuda_info().devices[ctx.device].nsm) {
+        if (ks_force >= 2 && ks_force <= 4) {
+            ks = ks_force;
+        } else if (pblocks <= 72) {
+            ks = (int) std::min<int64_t>(nchunks, pblocks <= 32 ? 4 : 3);
+        } else if (nbk <= 64 || nbk % 64 == 0) {
+            ks = 2;
+        }
+    }
+    if (ks >= 2) {
         const dim3 grids((unsigned) ((M + MMVQ_H1_RPW - 1)/MMVQ_H1_RPW));
         auto launchs = [&](auto type_tag) {
             constexpr ggml_type T = decltype(type_tag)::value;
