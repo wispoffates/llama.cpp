@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cassert>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <mutex>
@@ -1831,7 +1832,7 @@ struct ggml_backend_meta_context {
         ggml_backend_buffer_ptr bufs_par[2]; // threaded dispatch: AllReduce receive buffers, alternating by subgraph parity
     };
 
-    // p100-series: GGML_META_THREADS=1 (2 devices, no comm backend) -> one host thread per device issues that device's subgraphs and
+    // p100-series: GGML_META_THREADS=1 (2 devices) -> one host thread per device issues that device's subgraphs and
     // its half of each AllReduce. Single-threaded, the host time per token is the SUM of the devices' launch work (decode on 2 P100s
     // is bound by it); with a thread per device it is the max. The main thread drives device 0, a persistent worker device 1.
     struct threaded_dispatch {
@@ -1947,10 +1948,13 @@ struct ggml_backend_meta_context {
         }
 
         const char * env_threads = getenv("GGML_META_THREADS");
-        if (env_threads != nullptr && atoi(env_threads) == 1 && n_devs == 2 && comm_ctx == nullptr) {
+        // note: the CUDA backend always returns a comm context (mode "none" when neither NCCL nor its internal AllReduce can run,
+        // e.g. below Volta: comm_allreduce then declines and the butterfly fallback runs). The threaded path does its own
+        // peer-copy + ADD AllReduce (= that fallback) and never calls comm_allreduce.
+        if (env_threads != nullptr && atoi(env_threads) == 1 && n_devs == 2) {
             disp.enabled = true;
             disp.worker  = std::thread([this] { disp.worker_loop(); });
-            GGML_LOG_INFO("%s: threaded dispatch: one host thread per device (GGML_META_THREADS=1)\n", name.c_str());
+            fprintf(stderr, "%s: threaded dispatch: one host thread per device (GGML_META_THREADS=1)\n", name.c_str());
         }
     }
 
