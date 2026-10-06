@@ -80,6 +80,78 @@ static __global__ void ggml_cuda_ar_rank_kernel(float * data, const int n, float
     }
 }
 
+// AllReduce fused with the RMS norm that opens the next subgraph (exactly rms_norm_f32<BS, true[, true]>'s register path: same
+// thread -> column map, accumulation order, block_reduce and output expression, so the result is bit-identical):
+//   ADD_FIRST:  x = (mine + peer) + res, stored to x_out (the residual ADD node), then norm      (qwen35moe: AR -> ADD -> RMS_NORM -> MUL)
+//   otherwise:  x = mine + peer, then norm                                                     (gemma4:    AR -> RMS_NORM -> MUL [-> ADD])
+//   y = rsqrt(mean(x^2) + eps) * x * w [+ add2]
+// One block per row (rows striped over the grid); the handshake partition is by row on both devices.
+template <int BS, bool ADD_FIRST, bool ADD_AFTER>
+static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
+        float * data, const int ncols, const int nrows, float * __restrict__ wire_out, const float * __restrict__ wire_in,
+        int * signal_out, const int * signal_in, const int token,
+        const float * res, float * x_out, const float * w, const float * add2, float * y, const float eps) {
+    // no __restrict__ on the fused outputs: the allocator may place an output in an input's buffer (in-place ADD / norm). Every
+    // element is read and written by the same thread, y only after the row's reduction, so aliasing is safe.
+    constexpr int max_regs = 8;
+    __shared__ float s_sum[32];
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+
+    for (int r = bid; r < nrows; r += gridDim.x) {
+        for (int col = tid; col < ncols; col += BS) {
+            wire_out[(int64_t) r*ncols + col] = data[(int64_t) r*ncols + col];
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (tid == 0) {
+        *(volatile int *) (signal_out + bid * (AR_RANK_STRIDE / sizeof(int))) = token;
+        __threadfence_system();
+        const volatile int * in = (const volatile int *) (signal_in + bid * (AR_RANK_STRIDE / sizeof(int)));
+        while (*in != token) {
+        }
+    }
+    __syncthreads();
+    __threadfence();
+
+    for (int r = bid; r < nrows; r += gridDim.x) {
+        const int64_t o = (int64_t) r*ncols;
+        float xv[max_regs];
+        float tmp = 0.0f;
+#pragma unroll
+        for (int u = 0; u < max_regs; ++u) {
+            const int col = tid + u*BS;
+            float v = 0.0f;
+            if (col < ncols) {
+                v = data[o + col] + __ldcg(wire_in + o + col);
+                data[o + col] = v;
+                if constexpr (ADD_FIRST) {
+                    v = v + res[o + col];
+                    x_out[o + col] = v;
+                }
+            }
+            xv[u] = v;
+            tmp += xv[u] * xv[u];
+        }
+        tmp = block_reduce<block_reduce_method::SUM, BS>(tmp, s_sum);
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+#pragma unroll
+        for (int u = 0; u < max_regs; ++u) {
+            const int col = tid + u*BS;
+            if (col < ncols) {
+                if constexpr (ADD_AFTER) {
+                    y[o + col] = scale * xv[u] * w[col] + add2[o + col];
+                } else {
+                    y[o + col] = scale * xv[u] * w[col];
+                }
+            }
+        }
+        __syncthreads(); // s_sum reuse by the next row
+    }
+}
+
 ggml_cuda_ar_rank_ctx * ggml_cuda_ar_rank_init(int dev0, int dev1, size_t max_bytes) {
     if (getenv("GGML_CUDA_P2P") == nullptr) {
         return nullptr; // peer access is only enabled (ggml_cuda_init) under GGML_CUDA_P2P
@@ -141,5 +213,42 @@ void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t 
     int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
 
     ggml_cuda_ar_rank_kernel<<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, wire_out, wire_in, signal_out, signal_in, (int) token);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_ar_rank_norm_eligible(const ggml_cuda_ar_rank_ctx * c, const ggml_tensor * t) {
+    if (!ggml_cuda_ar_rank_eligible(c, t)) {
+        return false;
+    }
+    const int64_t ncols = t->ne[0];
+    const int     bs    = ncols < 1024 ? 256 : 1024;
+    return ncols <= bs * 8 && ggml_nrows(t) <= 65535;
+}
+
+void ggml_cuda_ar_rank_reduce_norm(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t stream, ggml_tensor * t, const ggml_cuda_ar_rank_norm_args & a) {
+    const int      peer  = rank ^ 1;
+    const uint32_t token = ++c->calls[rank];
+    const int      slot  = token % AR_RANK_SLOTS;
+    const int      ncols = (int) t->ne[0];
+    const int      nrows = (int) ggml_nrows(t);
+    const int      nb    = std::min(AR_RANK_MAX_BLOCKS, nrows);
+
+    float * wire_out   = (float *) (c->inbox[peer] + (size_t) slot * c->max_bytes);
+    float * wire_in    = (float *) (c->inbox[rank] + (size_t) slot * c->max_bytes);
+    int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
+    int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
+
+#define AR_NORM_LAUNCH(BS, AF, AA) ggml_cuda_ar_rank_norm_kernel<BS, AF, AA><<<nb, BS, 0, stream>>>((float *) t->data, ncols, nrows, \
+        wire_out, wire_in, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps)
+    const bool af = a.res != nullptr;
+    const bool aa = a.add2 != nullptr;
+    if (ncols < 1024) {
+        if (af) { if (aa) AR_NORM_LAUNCH(256, true, true); else AR_NORM_LAUNCH(256, true, false); }
+        else    { if (aa) AR_NORM_LAUNCH(256, false, true); else AR_NORM_LAUNCH(256, false, false); }
+    } else {
+        if (af) { if (aa) AR_NORM_LAUNCH(1024, true, true); else AR_NORM_LAUNCH(1024, true, false); }
+        else    { if (aa) AR_NORM_LAUNCH(1024, false, true); else AR_NORM_LAUNCH(1024, false, false); }
+    }
+#undef AR_NORM_LAUNCH
     CUDA_CHECK(cudaGetLastError());
 }
