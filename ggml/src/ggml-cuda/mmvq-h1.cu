@@ -234,51 +234,51 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
 // Q4_K/Q5_K hybrid kernels, so it ran two h1 matvecs and a GLU kernel per layer). Each matrix's rows are accumulated exactly as
 // mmvq_h1_q accumulates them (same chunk order, block math, fold and butterfly); the epilogue is the fused path's
 // up * act(gate) = the gated unary kernel's act(gate) * up, so the output is bit-identical to the three launches.
+// Warp-split layout: the block's first WPB/2 warps take up rows, the others the same rows of gate, each warp exactly mmvq_h1_q's
+// work for its RPW rows; the row sums meet in shared memory for the epilogue. (A first version had every warp stream both
+// matrices: twice the latency per block with gemma4's ~540 rows = 34 blocks on 56 SMs, 4.5 % slower than three launches.)
 template <ggml_type type, int WPB, int U, int RPW, ggml_glu_op GLU>
 static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q_glu(
         const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg, const int64_t row_bytes,
         const __half * __restrict__ XH, const float * __restrict__ XS, float * __restrict__ Y, const int M, const int K) {
+    static_assert(WPB % 2 == 0, "warp pairs");
+    constexpr int HW  = WPB/2;
     constexpr int BB  = mmvq_h1_traits<type>::BB, NWD = mmvq_h1_traits<type>::NWD;
     constexpr int STG = (32*BB + 15 + 15)/16;
     constexpr int NLD = (STG + 31)/32;
     __shared__ uint4 stage[WPB][U][STG];
+    __shared__ float res[2][HW*RPW];
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
-    const int r0 = (blockIdx.x*WPB + wid)*RPW;
-    if (r0 >= M) {
-        return;
-    }
+    const int mat  = wid / HW;                                   // 0: up, 1: gate
+    const int r0   = (blockIdx.x*HW + wid % HW)*RPW;
+    const uint8_t * W = mat == 0 ? Wu : Wg;
     const int nb = K/H1_QK;
 
-    float acc[2][RPW];
-#pragma unroll
-    for (int m = 0; m < 2; ++m) {
+    if (r0 < M) {
+        float acc[RPW];
 #pragma unroll
         for (int i = 0; i < RPW; ++i) {
-            acc[m][i] = 0.0f;
+            acc[i] = 0.0f;
         }
-    }
-    for (int cb = 0; cb < nb; cb += 32) {
-        const int nblk = min(32, nb - cb);
-        half2 xv[16];
-        float s = 0.0f;
-        if (lane < nblk) {
-            const uint4 * xp = (const uint4 *) (XH + (int64_t) (cb + lane)*H1_QK);
+        for (int cb = 0; cb < nb; cb += 32) {
+            const int nblk = min(32, nb - cb);
+            half2 xv[16];
+            float s = 0.0f;
+            if (lane < nblk) {
+                const uint4 * xp = (const uint4 *) (XH + (int64_t) (cb + lane)*H1_QK);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                const uint4 v = xp[i];
-                xv[4*i + 0] = *(const half2 *) &v.x; xv[4*i + 1] = *(const half2 *) &v.y;
-                xv[4*i + 2] = *(const half2 *) &v.z; xv[4*i + 3] = *(const half2 *) &v.w;
+                for (int i = 0; i < 4; ++i) {
+                    const uint4 v = xp[i];
+                    xv[4*i + 0] = *(const half2 *) &v.x; xv[4*i + 1] = *(const half2 *) &v.y;
+                    xv[4*i + 2] = *(const half2 *) &v.z; xv[4*i + 3] = *(const half2 *) &v.w;
+                }
+                s = XS[cb + lane];
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    xv[i] = __float2half2_rn(0.0f);
+                }
             }
-            s = XS[cb + lane];
-        } else {
-#pragma unroll
-            for (int i = 0; i < 16; ++i) {
-                xv[i] = __float2half2_rn(0.0f);
-            }
-        }
-#pragma unroll
-        for (int m = 0; m < 2; ++m) {
-            const uint8_t * W = m == 0 ? Wu : Wg;
 #pragma unroll
             for (int rr = 0; rr < RPW; rr += U) {
                 uint4 v[U][NLD];
@@ -317,37 +317,42 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q_glu(
                         for (int i = 0; i < NWD; ++i) {
                             wd[i] = p[i];
                         }
-                        acc[m][rr + u] += s*mmvq_h1_block<type>(wd, o & 2, xv);
+                        acc[rr + u] += s*mmvq_h1_block<type>(wd, o & 2, xv);
                     }
                 }
                 __syncwarp();
             }
         }
-    }
-#pragma unroll
-    for (int m = 0; m < 2; ++m) {
 #pragma unroll
         for (int sft = 16; sft >= RPW; sft >>= 1) {
 #pragma unroll
             for (int i = 0; i < RPW; ++i) {
-                acc[m][i] += __shfl_xor_sync(0xffffffffu, acc[m][i], sft);
+                acc[i] += __shfl_xor_sync(0xffffffffu, acc[i], sft);
             }
         }
-        if constexpr (RPW >= 32) { mmvq_h1_bfly<16>(acc[m], lane); }
-        if constexpr (RPW >= 16) { mmvq_h1_bfly<8>(acc[m], lane); }
-        if constexpr (RPW >= 8)  { mmvq_h1_bfly<4>(acc[m], lane); }
-        if constexpr (RPW >= 4)  { mmvq_h1_bfly<2>(acc[m], lane); }
-        if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc[m], lane); }
-    }
-    if (lane < RPW && r0 + lane < M) {
-        const float up = acc[0][0], g = acc[1][0];
-        float r;
-        if constexpr (GLU == GGML_GLU_OP_GEGLU) {
-            r = up * ggml_cuda_op_gelu_single(g);
-        } else {
-            r = up * ggml_cuda_op_silu_single(g);
+        if constexpr (RPW >= 32) { mmvq_h1_bfly<16>(acc, lane); }
+        if constexpr (RPW >= 16) { mmvq_h1_bfly<8>(acc, lane); }
+        if constexpr (RPW >= 8)  { mmvq_h1_bfly<4>(acc, lane); }
+        if constexpr (RPW >= 4)  { mmvq_h1_bfly<2>(acc, lane); }
+        if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc, lane); }
+        if (lane < RPW) {
+            res[mat][(wid % HW)*RPW + lane] = acc[0];
         }
-        Y[r0 + lane] = r;
+    }
+    __syncthreads();
+    const int t = threadIdx.x;
+    if (t < HW*RPW) {
+        const int row = blockIdx.x*HW*RPW + t;
+        if (row < M) {
+            const float up = res[0][t], g = res[1][t];
+            float r;
+            if constexpr (GLU == GGML_GLU_OP_GEGLU) {
+                r = up * ggml_cuda_op_gelu_single(g);
+            } else {
+                r = up * ggml_cuda_op_silu_single(g);
+            }
+            Y[row] = r;
+        }
     }
 }
 
@@ -755,7 +760,7 @@ bool ggml_cuda_mmvq_h1_glu_try(ggml_backend_cuda_context & ctx, const ggml_tenso
         const dim3 pg((unsigned) ((K + 255)/256), 1);
         mmvq_h1_prep<<<pg, 256, 0, stream>>>((const float *) src1->data, 0, xh, xs, (int) K);
     }
-    constexpr int RB = MMVQ_H1_WPB*MMVQ_H1_RPW;
+    constexpr int RB = (MMVQ_H1_WPB/2)*MMVQ_H1_RPW; // rows per block: half the warps take up, half gate
     const dim3 grid((unsigned) ((M + RB - 1)/RB));
     auto launch = [&](auto type_tag, auto glu_tag) {
         constexpr ggml_type   T = decltype(type_tag)::value;
