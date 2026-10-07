@@ -101,6 +101,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_moe_lru;
 
 //
 // llm_graph_input
@@ -812,6 +813,7 @@ struct llm_graph_params {
 
     const llama_hadamard * hdmd = nullptr;
 
+    llama_moe_lru * lru = nullptr;
     ggml_tensor * layer_inp_dev = nullptr; // own layer input device buffer (write)
     ggml_tensor * layer_inp_src = nullptr; // ctx_other's layer input device buffer (read)
 
@@ -1082,6 +1084,8 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+
+    llama_moe_lru * lru = nullptr;
 
     llm_graph_result * res;
 
