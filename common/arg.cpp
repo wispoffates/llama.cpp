@@ -2756,6 +2756,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-lru-slots"}, "N",
+        "number of GPU pool slots per pooled MoE layer for the expert LRU cache\n"
+        "(pools activate on layers whose expert weights are on the host,\n"
+        "e.g. via --n-cpu-moe or --override-tensor)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_lru_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_LRU_SLOTS"));
+    add_opt(common_arg(
         {"--moe-cache-cpu-share"}, "F",
         string_format("share of the MoE cache misses that the CPU computes from the host experts instead of uploading them to the GPU once the cache is full, from 0 to 1 (default: %.2f)", (double) params.moe_cache_cpu_share),
         [](common_params & params, const std::string & value) {
