@@ -21,3 +21,9 @@ void ggml_cuda_mmid_slot_scale(ggml_backend_cuda_context & ctx, const ggml_tenso
 // RMS_NORM -> SCALE -> MUL(w) for one row in one launch (Pascal). Returns false if it does not apply.
 bool ggml_cuda_rms_norm_scale_mul_try(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * scl,
                                       ggml_tensor * mul);
+
+// gate + up + GLU (GEGLU / SWIGLU) for one column in one launch, bit-identical to the three separate launches (Pascal, q4_0 / q8_0).
+// _ok: whether the up / gate / glu nodes qualify; _try: run it (dst = the GLU node).
+bool ggml_cuda_mmvq_h1_glu_ok(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu);
+bool ggml_cuda_mmvq_h1_glu_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                               const ggml_tensor * gate_w, ggml_glu_op op, ggml_tensor * dst);

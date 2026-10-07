@@ -4443,6 +4443,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
+            // Pascal, q4_0 / q8_0, one column: gate + up + GLU in one h1 launch (bit-identical to the three; mmvq-h1.cu)
+            if (ggml_cuda_mmvq_h1_glu_ok(up, gate, glu)) {
+                ggml_cuda_mmvq_h1_glu_try(*cuda_ctx, src0, src1, gate->src[0], ggml_get_glu_op(glu), glu);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
