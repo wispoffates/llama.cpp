@@ -7,134 +7,105 @@
 // The integer path (mmvq.cu) quantizes the activation to q8_1 and multiplies with DP4A, which sm_60 emulates in several
 // instructions; for these types it also expands every grid entry to int8 lanes first. On Sakura (Swift-1.5 Flash-Next K352 IQ2_XS)
 // that ran the Q2_0 expert down-projection (K = 640) at ~72 GB/s and the IQ2_S gate/up and IQ4_XS projections at ~150-250 GB/s.
-// Here the activation stays fp32: the block stages it once in shared memory (33-float stride per 32 values, so lanes on
-// consecutive 32-value units hit distinct banks), and each lane decodes its unit's weights straight to fp32 and multiplies.
+// Here the weights decode straight to fp32 and meet the fp32 activation.
 //
-// Work unit = 32 consecutive K values (one IQ sub-block, half a Q2_0 block, one IQ4_NL block). upr = K/32 units per row.
-//   long rows (upr >= 32): a warp owns RPW rows; lane l walks units l, l+32, ... of all RPW rows at once (RPW loads in flight),
-//                          then one warp reduction per row.
-//   short rows (upr < 32): the warp's RPW*upr (row, unit) pairs are spread over the 32 lanes, partials meet in shared memory and
-//                          lane r adds row r's upr partials in K order. (Q2_0 down at K = 640 is 20 units: one row per warp would
-//                          leave 12 lanes idle.)
+// Layout (v2, 10-07): eight lanes share a 32-value unit (one IQ sub-block, half a Q2_0 block, one IQ4_NL block), four values each,
+// so a warp covers 4 units = 128 values per step and each lane reads its 4 activation values as one float4 -- coalesced, straight
+// from L1/L2, and kept in registers for all RPW rows of the warp. A block is WPB warps x RPW rows = 8 rows, so a 1280-row expert
+// matrix is 160 blocks per expert slot. Each lane decodes only its 4 weights (one grid entry or one 32-bit word of nibbles).
+// (v1 staged the whole activation per block in shared memory and packed 32-64 rows per block: ~200 blocks for the expert
+// matmuls, 5 serial units per warp, and a block-wide stage + barrier -- slower than the integer path on most shapes.)
 // Accumulation is fp32 throughout; the order differs from the integer path, so results match it to rounding, not bit for bit.
 // GGML_CUDA_MMVQ_LB=0 disables the path; GGML_CUDA_MMVQ_LB_DENSE=0 keeps dense (non-MUL_MAT_ID) matmuls on the integer path.
 
-#define MMVQ_LB_WPB 8   // warps per block
-#define MMVQ_LB_SK  33  // shared-memory floats per 32-value unit (32 + 1 skew)
+#define MMVQ_LB_WPB 4   // warps per block
+#define MMVQ_LB_RPW 2   // rows per warp
 
 static __device__ __forceinline__ float lb_sgn(const float v, const uint32_t bit) {
     return __int_as_float(__float_as_int(v) ^ (int) (bit << 31));
 }
 
-template <ggml_type type> struct lb_traits;
-template <> struct lb_traits<GGML_TYPE_Q2_0>    { static constexpr int QK = QK2_0;  static constexpr int BS = sizeof(block_q2_0);    };
-template <> struct lb_traits<GGML_TYPE_IQ2_XXS> { static constexpr int QK = QK_K;   static constexpr int BS = sizeof(block_iq2_xxs); };
-template <> struct lb_traits<GGML_TYPE_IQ2_S>   { static constexpr int QK = QK_K;   static constexpr int BS = sizeof(block_iq2_s);   };
-template <> struct lb_traits<GGML_TYPE_IQ1_M>   { static constexpr int QK = QK_K;   static constexpr int BS = sizeof(block_iq1_m);   };
-template <> struct lb_traits<GGML_TYPE_IQ3_S>   { static constexpr int QK = QK_K;   static constexpr int BS = sizeof(block_iq3_s);   };
-template <> struct lb_traits<GGML_TYPE_IQ4_NL>  { static constexpr int QK = QK4_NL; static constexpr int BS = sizeof(block_iq4_nl);  };
-template <> struct lb_traits<GGML_TYPE_IQ4_XS>  { static constexpr int QK = QK_K;   static constexpr int BS = sizeof(block_iq4_xs);  };
-
-// dot of unit u of a row (its 32 weights, exactly as dequantize_row_* produces them) with the staged activation y[0..31]
+// lane's 4 values of unit u (values 4*s .. 4*s+3, s = lane%8 = sub-lane) dotted with y4; exactly dequantize_row_* weights
 template <ggml_type type>
-static __device__ __forceinline__ float lb_unit(const uint8_t * __restrict__ row, const int u, const float * __restrict__ y,
+static __device__ __forceinline__ float lb_quad(const uint8_t * __restrict__ row, const int u, const int s, const float4 y,
                                                 const float * __restrict__ kv) {
+    const float yv[4] = {y.x, y.y, y.z, y.w};
     if constexpr (type == GGML_TYPE_Q2_0) {
         const block_q2_0 * b = (const block_q2_0 *) row + (u >> 1);
-        const uint16_t * q16 = (const uint16_t *) (b->qs + 8*(u & 1));
-        float s1 = 0.0f, s0 = 0.0f;
-#pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const uint32_t w = q16[k];
-#pragma unroll
-            for (int m = 0; m < 8; ++m) {
-                const float v = y[8*k + m];
-                s1 += (float) ((w >> 2*m) & 3) * v;   // code c, weight (c - 1)*d
-                s0 += v;
-            }
-        }
-        return __half2float(b->d)*(s1 - s0);
-    } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
-        const block_iq2_xxs * b = (const block_iq2_xxs *) row + (u >> 3);
-        const uint16_t * q2 = b->qs + 4*(u & 7);
-        const uint32_t aux0 = q2[0] | ((uint32_t) q2[1] << 16), aux1 = q2[2] | ((uint32_t) q2[3] << 16);
+        const uint32_t q = b->qs[8*(u & 1) + s];                    // 4 codes, value j at bits 2j
         float acc = 0.0f;
 #pragma unroll
-        for (int il = 0; il < 4; ++il) {
-            const uint64_t g = iq2xxs_grid[(aux0 >> 8*il) & 0xff];
-            const uint32_t s = ksigns_iq2xs[(aux1 >> 7*il) & 127];
+        for (int j = 0; j < 4; ++j) {
+            acc += (float) ((int) ((q >> 2*j) & 3) - 1)*yv[j];
+        }
+        return __half2float(b->d)*acc;
+    } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        const block_iq2_xxs * b = (const block_iq2_xxs *) row + (u >> 3);
+        const uint8_t * q2 = (const uint8_t *) (b->qs + 4*(u & 7));
+        const int il = s >> 1, jj = 4*(s & 1);
+        const uint32_t aux1 = q2[4] | (q2[5] << 8) | (q2[6] << 16) | ((uint32_t) q2[7] << 24);
+        const uint32_t g = (uint32_t) (iq2xxs_grid[q2[il]] >> 8*jj);   // entries jj..jj+3
+        const uint32_t sg = ksigns_iq2xs[(aux1 >> 7*il) & 127] >> jj;
+        float acc = 0.0f;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                acc += (float) ((g >> 8*j) & 0xff) * lb_sgn(y[8*il + j], (s >> j) & 1);
-            }
+        for (int j = 0; j < 4; ++j) {
+            acc += (float) ((g >> 8*j) & 0xff)*lb_sgn(yv[j], (sg >> j) & 1);
         }
         return __half2float(b->d)*(0.5f + (aux1 >> 28))*0.25f*acc;
     } else if constexpr (type == GGML_TYPE_IQ2_S) {
         const block_iq2_s * b = (const block_iq2_s *) row + (u >> 3);
-        const int ib = u & 7;
-        const uint32_t qh = b->qh[ib], sc = b->scales[ib];
-        float acc[2] = {0.0f, 0.0f};
+        const int ib = u & 7, il = s >> 1, jj = 4*(s & 1);
+        const uint32_t qh = b->qh[ib];
+        const uint32_t g = (uint32_t) (iq2s_grid[b->qs[4*ib + il] | ((qh << (8 - 2*il)) & 0x300)] >> 8*jj);
+        const uint32_t sg = (uint32_t) b->qs[QK_K/8 + 4*ib + il] >> jj;
+        const float dl = __half2float(b->d)*(0.5f + ((b->scales[ib] >> 4*(il/2)) & 0xf))*0.25f;
+        float acc = 0.0f;
 #pragma unroll
-        for (int il = 0; il < 4; ++il) {
-            const uint64_t g = iq2s_grid[b->qs[4*ib + il] | ((qh << (8 - 2*il)) & 0x300)];
-            const uint32_t s = b->qs[QK_K/8 + 4*ib + il];
-#pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                acc[il/2] += (float) ((g >> 8*j) & 0xff) * lb_sgn(y[8*il + j], (s >> j) & 1);
-            }
+        for (int j = 0; j < 4; ++j) {
+            acc += (float) ((g >> 8*j) & 0xff)*lb_sgn(yv[j], (sg >> j) & 1);
         }
-        return __half2float(b->d)*0.25f*((0.5f + (sc & 0xf))*acc[0] + (0.5f + (sc >> 4))*acc[1]);
+        return dl*acc;
     } else if constexpr (type == GGML_TYPE_IQ1_M) {
         const block_iq1_m * b = (const block_iq1_m *) row + (u >> 3);
-        const int ib = u & 7;
+        const int ib = u & 7, il = s >> 1, h = s & 1;
         const uint16_t * sc = (const uint16_t *) b->scales;
         iq1m_scale_t scale;
         scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
-        const float d = __half2float(scale.f16);
-        float tot = 0.0f;
+        const int ib16 = 2*ib + il/2;
+        const float dl = __half2float(scale.f16)*(2*((sc[ib16/4] >> 3*(ib16%4)) & 0x7) + 1);
+        const uint32_t qhb = b->qh[2*ib + il/2];
+        const float delta = qhb & (0x08 << 4*(il%2)) ? -1.0f - IQ1M_DELTA : -1.0f + IQ1M_DELTA;
+        // entries 0..3 = low nibbles of the grid bytes, 4..7 = high nibbles
+        const uint32_t g = iq1s_grid_gpu[b->qs[4*ib + il] | (((qhb >> 4*(il%2)) & 7) << 8)] >> 4*h;
+        float sq = 0.0f, sy = 0.0f;
 #pragma unroll
-        for (int il = 0; il < 4; ++il) {
-            const int ib16 = 2*ib + il/2;
-            const float dl = d*(2*((sc[ib16/4] >> 3*(ib16%4)) & 0x7) + 1);
-            const uint32_t qhb = b->qh[2*ib + il/2];
-            const float delta = qhb & (0x08 << 4*(il%2)) ? -1.0f - IQ1M_DELTA : -1.0f + IQ1M_DELTA;
-            const uint32_t g = iq1s_grid_gpu[b->qs[4*ib + il] | (((qhb >> 4*(il%2)) & 7) << 8)];
-            float sq = 0.0f, sy = 0.0f;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float v0 = y[8*il + j], v1 = y[8*il + 4 + j];
-                sq += (float) ((g >> 8*j) & 0x0f)*v0 + (float) ((g >> (8*j + 4)) & 0x0f)*v1;
-                sy += v0 + v1;
-            }
-            tot += dl*(sq + delta*sy);
+        for (int j = 0; j < 4; ++j) {
+            sq += (float) ((g >> 8*j) & 0x0f)*yv[j];
+            sy += yv[j];
         }
-        return tot;
+        return dl*(sq + delta*sy);
     } else if constexpr (type == GGML_TYPE_IQ3_S) {
         const block_iq3_s * b = (const block_iq3_s *) row + (u >> 3);
-        const int ib = u & 7;
-        const uint8_t * qs = b->qs + 8*ib;
+        const int ib = u & 7, il = s >> 1, h = s & 1;
         const uint32_t qh = b->qh[ib];
+        const uint32_t g = iq3s_grid[b->qs[8*ib + 2*il + h] | ((qh << (8 - 2*il - h)) & 256)];   // entries 4h..4h+3
+        const uint32_t sg = (uint32_t) b->signs[4*ib + il] >> 4*h;
         float acc = 0.0f;
 #pragma unroll
-        for (int il = 0; il < 4; ++il) {
-            const uint32_t g1 = iq3s_grid[qs[2*il + 0] | ((qh << (8 - 2*il)) & 256)];
-            const uint32_t g2 = iq3s_grid[qs[2*il + 1] | ((qh << (7 - 2*il)) & 256)];
-            const uint32_t s = b->signs[4*ib + il];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                acc += (float) ((g1 >> 8*j) & 0xff) * lb_sgn(y[8*il + j],     (s >> j) & 1);
-                acc += (float) ((g2 >> 8*j) & 0xff) * lb_sgn(y[8*il + 4 + j], (s >> (j + 4)) & 1);
-            }
+        for (int j = 0; j < 4; ++j) {
+            acc += (float) ((g >> 8*j) & 0xff)*lb_sgn(yv[j], (sg >> j) & 1);
         }
         return __half2float(b->d)*(1 + 2*((b->scales[ib/2] >> 4*(ib%2)) & 0xf))*acc;
     } else if constexpr (type == GGML_TYPE_IQ4_NL) {
+        // values 0..15 = low nibbles of qs[0..15], 16..31 = high nibbles: sub-lane s takes bytes 4*(s%4).. of the low (s < 4) or
+        // high (s >= 4) half; qs sits at +2 in 18-byte blocks (2-aligned)
         const block_iq4_nl * b = (const block_iq4_nl *) row + u;
-        const uint16_t * q16 = (const uint16_t *) b->qs;
+        const uint16_t * q16 = (const uint16_t *) (b->qs + 4*(s & 3));
+        const uint32_t w = (q16[0] | ((uint32_t) q16[1] << 16)) >> (s < 4 ? 0 : 4);
         float acc = 0.0f;
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
-            const uint32_t w = q16[k];
-            acc += kv[w & 0xf]*y[2*k] + kv[(w >> 4) & 0xf]*y[2*k + 16] + kv[(w >> 8) & 0xf]*y[2*k + 1] + kv[(w >> 12) & 0xf]*y[2*k + 17];
+        for (int j = 0; j < 4; ++j) {
+            acc += kv[(w >> 8*j) & 0xf]*yv[j];
         }
         return __half2float(b->d)*acc;
     } else {
@@ -142,107 +113,64 @@ static __device__ __forceinline__ float lb_unit(const uint8_t * __restrict__ row
         const block_iq4_xs * b = (const block_iq4_xs *) row + (u >> 3);
         const int ib = u & 7;
         const int ls = ((b->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((b->scales_h >> 2*ib) & 3) << 4);
-        const uint2 * q8 = (const uint2 *) (b->qs + 16*ib);   // 8-byte aligned: 136-byte blocks, qs at +8
+        const uint32_t w = *(const uint32_t *) (b->qs + 16*ib + 4*(s & 3)) >> (s < 4 ? 0 : 4);   // qs at +8 in 136-byte blocks
         float acc = 0.0f;
 #pragma unroll
-        for (int k = 0; k < 2; ++k) {
-            const uint2 w2 = q8[k];
-#pragma unroll
-            for (int h = 0; h < 2; ++h) {
-                const uint32_t w = h ? w2.y : w2.x;
-#pragma unroll
-                for (int m = 0; m < 4; ++m) {
-                    const int j = 8*k + 4*h + m;
-                    acc += kv[(w >> 8*m) & 0xf]*y[j] + kv[(w >> (8*m + 4)) & 0xf]*y[j + 16];
-                }
-            }
+        for (int j = 0; j < 4; ++j) {
+            acc += kv[(w >> 8*j) & 0xf]*yv[j];
         }
         return __half2float(b->d)*(ls - 32)*acc;
     }
 }
 
 // grid (ceil(M/(WPB*RPW)), slots); ID: slot y -> expert ids[y], activation row (nxr == 1 ? 0 : y), dst column y
-template <ggml_type type, int RPW, bool SHORT, bool ID>
+template <ggml_type type, bool ID>
 static __global__ void __launch_bounds__(MMVQ_LB_WPB*32) mmvq_lb(
         const uint8_t * __restrict__ W, const int64_t row_bytes, const int64_t expert_bytes, const int32_t * __restrict__ ids,
         const float * __restrict__ X, const int64_t sx, const int nxr, float * __restrict__ Y, const int64_t sy, const int M, const int K) {
-    extern __shared__ float lb_smem[];
-    float * ys   = lb_smem;                                   // K/32 units x MMVQ_LB_SK
-    float * kv   = ys + (K/32)*MMVQ_LB_SK;                    // 16 IQ4 values
-    float * part = kv + 16;                                   // SHORT: per warp RPW*32 partials
+    __shared__ float kv[16];
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
-    const int slot = blockIdx.y;
-    const int xr = nxr == 1 ? 0 : slot;
-    const int upr = K/32;
-
-    ggml_cuda_pdl_sync();
-    X += (int64_t) xr*sx;
-    for (int i = threadIdx.x; i < K; i += MMVQ_LB_WPB*32) {
-        ys[(i >> 5)*MMVQ_LB_SK + (i & 31)] = X[i];
-    }
     if (threadIdx.x < 16) {
         kv[threadIdx.x] = kvalues_iq4nl[threadIdx.x];
     }
     __syncthreads();
-
-    const int r0 = (blockIdx.x*MMVQ_LB_WPB + wid)*RPW;
+    const int slot = blockIdx.y;
+    const int r0 = (blockIdx.x*MMVQ_LB_WPB + wid)*MMVQ_LB_RPW;
     if (r0 >= M) {
-        return;   // no block-wide barriers below
+        return;
     }
+    ggml_cuda_pdl_sync();
     if (ID) {
         W += (int64_t) ids[slot]*expert_bytes;
     }
-    Y += (int64_t) slot*sy;
-
-    if constexpr (!SHORT) {
-        const uint8_t * rows[RPW];
-        float acc[RPW];
+    X += (int64_t) (nxr == 1 ? 0 : slot)*sx;
+    const uint8_t * rows[MMVQ_LB_RPW];
+    float acc[MMVQ_LB_RPW];
 #pragma unroll
-        for (int r = 0; r < RPW; ++r) {
-            rows[r] = W + (int64_t) min(r0 + r, M - 1)*row_bytes;   // rows past M re-read the last row; never written
-            acc[r] = 0.0f;
-        }
-        for (int u = lane; u < upr; u += 32) {
-            const float * yu = ys + u*MMVQ_LB_SK;
+    for (int r = 0; r < MMVQ_LB_RPW; ++r) {
+        rows[r] = W + (int64_t) min(r0 + r, M - 1)*row_bytes;   // rows past M re-read the last row; never written
+        acc[r] = 0.0f;
+    }
+    const int s = lane & 7;
+    const int nsteps = K/128;
+    for (int st = 0; st < nsteps; ++st) {
+        const int u = 4*st + (lane >> 3);
+        const float4 y = __ldg((const float4 *) (X + 32*u + 4*s));
 #pragma unroll
-            for (int r = 0; r < RPW; ++r) {
-                acc[r] += lb_unit<type>(rows[r], u, yu, kv);
-            }
-        }
-        ggml_cuda_pdl_lc();
-#pragma unroll
-        for (int r = 0; r < RPW; ++r) {
-            acc[r] = warp_reduce_sum<32>(acc[r]);
-        }
-        if (lane < RPW && r0 + lane < M) {
-            float v = acc[0];
-#pragma unroll
-            for (int r = 1; r < RPW; ++r) {
-                v = lane == r ? acc[r] : v;
-            }
-            Y[r0 + lane] = v;
-        }
-    } else {
-        float * pw = part + wid*(RPW*32);
-        const int n = RPW*upr;
-        for (int i = lane; i < n; i += 32) {
-            const int r = i / upr, u = i - r*upr;
-            const uint8_t * row = W + (int64_t) min(r0 + r, M - 1)*row_bytes;
-            pw[i] = lb_unit<type>(row, u, ys + u*MMVQ_LB_SK, kv);
-        }
-        ggml_cuda_pdl_lc();
-        __syncwarp();
-        if (lane < RPW && r0 + lane < M) {
-            float v = 0.0f;
-            for (int u = 0; u < upr; ++u) {
-                v += pw[lane*upr + u];
-            }
-            Y[r0 + lane] = v;
+        for (int r = 0; r < MMVQ_LB_RPW; ++r) {
+            acc[r] += lb_quad<type>(rows[r], u, s, y, kv);
         }
     }
+    ggml_cuda_pdl_lc();
+#pragma unroll
+    for (int r = 0; r < MMVQ_LB_RPW; ++r) {
+        acc[r] = warp_reduce_sum<32>(acc[r]);
+    }
+    if (lane < MMVQ_LB_RPW && r0 + lane < M) {
+        Y[(int64_t) slot*sy + r0 + lane] = lane == 0 ? acc[0] : acc[MMVQ_LB_RPW - 1];
+    }
+    static_assert(MMVQ_LB_RPW == 2, "the store picks acc[0] / acc[1]");
 }
-
-static constexpr int MMVQ_LB_MAX_K = 10240;   // staged activation: 10240*33/32 floats = 42 KB of shared memory
 
 bool ggml_cuda_mmvq_lb_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                            const ggml_tensor * ids, ggml_tensor * dst) {
@@ -267,9 +195,11 @@ bool ggml_cuda_mmvq_lb_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     const int64_t K = src0->ne[0], M = src0->ne[1];
     const int64_t row_bytes = (K/qk)*(int64_t) ggml_type_size(type);
-    if (K % qk != 0 || K > MMVQ_LB_MAX_K || src0->nb[0] != ggml_type_size(type) || (int64_t) src0->nb[1] != row_bytes ||
+    // K % 128: whole 4-unit warp steps; float4 activation loads need a 16-byte aligned activation row
+    if (K % qk != 0 || K % 128 != 0 || src0->nb[0] != ggml_type_size(type) || (int64_t) src0->nb[1] != row_bytes ||
             src0->ne[3] != 1 || ((uintptr_t) src0->data % 8) != 0 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
-            src1->nb[1] % sizeof(float) != 0 || dst->nb[1] % sizeof(float) != 0 || src1->ne[0] != K || dst->ne[0] != M) {
+            src1->nb[1] % 16 != 0 || ((uintptr_t) src1->data % 16) != 0 || dst->nb[1] % sizeof(float) != 0 ||
+            src1->ne[0] != K || dst->ne[0] != M) {
         return false;
     }
     int64_t nxr, slots;
@@ -290,13 +220,10 @@ bool ggml_cuda_mmvq_lb_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         nxr = 1;
         slots = 1;
     }
-    const int upr = (int) (K/32);
-    const bool shrt = upr < 32;
-    const int rpw = shrt ? 8 : 4;
     const int64_t sx = nxr > 1 ? (int64_t) (src1->nb[1]/sizeof(float)) : 0;
     const int64_t sy = ids ? (int64_t) (dst->nb[1]/sizeof(float)) : 0;
-    const size_t smem = ((size_t) upr*MMVQ_LB_SK + 16 + (shrt ? MMVQ_LB_WPB*rpw*32 : 0))*sizeof(float);
-    const dim3 grid((unsigned) ((M + MMVQ_LB_WPB*rpw - 1)/(MMVQ_LB_WPB*rpw)), (unsigned) slots);
+    constexpr int RB = MMVQ_LB_WPB*MMVQ_LB_RPW;
+    const dim3 grid((unsigned) ((M + RB - 1)/RB), (unsigned) slots);
     cudaStream_t stream = ctx.stream();
     const uint8_t * W = (const uint8_t *) src0->data;
     const int64_t eb = ids ? (int64_t) src0->nb[2] : 0;
@@ -304,22 +231,12 @@ bool ggml_cuda_mmvq_lb_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 
     auto launch = [&](auto type_tag) {
         constexpr ggml_type T = decltype(type_tag)::value;
-        if (shrt) {
-            if (ids) {
-                mmvq_lb<T, 8, true, true><<<grid, MMVQ_LB_WPB*32, smem, stream>>>(W, row_bytes, eb, idp, (const float *) src1->data, sx,
-                    (int) nxr, (float *) dst->data, sy, (int) M, (int) K);
-            } else {
-                mmvq_lb<T, 8, true, false><<<grid, MMVQ_LB_WPB*32, smem, stream>>>(W, row_bytes, 0, nullptr, (const float *) src1->data, 0,
-                    1, (float *) dst->data, 0, (int) M, (int) K);
-            }
+        if (ids) {
+            mmvq_lb<T, true><<<grid, MMVQ_LB_WPB*32, 0, stream>>>(W, row_bytes, eb, idp, (const float *) src1->data, sx, (int) nxr,
+                (float *) dst->data, sy, (int) M, (int) K);
         } else {
-            if (ids) {
-                mmvq_lb<T, 4, false, true><<<grid, MMVQ_LB_WPB*32, smem, stream>>>(W, row_bytes, eb, idp, (const float *) src1->data, sx,
-                    (int) nxr, (float *) dst->data, sy, (int) M, (int) K);
-            } else {
-                mmvq_lb<T, 4, false, false><<<grid, MMVQ_LB_WPB*32, smem, stream>>>(W, row_bytes, 0, nullptr, (const float *) src1->data, 0,
-                    1, (float *) dst->data, 0, (int) M, (int) K);
-            }
+            mmvq_lb<T, false><<<grid, MMVQ_LB_WPB*32, 0, stream>>>(W, row_bytes, 0, nullptr, (const float *) src1->data, 0, 1,
+                (float *) dst->data, 0, (int) M, (int) K);
         }
     };
     switch (type) {
