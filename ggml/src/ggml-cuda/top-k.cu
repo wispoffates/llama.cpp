@@ -278,6 +278,144 @@ static void top_k_argsort_cuda(
     }
 }
 
+// p100-series 10-07: short rows (<= 2048 values, e.g. qwen4exp's attention indexer picking pools at decode) in ONE block per row:
+// 4-pass 8-bit radix select of the k-th largest key in shared memory, then a gather. The bitonic argsort it replaces sorts the
+// whole padded row (1024 threads, ~54 us on a P100 for one decode row). Output is the top-k set (GGML_OP_TOP_K is unordered):
+// keys above the threshold in index order, then threshold ties in index order (deterministic).
+#define TOPK_BLOCK_THREADS 1024
+#define TOPK_BLOCK_E       2      // values per thread
+
+static __device__ __forceinline__ uint32_t topk_block_key(const float v) {
+    const uint32_t b = __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// exclusive block scan of one flag per thread; returns this thread's offset, *total = block sum
+static __device__ __forceinline__ int topk_block_scan(const bool flag, int * wsum, int * total) {
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const uint32_t m = __ballot_sync(0xffffffffu, flag);
+    const int in_warp = __popc(m & ((1u << lane) - 1u));
+    if (lane == 0) {
+        wsum[wid] = __popc(m);
+    }
+    __syncthreads();
+    if (wid == 0) {
+        const int v = wsum[lane];
+        int s = v;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int t = __shfl_up_sync(0xffffffffu, s, o);
+            s += lane >= o ? t : 0;
+        }
+        wsum[lane] = s - v;               // exclusive
+        if (lane == 31) {
+            *total = s;
+        }
+    }
+    __syncthreads();
+    const int r = wsum[wid] + in_warp;
+    __syncthreads();                      // wsum is reused by the next call
+    return r;
+}
+
+static __global__ void __launch_bounds__(TOPK_BLOCK_THREADS) top_k_block(const float * __restrict__ src, int * __restrict__ dst,
+                                                                         const int ncols, const int k) {
+    __shared__ int hist[256];
+    __shared__ int wsum[32];
+    __shared__ int s_total;
+    __shared__ uint32_t s_prefix;
+    __shared__ int s_krem;
+    const int row = blockIdx.x, t = threadIdx.x, lane = t & 31;
+    src += (int64_t) row*ncols;
+    dst += (int64_t) row*k;
+
+    uint32_t key[TOPK_BLOCK_E];
+#pragma unroll
+    for (int e = 0; e < TOPK_BLOCK_E; ++e) {
+        const int c = t + e*TOPK_BLOCK_THREADS;
+        key[e] = c < ncols ? topk_block_key(src[c]) : 0u;
+    }
+    if (t == 0) {
+        s_prefix = 0;
+        s_krem = k;
+    }
+    uint32_t pmask = 0;
+#pragma unroll 1
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (t < 256) {
+            hist[t] = 0;
+        }
+        __syncthreads();
+        const uint32_t prefix = s_prefix;
+#pragma unroll
+        for (int e = 0; e < TOPK_BLOCK_E; ++e) {
+            const int c = t + e*TOPK_BLOCK_THREADS;
+            if (c < ncols && (key[e] & pmask) == prefix) {
+                atomicAdd(&hist[(key[e] >> shift) & 255], 1);
+            }
+        }
+        __syncthreads();
+        if (t < 32) {
+            // lane l owns bins 255-8l .. 248-8l (descending); find the bin where the running count from the top reaches krem
+            const int krem = s_krem;
+            int c8[8], sl = 0;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                c8[i] = hist[255 - 8*lane - i];
+                sl += c8[i];
+            }
+            int incl = sl;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xffffffffu, incl, o);
+                incl += lane >= o ? v : 0;
+            }
+            const int excl = incl - sl;
+            const uint32_t hit = __ballot_sync(0xffffffffu, excl < krem && incl >= krem);
+            if (lane == __ffs(hit) - 1) {
+                int run = excl;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (run + c8[i] >= krem) {
+                        s_prefix = prefix | ((uint32_t) (255 - 8*lane - i) << shift);
+                        s_krem = krem - run;
+                        break;
+                    }
+                    run += c8[i];
+                }
+            }
+        }
+        pmask |= 255u << shift;
+        __syncthreads();
+    }
+    const uint32_t thr = s_prefix;
+    const int ntie = s_krem;   // ties at the threshold to take
+    int base_gt = 0, base_tie = 0;
+#pragma unroll
+    for (int e = 0; e < TOPK_BLOCK_E; ++e) {
+        const int c = t + e*TOPK_BLOCK_THREADS;
+        const bool gt = c < ncols && key[e] > thr;
+        const int off = topk_block_scan(gt, wsum, &s_total);
+        if (gt) {
+            dst[base_gt + off] = c;
+        }
+        base_gt += s_total;
+        __syncthreads();
+    }
+#pragma unroll
+    for (int e = 0; e < TOPK_BLOCK_E; ++e) {
+        const int c = t + e*TOPK_BLOCK_THREADS;
+        const bool tie = c < ncols && key[e] == thr;
+        const int off = topk_block_scan(tie, wsum, &s_total);
+        if (tie && base_tie + off < ntie) {
+            dst[base_gt + base_tie + off] = c;
+        }
+        base_tie += s_total;
+        __syncthreads();
+    }
+    GGML_UNUSED(lane);
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -293,6 +431,13 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+    // GGML_CUDA_TOPK_BLOCK=0: short rows back to the sort-based paths below
+    static const bool block_on = [] { const char * e = getenv("GGML_CUDA_TOPK_BLOCK"); return !e || atoi(e) != 0; }();
+    if (block_on && ncols <= TOPK_BLOCK_THREADS*TOPK_BLOCK_E && k >= 1 && k <= ncols) {
+        top_k_block<<<(unsigned) nrows, TOPK_BLOCK_THREADS, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
 
     const int device = ggml_cuda_get_device();
 
