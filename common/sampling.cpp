@@ -15,6 +15,7 @@
 #include <cstring>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__SSE2__)
@@ -136,16 +137,40 @@ struct common_sampler {
     // which on a 248k vocab is most of the host time in a speculative cycle.
     int32_t prefilter_k = 0;
 
+    // p100-series: DRY ahead of top_k (gemma4's entry runs --dry-multiplier 0.8, which turned the prefilter off: the full 262k
+    // vocabulary was materialized and partially sorted every token, ~5 % of serving decode). DRY only LOWERS logits, and only of
+    // tokens that follow an earlier occurrence of the last token (a repeated suffix of length >= dry_allowed_length >= 1 ends in
+    // it). With F = those followers, the k + |F| largest logits hold the final top k exactly: at least k of them are unpenalized
+    // and keep logits >= every token outside, which DRY can only lower. dry_followers tracks F for every token since reset (a
+    // superset of DRY's window).
+    bool                                                         prefilter_dry = false;
+    llama_token                                                  dry_last      = -1;
+    std::unordered_map<llama_token, std::unordered_set<llama_token>> dry_followers;
+
     void reset() {
         prev.clear();
+        dry_last = -1;
+        dry_followers.clear();
 
         llama_sampler_reset(chain);
+    }
+
+    // candidates the prefilter takes for this call (see prefilter_dry)
+    int32_t prefilter_k_now() const {
+        if (!prefilter_dry || dry_last < 0) {
+            return prefilter_k;
+        }
+        const auto it = dry_followers.find(dry_last);
+        return prefilter_k + (it == dry_followers.end() ? 0 : (int32_t) it->second.size());
     }
 
     // true when set_logits may take the top-k fast path for this call
     bool can_prefilter() const {
         if (prefilter_k <= 0) {
             return false;
+        }
+        if (prefilter_dry && prefilter_k_now() > 4096) {
+            return false; // the last token was followed by too many distinct tokens: the full path is as cheap
         }
         // a forcing reasoning budget keeps a token that need not be among the top k
         return !rbudget || common_reasoning_budget_get_state(rbudget) != REASONING_BUDGET_FORCING;
@@ -173,12 +198,13 @@ struct common_sampler {
             for (uint32_t i = 0; i < sampled_logits_count; i++) {
                 cur[i] = llama_token_data{sampled_ids[i], sampled_logits[i], 0.0f};
             }
-        } else if (prefilter && prefilter_k < n_vocab) {
+        } else if (prefilter && prefilter_k_now() < n_vocab) {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
-            top_k_from_logits(logits, n_vocab, prefilter_k);
-            // the same state top_k's partial sort leaves: the k largest, in descending order
-            cur_p = { cur.data(), cur.size(), -1, true };
+            top_k_from_logits(logits, n_vocab, prefilter_k_now());
+            // the same state top_k's partial sort leaves: the k largest, in descending order (unsorted for DRY, which changes
+            // logits before top_k runs)
+            cur_p = { cur.data(), cur.size(), -1, !prefilter_dry };
             return;
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
@@ -538,11 +564,23 @@ struct common_sampler * common_sampler_init(
         const char * e = getenv("LLAMA_SAMPLER_PREFILTER");
         return e == nullptr || atoi(e) != 0;
     }();
+    // LLAMA_SAMPLER_PREFILTER_DRY=0: an active DRY ahead of top_k disables the prefilter again
+    static const bool prefilter_dry_enabled = [] {
+        const char * e = getenv("LLAMA_SAMPLER_PREFILTER_DRY");
+        return e == nullptr || atoi(e) != 0;
+    }();
     if (prefilter_enabled && params.mirostat == 0 && params.top_k > 0 && params.top_k <= 128 && !has_logit_bias) {
+        bool dry_active = false;
         for (const auto & cnstr : params.samplers) {
             if (cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
-                result->prefilter_k = params.top_k;
+                result->prefilter_k   = params.top_k;
+                result->prefilter_dry = dry_active;
                 break;
+            }
+            if (cnstr == COMMON_SAMPLER_TYPE_DRY && prefilter_dry_enabled && !dry_active && params.dry_allowed_length >= 1 &&
+                    params.dry_multiplier != 0.0f && params.dry_base >= 1.0f && params.dry_penalty_last_n != 0) {
+                dry_active = true; // handled by prefilter_dry
+                continue;
             }
             const bool noop =
                 (cnstr == COMMON_SAMPLER_TYPE_PENALTIES &&
@@ -619,6 +657,13 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     llama_sampler_accept(gsmpl->chain, token);
 
     gsmpl->prev.push_back(token);
+
+    if (gsmpl->prefilter_dry) {
+        if (gsmpl->dry_last >= 0) {
+            gsmpl->dry_followers[gsmpl->dry_last].insert(token);
+        }
+        gsmpl->dry_last = token;
+    }
 }
 
 void common_sampler_reset(struct common_sampler * gsmpl) {
@@ -640,7 +685,10 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur_p   = */ gsmpl->cur_p,
         /* .rng     = */ gsmpl->rng,
     };
-    res->prefilter_k = gsmpl->prefilter_k;
+    res->prefilter_k   = gsmpl->prefilter_k;
+    res->prefilter_dry = gsmpl->prefilter_dry;
+    res->dry_last      = gsmpl->dry_last;
+    res->dry_followers = gsmpl->dry_followers;
     return res;
 }
 
@@ -663,7 +711,10 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
-    dst->prefilter_k = src->prefilter_k;
+    dst->prefilter_k   = src->prefilter_k;
+    dst->prefilter_dry = src->prefilter_dry;
+    dst->dry_last      = src->dry_last;
+    dst->dry_followers = src->dry_followers;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
