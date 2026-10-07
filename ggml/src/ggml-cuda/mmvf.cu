@@ -461,6 +461,62 @@ static __global__ void mul_mat_vec_f_shortk(
     }
 }
 
+// p100-series: one column, long rows of 16-bit weights (K >= 4096) and few rows (qwen4exp hyper-connection down-projections,
+// BF16 10240 -> 320: 320 blocks of 256 threads with 4-byte loads keep too little in flight, ~330 GB/s). Same block-per-row shape,
+// 16-byte loads (8 weights per thread per step).
+template <typename T>
+static __global__ void __launch_bounds__(256) mul_mat_vec_f_longk(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols8, const int stride_row,
+        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    static_assert(sizeof(T) == 2, "16-bit weights");
+    const int row         = blockIdx.x;
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int sample_x    = fastdiv((uint32_t) sample_dst,  sample_ratio);
+    const int tid         = threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)*stride_channel_x + int64_t(row)*stride_row;
+    y   += int64_t(sample_dst)*stride_sample_y   + int64_t(channel_dst)*stride_channel_y;
+    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+
+    const uint4  * x8 = (const uint4 *) x;
+    const float4 * y4 = (const float4 *) y;
+    float sumf = 0.0f;
+    for (int i = tid; i < ncols8; i += 256) {
+        const uint4  w  = __ldg(x8 + i);
+        const float4 ya = __ldg(y4 + 2*i), yb = __ldg(y4 + 2*i + 1);
+        float2 f[4];
+        const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            if constexpr (std::is_same_v<T, half>) {
+                f[q] = __half22float2(*(const half2 *) &ww[q]);
+            } else {
+                f[q] = make_float2(__uint_as_float(ww[q] << 16), __uint_as_float(ww[q] & 0xffff0000u));   // bf16 -> f32 exact
+            }
+        }
+        sumf += f[0].x*ya.x; sumf += f[0].y*ya.y; sumf += f[1].x*ya.z; sumf += f[1].y*ya.w;
+        sumf += f[2].x*yb.x; sumf += f[2].y*yb.y; sumf += f[3].x*yb.z; sumf += f[3].y*yb.w;
+    }
+    ggml_cuda_pdl_lc();
+    __shared__ float red[8];
+    sumf = warp_reduce_sum<WARP_SIZE>(sumf);
+    if ((tid & 31) == 0) {
+        red[tid >> 5] = sumf;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        sumf = tid < 8 ? red[tid] : 0.0f;
+        sumf = warp_reduce_sum<WARP_SIZE>(sumf);
+        if (tid == 0) {
+            dst[row] = sumf;
+        }
+    }
+}
+
 static bool ggml_cuda_mmvf_shortk_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK"); return e == nullptr || atoi(e) != 0; }();
     return on;
@@ -513,6 +569,20 @@ void launch_mul_mat_vec_f_cuda(
                 x, y, dst, (int) (ncols/2), (int) nrows, (int) stride_row, channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y,
                 (int) stride_channel_dst, sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
             return;
+        }
+        if constexpr (sizeof(T) == 2) {
+            const bool al16 = (uintptr_t) x % 16 == 0 && (uintptr_t) y % 16 == 0 && (stride_row*sizeof(T)) % 16 == 0 &&
+                              (stride_channel_x*sizeof(T)) % 16 == 0 && (stride_sample_x*sizeof(T)) % 16 == 0 &&
+                              (stride_channel_y*sizeof(float)) % 16 == 0 && (stride_sample_y*sizeof(float)) % 16 == 0;
+            if (ids == nullptr && !has_fusion && warp_size == 32 && ncols >= 4096 && ncols % 8 == 0 && nrows <= 2048 && al16 &&
+                    ggml_cuda_mmvf_shortk_enabled()) {
+                const dim3 block_nums_lk(nrows, nchannels_dst, nsamples_or_ntokens);
+                const ggml_cuda_kernel_launch_params launch_params = {block_nums_lk, dim3(256, 1, 1), 0, stream};
+                ggml_cuda_kernel_launch(mul_mat_vec_f_longk<T>, launch_params,
+                    x, y, dst, (int) (ncols/8), (int) stride_row, channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y,
+                    (int) stride_channel_dst, sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
+                return;
+            }
         }
     }
 
