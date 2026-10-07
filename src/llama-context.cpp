@@ -627,6 +627,21 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        if (model.moe_lru_slots() > 0) {
+            if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                LLAMA_LOG_WARN("llama_moe_lru: -sm tensor is not supported yet, running without pools\n");
+            } else {
+                std::vector<ggml_backend_t> lru_backends;
+                for (const auto & b : backends) {
+                    ggml_backend_dev_t d = ggml_backend_get_device(b.get());
+                    if (d && llama_moe_lru::backend_supports(d)) {
+                        lru_backends.push_back(b.get());
+                    }
+                }
+                lru = model.create_moe_lru(lru_backends);
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -648,6 +663,10 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (lru) {
+        lru->log_final_stats();
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -2655,6 +2674,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res *= 4;
     }
 
+    if (lru) {
+        res += lru->n_pooled() * llama_moe_lru::NODES_PER_LAYER;
+    }
     return res;
 }
 
@@ -2821,6 +2843,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.lru         =*/ lru.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
