@@ -415,6 +415,57 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
+// p100-series: one column, short rows (K <= 1024). The block-per-row kernel above gives each row its own block of K/2 threads,
+// so a K = 320 row is one pass of 160 threads and the launch is dominated by per-block overhead (qwen4exp hyper-connection
+// up-projections, BF16 320 -> 10240: 75 us = ~87 GB/s on P100). Here one warp owns a row and a block holds 8 rows.
+template <typename T, int rows_per_block>
+static __global__ void mul_mat_vec_f_shortk(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols2, const int nrows,
+        const int stride_row, const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    const int lane        = threadIdx.x;
+    const int row         = blockIdx.x*rows_per_block + threadIdx.y;
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int sample_x    = fastdiv((uint32_t) sample_dst,  sample_ratio);
+
+    ggml_cuda_pdl_sync();
+    if (row >= nrows) {
+        return;
+    }
+    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)*stride_channel_x + int64_t(row)*stride_row;
+    y   += int64_t(sample_dst)*stride_sample_y   + int64_t(channel_dst)*stride_channel_y;
+    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+
+    const float2 * y2 = (const float2 *) y;
+    float sumf = 0.0f;
+    for (int col2 = lane; col2 < ncols2; col2 += WARP_SIZE) {
+        float2 tmpx;
+        if constexpr (std::is_same_v<T, float>) {
+            tmpx = ((const float2 *) x)[col2];
+        } else if constexpr (std::is_same_v<T, half>) {
+            tmpx = __half22float2(((const half2 *) x)[col2]);
+        } else {
+            const nv_bfloat162 t = ((const nv_bfloat162 *) x)[col2];
+            tmpx = make_float2(ggml_cuda_cast<float>(t.x), ggml_cuda_cast<float>(t.y));
+        }
+        const float2 tmpy = __ldg(y2 + col2);
+        sumf += tmpx.x*tmpy.x;
+        sumf += tmpx.y*tmpy.y;
+    }
+    ggml_cuda_pdl_lc();
+    sumf = warp_reduce_sum<WARP_SIZE>(sumf);
+    if (lane == 0) {
+        dst[row] = sumf;
+    }
+}
+
+static bool ggml_cuda_mmvf_shortk_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -451,6 +502,19 @@ void launch_mul_mat_vec_f_cuda(
     }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+    if constexpr (ncols_dst == 1 && !is_multi_token_id && std::is_same_v<type_acc, float>) {
+        if (ids == nullptr && !has_fusion && warp_size == 32 && ncols <= 1024 && nrows >= 1024 && ggml_cuda_mmvf_shortk_enabled()) {
+            constexpr int rpb = 8;
+            const dim3 block_nums_sk((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
+            const dim3 block_dims_sk(WARP_SIZE, rpb, 1);
+            const ggml_cuda_kernel_launch_params launch_params = {block_nums_sk, block_dims_sk, 0, stream};
+            ggml_cuda_kernel_launch(mul_mat_vec_f_shortk<T, rpb>, launch_params,
+                x, y, dst, (int) (ncols/2), (int) nrows, (int) stride_row, channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y,
+                (int) stride_channel_dst, sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
+            return;
+        }
+    }
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
