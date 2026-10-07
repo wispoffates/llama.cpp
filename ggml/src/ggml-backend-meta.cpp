@@ -1845,6 +1845,9 @@ struct ggml_backend_meta_context {
         bool (*ar_can_norm)(void * ar, const ggml_tensor * t)                           = nullptr;
         void (*ar_run_norm)(void * ar, int rank, ggml_backend_t backend, ggml_tensor * t, const float * res, float * x_out,
                             const float * w, const float * add2, float * y, float eps)  = nullptr;
+        // the AR -> ADD -> norm chain (qwen35moe) measured 0.6 % slower fused (one block per row pumps the P2P writes);
+        // GGML_META_AR_NORM=2 fuses it too
+        bool ar_norm_add_first = false;
         // GGML_META_AR_STATS=1: per-rank counts printed at teardown (fused AllReduce, + norm chain, peer copy + ADD)
         bool                 stats = false;
         std::atomic<int64_t> n_ar{0}, n_ar_norm{0}, n_copy{0};
@@ -2003,6 +2006,7 @@ struct ggml_backend_meta_context {
                     disp.ar = ar_create(simple_backends[0], simple_backends[1]);
                 }
                 const char * env_arn = getenv("GGML_META_AR_NORM");
+                disp.ar_norm_add_first = env_arn != nullptr && atoi(env_arn) == 2;
                 if (disp.ar != nullptr && (env_arn == nullptr || atoi(env_arn) != 0)) {
                     disp.ar_can_norm = (bool (*)(void *, const ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_can_norm");
                     disp.ar_run_norm = (void (*)(void *, int, ggml_backend_t, ggml_tensor *, const float *, float *, const float *, const float *, float *, float))
@@ -2171,7 +2175,7 @@ struct meta_ar_norm_match {
     float         eps   = 0.0f;
 };
 
-static bool meta_match_ar_norm(const ggml_cgraph * g, const ggml_tensor * ar, meta_ar_norm_match & m) {
+static bool meta_match_ar_norm(const ggml_cgraph * g, const ggml_tensor * ar, meta_ar_norm_match & m, const bool allow_add_first) {
     auto f32c = [&](const ggml_tensor * t) {
         return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->data != nullptr && ggml_are_same_shape(t, ar);
     };
@@ -2179,6 +2183,9 @@ static bool meta_match_ar_norm(const ggml_cgraph * g, const ggml_tensor * ar, me
     int k = 0;
     const ggml_tensor * x = ar;
     if (n >= 1 && g->nodes[0]->op == GGML_OP_ADD && (g->nodes[0]->src[0] == ar || g->nodes[0]->src[1] == ar)) {
+        if (!allow_add_first) {
+            return false;
+        }
         ggml_tensor *       add = g->nodes[0];
         const ggml_tensor * res = add->src[0] == ar ? add->src[1] : add->src[0];
         if (res == ar || !f32c(res) || !f32c(add)) {
@@ -2754,7 +2761,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // same decision on both threads (identical shapes and graphs): the GPUs pair up inside the kernel
                     meta_ar_norm_match m;
                     if (backend_ctx->disp.ar_run_norm != nullptr && backend_ctx->disp.ar_can_norm(backend_ctx->disp.ar, node_dst) &&
-                            meta_match_ar_norm(me.cgraphs[i + 1].cgraph_main, node_dst, m)) {
+                            meta_match_ar_norm(me.cgraphs[i + 1].cgraph_main, node_dst, m, backend_ctx->disp.ar_norm_add_first)) {
                         backend_ctx->disp.ar_run_norm(backend_ctx->disp.ar, (int) j, me.backend, node_dst, m.res, m.x_out, m.w, m.add2, m.y, m.eps);
                         skip = m.skip;
                         if (backend_ctx->disp.stats) {
