@@ -2,6 +2,7 @@
 #include "mmvq-f16.cuh"
 #include "mmvq-h1.cuh"
 #include "mmvq-gp100.cuh"
+#include "mmvq-lb.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1740,6 +1741,11 @@ void ggml_cuda_mul_mat_vec_q(
 
     // Pascal: fp16 one-column q4_0 (mmvq-h1.cu); fused launches keep the integer path
     if (!fusion && ggml_cuda_mmvq_h1_try(ctx, src0, src1, ids, dst)) {
+        return;
+    }
+
+    // Pascal: fp32 one-column low-bit / grid types (mmvq-lb.cu): 2-bit expert banks and IQ projections of qwen4exp builds
+    if (!fusion && ggml_cuda_mmvq_lb_try(ctx, src0, src1, ids, dst)) {
         return;
     }
 
