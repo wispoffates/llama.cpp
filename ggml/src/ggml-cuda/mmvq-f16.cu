@@ -75,17 +75,17 @@ static __global__ void mmvq_f16_prep(const float * __restrict__ X, const int64_t
 }
 
 // 32-bit field at byte offset OFF of block B, relative to a 4-aligned window base
-template <int B, int OFF>
+template <int B, int OFF, bool FK = false>
 static __device__ __forceinline__ uint32_t mmvq_f16_fld(const uint32_t * wb, const int lane_words) {
     constexpr int A = 210*B + OFF;
-    if constexpr ((A & 3) == 0) {
+    if constexpr (FK || (A & 3) == 0) {
         return wb[A/4 + lane_words];
     } else {
         return __byte_perm(wb[A/4 + lane_words], wb[A/4 + 1 + lane_words], 0x5432);
     }
 }
 
-template <int NC, int RPW, int NBLK, bool ODD, int B = 0>
+template <int NC, int RPW, int NBLK, bool ODD, int B = 0, bool FK = false>
 static __device__ __forceinline__ void mmvq_f16_blocks(
         const uint32_t * const * wb, const uint2 * const * scs, const __half * const * xw, __half2 (&t)[NC][RPW],
         const int P, const int ql_w, const int qh_w, const int vh_shift, const int sp) {
@@ -103,13 +103,13 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
         for (int i = 0; i < RPW; ++i) {
             // ODD rows with i odd: wb[i] points 2 bytes before the block start (see the layout note)
             const bool ph = ODD && (i & 1);
-            const uint32_t vl = ph ? mmvq_f16_fld<B, 2>(wb[i], ql_w) : mmvq_f16_fld<B, 0>(wb[i], ql_w);
-            const uint32_t vh = (ph ? mmvq_f16_fld<B, 130>(wb[i], qh_w) : mmvq_f16_fld<B, 128>(wb[i], qh_w)) >> vh_shift;
+            const uint32_t vl = ph ? mmvq_f16_fld<B, 2, FK>(wb[i], ql_w) : mmvq_f16_fld<B, 0, FK>(wb[i], ql_w);
+            const uint32_t vh = FK ? 0u : (ph ? mmvq_f16_fld<B, 130>(wb[i], qh_w) : mmvq_f16_fld<B, 128>(wb[i], qh_w)) >> vh_shift;
             // scales so and so+4, precomputed per window by mmvq_f16_scales (the same half ops)
             const uint2 sAB = scs[i][B*8 + sp];
             const __half2 sA = *(const __half2 *) &sAB.x, sB = *(const __half2 *) &sAB.y;
-            const uint32_t qa = (vl & 0x0F0F0F0F) | ((vh << 4) & 0x30303030);
-            const uint32_t qb = ((vl >> 4) & 0x0F0F0F0F) | (vh & 0x30303030);
+            const uint32_t qa = FK ? (vl & 0x3F3F3F3F) : (vl & 0x0F0F0F0F) | ((vh << 4) & 0x30303030);
+            const uint32_t qb = FK ? ((vl >> 2) & 0x3F3F3F3F) : ((vl >> 4) & 0x0F0F0F0F) | (vh & 0x30303030);
             // half(1024 + q) per byte, minus 1056, times the scale
             const uint32_t h0 = __byte_perm(qa, 0x64646464u, 0x5140), h1 = __byte_perm(qa, 0x64646464u, 0x5342);
             const uint32_t h2 = __byte_perm(qb, 0x64646464u, 0x5140), h3 = __byte_perm(qb, 0x64646464u, 0x5342);
@@ -125,7 +125,7 @@ static __device__ __forceinline__ void mmvq_f16_blocks(
                 t[c][i] = __hfma2(w3, xb[c][1], u);
             }
         }
-        mmvq_f16_blocks<NC, RPW, NBLK, ODD, B + 1>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp);
+        mmvq_f16_blocks<NC, RPW, NBLK, ODD, B + 1, FK>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp);
     }
 }
 
@@ -158,7 +158,7 @@ static __device__ __forceinline__ void mmvq_f16_scales(const uint32_t * const * 
 // PF (p100-series 10-06): software pipelining -- the next window's weights are loaded into registers while this window is
 // computed (each warp used to load a window into shared memory and only then compute, so with ~12 warps per SM the global
 // load latency showed every window: ~300 GB/s on Swift's verify shapes). Same arithmetic, identical results.
-template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT, bool ODD = false, bool PF = false>
+template <int NC, int RPW, int NWT, bool KS, int MINB = 12/NWT, bool ODD = false, bool PF = false, bool FK = false>
 __launch_bounds__(NWT*WARP_SIZE, MINB) // 12/NWT: 168 registers, no spills: 6 blocks per SM (OPTLOG 210)
 static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64_t row_bytes, const __half * __restrict__ XS,
                                      const float * __restrict__ S, float * __restrict__ Y, const int64_t sy,
@@ -276,8 +276,8 @@ static __global__ void mmvq_f16_q6_K(const uint8_t * __restrict__ W, const int64
             }
         } else {
             switch (nblk) {
-                case 4: mmvq_f16_blocks<NC, RPW, 4, false>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break;
-                default: mmvq_f16_blocks<NC, RPW, 2, false>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break; // nb % 4 == 2
+                case 4: mmvq_f16_blocks<NC, RPW, 4, false, 0, FK>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break;
+                default: mmvq_f16_blocks<NC, RPW, 2, false, 0, FK>(wb, scs, xw, t, P, ql_w, qh_w, vh_shift, sp); break; // nb % 4 == 2
             }
         }
 #pragma unroll
@@ -437,6 +437,13 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         constexpr int  NWT  = decltype(nwt)::value;
         constexpr bool KS   = decltype(ks)::value;
         constexpr int  MINB = decltype(minb)::value;
+        static const bool fake = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_FAKE"); return s && atoi(s) != 0; }();
+        if (fake && !KS && !odd && ncols == 4 && NWT == MMVQ_F16_NW && RPW == MMVQ_F16_RPW) {
+            const dim3 bdk(WARP_SIZE, NWT);
+            const int g = (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
+            mmvq_f16_q6_K<4, RPW, NWT, false, MINB, false, false, true><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K);
+            return;
+        }
         if (pf_env != 0 && !KS && NWT == MMVQ_F16_NW && RPW == MMVQ_F16_RPW) {
             const dim3 bdk(WARP_SIZE, NWT);
             const int g = (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
