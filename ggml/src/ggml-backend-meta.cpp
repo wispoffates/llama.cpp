@@ -2849,8 +2849,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 // are a weight (a leaf) and that shared activation may move up past nodes that neither produce nor write it; the allocator then sees the
 // new order, so nothing aliases. At most 3 per group, within a 16-node window. GGML_META_GROUP_MM=0 disables.
 static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, ggml_cgraph * g, ggml_backend_graph_optimize_params * params) {
-    static const bool on = [] { const char * e = getenv("GGML_META_GROUP_MM"); return e == nullptr || atoi(e) != 0; }();
-    if (!on) {
+    // 1 = group any same-type matmuls (q, k, v: measured −2 % on gemma4 -- moving k / v between q's matvec and q's norm / rope /
+    // attention chain slowed that chain more than the launch saved); 2 = only same-shape ones (k, v), q stays put
+    static const int mode = [] { const char * e = getenv("GGML_META_GROUP_MM"); return e == nullptr ? 2 : atoi(e); }();
+    if (mode == 0) {
         return;
     }
     auto writes = [](const ggml_tensor * n, const ggml_tensor * x) {
@@ -2870,7 +2872,8 @@ static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (writes(b, x)) {
                 break;
             }
-            if (b->op != GGML_OP_MUL_MAT || b->src[1] != x || b->src[0]->op != GGML_OP_NONE || b->src[0]->type != a->src[0]->type) {
+            if (b->op != GGML_OP_MUL_MAT || b->src[1] != x || b->src[0]->op != GGML_OP_NONE || b->src[0]->type != a->src[0]->type ||
+                    (mode == 2 && !ggml_are_same_shape(b->src[0], a->src[0]))) {
                 continue;
             }
             if (j != pos) {
