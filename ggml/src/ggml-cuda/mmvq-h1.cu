@@ -1,4 +1,5 @@
 #include "mmvq-h1.cuh"
+#include "unary.cuh"
 
 #include <unordered_map>
 
@@ -226,6 +227,132 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
     if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc, lane); }
     if (lane < RPW && r0 + lane < M) {
         Y[(int64_t) slot*sy + r0 + lane] = acc[0];
+    }
+}
+
+// p100-series 10-06: gate + up + GLU for one column in one launch (gemma4's dense q4_0 FFN: Pascal fuses gate/up only through the
+// Q4_K/Q5_K hybrid kernels, so it ran two h1 matvecs and a GLU kernel per layer). Each matrix's rows are accumulated exactly as
+// mmvq_h1_q accumulates them (same chunk order, block math, fold and butterfly); the epilogue is the fused path's
+// up * act(gate) = the gated unary kernel's act(gate) * up, so the output is bit-identical to the three launches.
+// Warp-split layout: the block's first WPB/2 warps take up rows, the others the same rows of gate, each warp exactly mmvq_h1_q's
+// work for its RPW rows; the row sums meet in shared memory for the epilogue. (A first version had every warp stream both
+// matrices: twice the latency per block with gemma4's ~540 rows = 34 blocks on 56 SMs, 4.5 % slower than three launches.)
+template <ggml_type type, int WPB, int U, int RPW, ggml_glu_op GLU>
+static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q_glu(
+        const uint8_t * __restrict__ Wu, const uint8_t * __restrict__ Wg, const int64_t row_bytes,
+        const __half * __restrict__ XH, const float * __restrict__ XS, float * __restrict__ Y, const int M, const int K) {
+    static_assert(WPB % 2 == 0, "warp pairs");
+    constexpr int HW  = WPB/2;
+    constexpr int BB  = mmvq_h1_traits<type>::BB, NWD = mmvq_h1_traits<type>::NWD;
+    constexpr int STG = (32*BB + 15 + 15)/16;
+    constexpr int NLD = (STG + 31)/32;
+    __shared__ uint4 stage[WPB][U][STG];
+    __shared__ float res[2][HW*RPW];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int mat  = wid / HW;                                   // 0: up, 1: gate
+    const int r0   = (blockIdx.x*HW + wid % HW)*RPW;
+    const uint8_t * W = mat == 0 ? Wu : Wg;
+    const int nb = K/H1_QK;
+
+    if (r0 < M) {
+        float acc[RPW];
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            acc[i] = 0.0f;
+        }
+        for (int cb = 0; cb < nb; cb += 32) {
+            const int nblk = min(32, nb - cb);
+            half2 xv[16];
+            float s = 0.0f;
+            if (lane < nblk) {
+                const uint4 * xp = (const uint4 *) (XH + (int64_t) (cb + lane)*H1_QK);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint4 v = xp[i];
+                    xv[4*i + 0] = *(const half2 *) &v.x; xv[4*i + 1] = *(const half2 *) &v.y;
+                    xv[4*i + 2] = *(const half2 *) &v.z; xv[4*i + 3] = *(const half2 *) &v.w;
+                }
+                s = XS[cb + lane];
+            } else {
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    xv[i] = __float2half2_rn(0.0f);
+                }
+            }
+#pragma unroll
+            for (int rr = 0; rr < RPW; rr += U) {
+                uint4 v[U][NLD];
+                int   mis[U], nu4[U];
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+                    const int row = min(r0 + rr + u, M - 1);
+                    const uintptr_t a = (uintptr_t) (W + (int64_t) row*row_bytes + (int64_t) cb*BB);
+                    mis[u] = (int) (a & 15);
+                    nu4[u] = (mis[u] + nblk*BB + 15)/16;
+                    const uint4 * src = (const uint4 *) (a - mis[u]);
+#pragma unroll
+                    for (int j = 0; j < NLD; ++j) {
+                        if (lane + 32*j < nu4[u]) {
+                            v[u][j] = __ldg(src + lane + 32*j);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+#pragma unroll
+                    for (int j = 0; j < NLD; ++j) {
+                        if (lane + 32*j < nu4[u]) {
+                            stage[wid][u][lane + 32*j] = v[u][j];
+                        }
+                    }
+                }
+                __syncwarp();
+                if (lane < nblk) {
+#pragma unroll
+                    for (int u = 0; u < U; ++u) {
+                        const int o = mis[u] + BB*lane;
+                        const uint32_t * p = (const uint32_t *) ((const char *) stage[wid][u] + (o & ~3));
+                        uint32_t wd[NWD];
+#pragma unroll
+                        for (int i = 0; i < NWD; ++i) {
+                            wd[i] = p[i];
+                        }
+                        acc[rr + u] += s*mmvq_h1_block<type>(wd, o & 2, xv);
+                    }
+                }
+                __syncwarp();
+            }
+        }
+#pragma unroll
+        for (int sft = 16; sft >= RPW; sft >>= 1) {
+#pragma unroll
+            for (int i = 0; i < RPW; ++i) {
+                acc[i] += __shfl_xor_sync(0xffffffffu, acc[i], sft);
+            }
+        }
+        if constexpr (RPW >= 32) { mmvq_h1_bfly<16>(acc, lane); }
+        if constexpr (RPW >= 16) { mmvq_h1_bfly<8>(acc, lane); }
+        if constexpr (RPW >= 8)  { mmvq_h1_bfly<4>(acc, lane); }
+        if constexpr (RPW >= 4)  { mmvq_h1_bfly<2>(acc, lane); }
+        if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc, lane); }
+        if (lane < RPW) {
+            res[mat][(wid % HW)*RPW + lane] = acc[0];
+        }
+    }
+    __syncthreads();
+    const int t = threadIdx.x;
+    if (t < HW*RPW) {
+        const int row = blockIdx.x*HW*RPW + t;
+        if (row < M) {
+            const float up = res[0][t], g = res[1][t];
+            float r;
+            if constexpr (GLU == GGML_GLU_OP_GEGLU) {
+                r = up * ggml_cuda_op_gelu_single(g);
+            } else {
+                r = up * ggml_cuda_op_silu_single(g);
+            }
+            Y[row] = r;
+        }
     }
 }
 
@@ -581,6 +708,77 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{});
     } else {
         launch(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// GGML_CUDA_MMVQ_H1_GLU=0: keep gate / up / GLU as three launches
+static bool mmvq_h1_glu_enabled() {
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_GLU"); return !s || atoi(s) != 0; }();
+    return on;
+}
+
+bool ggml_cuda_mmvq_h1_glu_ok(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
+    if (!mmvq_h1_glu_enabled() || up->op != GGML_OP_MUL_MAT || gate->op != GGML_OP_MUL_MAT || up->src[1] != gate->src[1]) {
+        return false;
+    }
+    const ggml_glu_op op = ggml_get_glu_op(glu);
+    if (op != GGML_GLU_OP_GEGLU && op != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    const ggml_tensor * w = up->src[0], * wg = gate->src[0], * x = up->src[1];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || (w->type != GGML_TYPE_Q4_0 && w->type != GGML_TYPE_Q8_0) ||
+            wg->type != w->type || !ggml_are_same_shape(w, wg) || !ggml_are_same_stride(w, wg) || x->type != GGML_TYPE_F32 ||
+            x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || up->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(glu) || glu->ne[1] != 1) {
+        return false;
+    }
+    const int64_t K = w->ne[0];
+    const int64_t BB = w->type == GGML_TYPE_Q4_0 ? mmvq_h1_traits<GGML_TYPE_Q4_0>::BB : mmvq_h1_traits<GGML_TYPE_Q8_0>::BB;
+    const int64_t row_bytes = (K/H1_QK)*BB;
+    auto rows_ok = [&](const ggml_tensor * t) {
+        return K % H1_QK == 0 && t->nb[0] == (size_t) BB && t->nb[1] == (size_t) row_bytes && t->ne[2] == 1 && t->ne[3] == 1 &&
+               ((uintptr_t) t->data % 2) == 0 &&
+               ((row_bytes % 16 == 0 && (uintptr_t) t->data % 16 == 0) || (t->view_src == nullptr && K % MATRIX_ROW_PADDING != 0));
+    };
+    return K >= 32*H1_QK && rows_ok(w) && rows_ok(wg) && x->nb[0] == sizeof(float) && x->ne[0] == K;
+}
+
+bool ggml_cuda_mmvq_h1_glu_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                               const ggml_tensor * gate_w, const ggml_glu_op op, ggml_tensor * dst) {
+    const int64_t K = src0->ne[0], M = src0->ne[1];
+    const int64_t BB = src0->type == GGML_TYPE_Q4_0 ? mmvq_h1_traits<GGML_TYPE_Q4_0>::BB : mmvq_h1_traits<GGML_TYPE_Q8_0>::BB;
+    const int64_t row_bytes = (K/H1_QK)*BB;
+    cudaStream_t stream = ctx.stream();
+    bool hit;
+    mmvq_h1_entry & entry = mmvq_h1_slot(ctx, mmvq_h1_key(src1), src1->data, 1, K, 0, hit);
+    __half * xh = (__half *) entry.buf;
+    float  * xs = (float *) ((char *) entry.buf + (size_t) K*sizeof(__half));
+    if (!hit) {
+        const dim3 pg((unsigned) ((K + 255)/256), 1);
+        mmvq_h1_prep<<<pg, 256, 0, stream>>>((const float *) src1->data, 0, xh, xs, (int) K);
+    }
+    constexpr int RB = (MMVQ_H1_WPB/2)*MMVQ_H1_RPW; // rows per block: half the warps take up, half gate
+    const dim3 grid((unsigned) ((M + RB - 1)/RB));
+    auto launch = [&](auto type_tag, auto glu_tag) {
+        constexpr ggml_type   T = decltype(type_tag)::value;
+        constexpr ggml_glu_op G = decltype(glu_tag)::value;
+        mmvq_h1_q_glu<T, MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW, G><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(
+            (const uint8_t *) src0->data, (const uint8_t *) gate_w->data, row_bytes, xh, xs, (float *) dst->data, (int) M, (int) K);
+    };
+    auto bytype = [&](auto glu_tag) {
+        if (src0->type == GGML_TYPE_Q4_0) {
+            launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{}, glu_tag);
+        } else {
+            launch(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{}, glu_tag);
+        }
+    };
+    if (op == GGML_GLU_OP_GEGLU) {
+        bytype(std::integral_constant<ggml_glu_op, GGML_GLU_OP_GEGLU>{});
+    } else {
+        bytype(std::integral_constant<ggml_glu_op, GGML_GLU_OP_SWIGLU>{});
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
