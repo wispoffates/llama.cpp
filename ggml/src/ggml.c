@@ -1108,9 +1108,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "LRU_DECIDE",
+    "LRU_FILL",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,9 +1227,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "lru_decide(ids,state)",
+    "pool[slot]=src[expert]",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6019,6 +6024,44 @@ struct ggml_tensor * ggml_rwkv_wkv7(
     result->src[4] = a;
     result->src[5] = b;
     result->src[6] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lru_decide(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * state,
+        int32_t               n_expert,
+        int32_t               n_slot) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(state) >= (int64_t) n_expert + 2 * n_slot + 3);
+
+    const int64_t ne[1] = { ggml_nelements(ids) + 2 * (int64_t) n_slot + 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 1, ne);
+
+    ggml_set_op_params_i32(result, 0, n_expert);
+    ggml_set_op_params_i32(result, 1, n_slot);
+
+    result->op     = GGML_OP_LRU_DECIDE;
+    result->src[0] = ids;
+    result->src[1] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lru_fill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * fill_list,
+        struct ggml_tensor  * src,
+        struct ggml_tensor  * pool) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, pool);
+
+    ggml_set_op_params(result, &src, sizeof(src));
+    result->op     = GGML_OP_LRU_FILL;
+    result->src[0] = fill_list;
+    result->src[1] = pool;
 
     return result;
 }
