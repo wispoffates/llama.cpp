@@ -230,6 +230,121 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
     }
 }
 
+// p100-series 10-07: up to 3 one-column matvecs that read the same activation in ONE launch (gemma4's q / k / v: the meta backend's
+// graph_optimize moves them next to each other). Matrix j owns blocks [bstart[j], bstart[j+1]); each block does exactly mmvq_h1_q's
+// non-ID work on its matrix (same rows per warp, chunk order, fold and butterfly), so every output is bit-identical. The 1-3 MB
+// matrices are latency-bound alone (1024 rows = 64 blocks on 56 SMs, ~160 GB/s); together they fill the GPU in one launch.
+struct mmvq_h1_multi_args {
+    const uint8_t * W[3];
+    float *         Y[3];
+    int             M[3];
+    int             bstart[4];
+};
+
+template <ggml_type type, int WPB, int U, int RPW>
+static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q_multi(
+        const mmvq_h1_multi_args a, const int64_t row_bytes, const __half * __restrict__ XH, const float * __restrict__ XS, const int K) {
+    constexpr int BB  = mmvq_h1_traits<type>::BB, NWD = mmvq_h1_traits<type>::NWD;
+    constexpr int STG = (32*BB + 15 + 15)/16;
+    constexpr int NLD = (STG + 31)/32;
+    __shared__ uint4 stage[WPB][U][STG];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int bx = blockIdx.x;
+    const int j  = bx >= a.bstart[2] ? 2 : (bx >= a.bstart[1] ? 1 : 0);
+    const uint8_t * __restrict__ W = a.W[j];
+    float * __restrict__ Y = a.Y[j];
+    const int M  = a.M[j];
+    const int r0 = ((bx - a.bstart[j])*WPB + wid)*RPW;
+    if (r0 >= M) {
+        return;
+    }
+    const int nb = K/H1_QK;
+
+    float acc[RPW];
+#pragma unroll
+    for (int i = 0; i < RPW; ++i) {
+        acc[i] = 0.0f;
+    }
+    for (int cb = 0; cb < nb; cb += 32) {
+        const int nblk = min(32, nb - cb);
+        half2 xv[16];
+        float s = 0.0f;
+        if (lane < nblk) {
+            const uint4 * xp = (const uint4 *) (XH + (int64_t) (cb + lane)*H1_QK);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const uint4 v = xp[i];
+                xv[4*i + 0] = *(const half2 *) &v.x; xv[4*i + 1] = *(const half2 *) &v.y;
+                xv[4*i + 2] = *(const half2 *) &v.z; xv[4*i + 3] = *(const half2 *) &v.w;
+            }
+            s = XS[cb + lane];
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                xv[i] = __float2half2_rn(0.0f);
+            }
+        }
+#pragma unroll
+        for (int rr = 0; rr < RPW; rr += U) {
+            uint4 v[U][NLD];
+            int   mis[U], nu4[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int row = min(r0 + rr + u, M - 1);
+                const uintptr_t ad = (uintptr_t) (W + (int64_t) row*row_bytes + (int64_t) cb*BB);
+                mis[u] = (int) (ad & 15);
+                nu4[u] = (mis[u] + nblk*BB + 15)/16;
+                const uint4 * src = (const uint4 *) (ad - mis[u]);
+#pragma unroll
+                for (int jj = 0; jj < NLD; ++jj) {
+                    if (lane + 32*jj < nu4[u]) {
+                        v[u][jj] = __ldg(src + lane + 32*jj);
+                    }
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+#pragma unroll
+                for (int jj = 0; jj < NLD; ++jj) {
+                    if (lane + 32*jj < nu4[u]) {
+                        stage[wid][u][lane + 32*jj] = v[u][jj];
+                    }
+                }
+            }
+            __syncwarp();
+            if (lane < nblk) {
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
+                    const int o = mis[u] + BB*lane;
+                    const uint32_t * p = (const uint32_t *) ((const char *) stage[wid][u] + (o & ~3));
+                    uint32_t wd[NWD];
+#pragma unroll
+                    for (int i = 0; i < NWD; ++i) {
+                        wd[i] = p[i];
+                    }
+                    acc[rr + u] += s*mmvq_h1_block<type>(wd, o & 2, xv);
+                }
+            }
+            __syncwarp();
+        }
+    }
+#pragma unroll
+    for (int sft = 16; sft >= RPW; sft >>= 1) {
+#pragma unroll
+        for (int i = 0; i < RPW; ++i) {
+            acc[i] += __shfl_xor_sync(0xffffffffu, acc[i], sft);
+        }
+    }
+    if constexpr (RPW >= 32) { mmvq_h1_bfly<16>(acc, lane); }
+    if constexpr (RPW >= 16) { mmvq_h1_bfly<8>(acc, lane); }
+    if constexpr (RPW >= 8)  { mmvq_h1_bfly<4>(acc, lane); }
+    if constexpr (RPW >= 4)  { mmvq_h1_bfly<2>(acc, lane); }
+    if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc, lane); }
+    if (lane < RPW && r0 + lane < M) {
+        Y[r0 + lane] = acc[0];
+    }
+}
+
 // p100-series 10-06: gate + up + GLU for one column in one launch (gemma4's dense q4_0 FFN: Pascal fuses gate/up only through the
 // Q4_K/Q5_K hybrid kernels, so it ran two h1 matvecs and a GLU kernel per layer). Each matrix's rows are accumulated exactly as
 // mmvq_h1_q accumulates them (same chunk order, block math, fold and butterfly); the epilogue is the fused path's
@@ -708,6 +823,67 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         launch(std::integral_constant<ggml_type, GGML_TYPE_Q4_0>{});
     } else {
         launch(std::integral_constant<ggml_type, GGML_TYPE_Q8_0>{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// whether mmvq_h1_q's dense one-column path takes this matmul (the conditions of ggml_cuda_mmvq_h1_try, no launch)
+static bool mmvq_h1_dense1_ok(const ggml_tensor * mm) {
+    const ggml_tensor * w = mm->src[0], * x = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || (w->type != GGML_TYPE_Q4_0 && w->type != GGML_TYPE_Q8_0) || x->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 || w->ne[2] != 1 || w->ne[3] != 1 ||
+            !ggml_is_contiguous(mm) || mm->ne[0] != w->ne[1] || x->nb[0] != sizeof(float) || x->ne[0] != w->ne[0]) {
+        return false;
+    }
+    const int64_t K = w->ne[0];
+    const int64_t BB = w->type == GGML_TYPE_Q4_0 ? mmvq_h1_traits<GGML_TYPE_Q4_0>::BB : mmvq_h1_traits<GGML_TYPE_Q8_0>::BB;
+    const int64_t row_bytes = (K/H1_QK)*BB;
+    return K >= 32*H1_QK && K % H1_QK == 0 && w->nb[0] == (size_t) BB && w->nb[1] == (size_t) row_bytes && ((uintptr_t) w->data % 2) == 0 &&
+           ((row_bytes % 16 == 0 && (uintptr_t) w->data % 16 == 0) || (w->view_src == nullptr && K % MATRIX_ROW_PADDING != 0));
+}
+
+bool ggml_cuda_mmvq_h1_multi_try(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, const int n) {
+    // GGML_CUDA_MMVQ_H1_MULTI=0: one launch per matmul
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_MULTI"); return !s || atoi(s) != 0; }();
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!on || n < 2 || n > 3 || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc)) {
+        return false;
+    }
+    for (int j = 0; j < n; ++j) {
+        if (!mmvq_h1_dense1_ok(mm[j]) || mm[j]->src[1] != mm[0]->src[1] || mm[j]->src[0]->type != mm[0]->src[0]->type) {
+            return false;
+        }
+    }
+    const ggml_tensor * src1 = mm[0]->src[1];
+    const ggml_type type = mm[0]->src[0]->type;
+    const int64_t K = mm[0]->src[0]->ne[0];
+    const int64_t BB = type == GGML_TYPE_Q4_0 ? mmvq_h1_traits<GGML_TYPE_Q4_0>::BB : mmvq_h1_traits<GGML_TYPE_Q8_0>::BB;
+    const int64_t row_bytes = (K/H1_QK)*BB;
+    cudaStream_t stream = ctx.stream();
+    bool hit;
+    mmvq_h1_entry & entry = mmvq_h1_slot(ctx, mmvq_h1_key(src1), src1->data, 1, K, 0, hit);
+    __half * xh = (__half *) entry.buf;
+    float  * xs = (float *) ((char *) entry.buf + (size_t) K*sizeof(__half));
+    if (!hit) {
+        const dim3 pg((unsigned) ((K + 255)/256), 1);
+        mmvq_h1_prep<<<pg, 256, 0, stream>>>((const float *) src1->data, 0, xh, xs, (int) K);
+    }
+    constexpr int RB = MMVQ_H1_WPB*MMVQ_H1_RPW;
+    mmvq_h1_multi_args a{};
+    a.bstart[0] = 0;
+    for (int j = 0; j < 3; ++j) {
+        const ggml_tensor * t = mm[j < n ? j : n - 1];
+        a.W[j] = (const uint8_t *) t->src[0]->data;
+        a.Y[j] = (float *) t->data;
+        a.M[j] = (int) t->src[0]->ne[1];
+        a.bstart[j + 1] = a.bstart[j] + (j < n ? (int) ((a.M[j] + RB - 1)/RB) : 0);
+    }
+    const dim3 grid((unsigned) a.bstart[3]);
+    if (type == GGML_TYPE_Q4_0) {
+        mmvq_h1_q_multi<GGML_TYPE_Q4_0, MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(a, row_bytes, xh, xs, (int) K);
+    } else {
+        mmvq_h1_q_multi<GGML_TYPE_Q8_0, MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(a, row_bytes, xh, xs, (int) K);
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

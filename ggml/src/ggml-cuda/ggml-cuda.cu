@@ -4210,6 +4210,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    // p100-series: 2-3 consecutive one-column matmuls that read the same activation (the meta backend's graph_optimize groups
+    // gemma4's q / k / v) in one h1 launch
+    if (node->op == GGML_OP_MUL_MAT) {
+        int n = 1;
+        while (n < 3 && i + n < cgraph->n_nodes && cgraph->nodes[i + n]->op == GGML_OP_MUL_MAT &&
+               cgraph->nodes[i + n]->src[1] == node->src[1]) {
+            n++;
+        }
+        if (n > 1 && ggml_cuda_mmvq_h1_multi_try(*cuda_ctx, cgraph->nodes + i, n)) {
+            return n - 1;
+        }
+    }
+
     // p100-series: MUL_MAT_ID with a per-expert weight scale (reshape -> repeat -> get_rows -> mul) on Pascal, any weight type:
     // the matvec runs unfused (keeps the short-K geometry), the scale is one launch instead of three (gemma4 ffn_down_exps_s)
     if (node->op == GGML_OP_MUL_MAT_ID && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_PASCAL) {

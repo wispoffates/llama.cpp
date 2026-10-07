@@ -27,3 +27,7 @@ bool ggml_cuda_rms_norm_scale_mul_try(ggml_backend_cuda_context & ctx, const ggm
 bool ggml_cuda_mmvq_h1_glu_ok(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu);
 bool ggml_cuda_mmvq_h1_glu_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                const ggml_tensor * gate_w, ggml_glu_op op, ggml_tensor * dst);
+
+// 2-3 consecutive one-column matmuls with the same activation (q / k / v) in one h1 launch; bit-identical to separate launches.
+// Returns false (nothing launched) unless every one takes the dense one-column h1 path with the same type.
+bool ggml_cuda_mmvq_h1_multi_try(ggml_backend_cuda_context & ctx, ggml_tensor * const * mm, int n);

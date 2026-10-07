@@ -2844,6 +2844,46 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+// p100-series: before allocation, move one-column-friendly matmuls that read the same activation next to each other (gemma4: q, then
+// k and v a few nodes later behind q's reshape / norm / rope), so the CUDA backend can run them as one launch. A matmul whose sources
+// are a weight (a leaf) and that shared activation may move up past nodes that neither produce nor write it; the allocator then sees the
+// new order, so nothing aliases. At most 3 per group, within a 16-node window. GGML_META_GROUP_MM=0 disables.
+static void ggml_backend_meta_graph_optimize(ggml_backend_t backend, ggml_cgraph * g, ggml_backend_graph_optimize_params * params) {
+    static const bool on = [] { const char * e = getenv("GGML_META_GROUP_MM"); return e == nullptr || atoi(e) != 0; }();
+    if (!on) {
+        return;
+    }
+    auto writes = [](const ggml_tensor * n, const ggml_tensor * x) {
+        // n is x, a view of x, or shares x's view base (an in-place / view op that may write x's memory)
+        const ggml_tensor * xb = x->view_src ? x->view_src : x;
+        return n == x || n == xb || n->view_src == x || (n->view_src != nullptr && n->view_src == xb);
+    };
+    for (int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * a = g->nodes[i];
+        if (a->op != GGML_OP_MUL_MAT || a->src[0]->op != GGML_OP_NONE) {
+            continue;
+        }
+        const ggml_tensor * x = a->src[1];
+        int pos = i + 1;
+        for (int j = i + 1; j < g->n_nodes && j <= i + 16 && pos - i < 3; ++j) {
+            ggml_tensor * b = g->nodes[j];
+            if (writes(b, x)) {
+                break;
+            }
+            if (b->op != GGML_OP_MUL_MAT || b->src[1] != x || b->src[0]->op != GGML_OP_NONE || b->src[0]->type != a->src[0]->type) {
+                continue;
+            }
+            if (j != pos) {
+                std::rotate(g->nodes + pos, g->nodes + j, g->nodes + j + 1);
+            }
+            pos++;
+        }
+        i = pos - 1;
+    }
+    GGML_UNUSED(backend);
+    GGML_UNUSED(params);
+}
+
 static const ggml_backend_i ggml_backend_meta_i = {
     /* .get_name                = */ ggml_backend_meta_get_name,
     /* .free                    = */ ggml_backend_meta_free,
@@ -2860,7 +2900,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .graph_compute           = */ ggml_backend_meta_graph_compute,
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
-    /* .graph_optimize          = */ nullptr,
+    /* .graph_optimize          = */ ggml_backend_meta_graph_optimize,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
