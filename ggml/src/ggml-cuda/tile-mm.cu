@@ -72,6 +72,38 @@ template <> struct tile_mm_traits<GGML_TYPE_Q4_0> {
     static constexpr bool flat    = true;   // 9-word rows: stage the tile as one flat list (~3 rows per warp load, not 1)
 };
 
+// p100-series 10-07: expert banks of 2-bit qwen4exp builds (Sakura: IQ2_S / IQ2_XXS / IQ1_M gate+up, Q2_0 down), which otherwise
+// prefill through MMQ's emulated DP4A. All flat (rows of 9..21 words); the 66 / 82-byte IQ2 blocks are 2-aligned and staged from the
+// aligned-down address like q6_K.
+template <> struct tile_mm_traits<GGML_TYPE_Q2_0> {
+    static constexpr int  UV      = 2*QK2_0; // two blocks = two 64-value steps: 36 bytes per row, 4-aligned when K % 128 == 0
+    static constexpr int  RW      = 9;
+    static constexpr int  UB      = 2*sizeof(block_q2_0);
+    static constexpr bool aligned = true;
+    static constexpr bool flat    = true;
+};
+template <> struct tile_mm_traits<GGML_TYPE_IQ2_S> {
+    static constexpr int  UV      = QK_K;   // one superblock, 82 bytes: 21 words from the aligned-down address
+    static constexpr int  RW      = 21;
+    static constexpr int  UB      = sizeof(block_iq2_s);
+    static constexpr bool aligned = false;
+    static constexpr bool flat    = true;
+};
+template <> struct tile_mm_traits<GGML_TYPE_IQ2_XXS> {
+    static constexpr int  UV      = QK_K;   // one superblock, 66 bytes: 17 words from the aligned-down address
+    static constexpr int  RW      = 17;
+    static constexpr int  UB      = sizeof(block_iq2_xxs);
+    static constexpr bool aligned = false;
+    static constexpr bool flat    = true;
+};
+template <> struct tile_mm_traits<GGML_TYPE_IQ1_M> {
+    static constexpr int  UV      = QK_K;   // one superblock, 56 bytes: always 4-aligned
+    static constexpr int  RW      = 14;
+    static constexpr int  UB      = sizeof(block_iq1_m);
+    static constexpr bool aligned = true;
+    static constexpr bool flat    = true;
+};
+
 // byte address of staged unit u of row m
 template <ggml_type type>
 static __device__ __forceinline__ const unsigned char * tile_mm_unit(const void * W, const int64_t m, const int64_t row_bytes, const int u) {
@@ -122,6 +154,45 @@ static __device__ __forceinline__ half2 tile_mm_decode(const unsigned char * rb,
         const float    d  = __half2float(*(const __half *) b)*1024.0f;
         const uint32_t qw = *(const unsigned short *) (b + 2 + 2*(lane & 15));
         return __floats2half2_rn(d*(int) (signed char) (qw & 0xFF), d*(int) (signed char) (qw >> 8));
+    } else if constexpr (type == GGML_TYPE_Q2_0) {
+        // step st = block st of the unit; values 2j, 2j+1 = bits 4*(j%2) .. +3 of qs[j/2]; code c -> (c - 1)*d
+        const unsigned char * b = rb + st*sizeof(block_q2_0);
+        const float    d = __half2float(*(const __half *) b)*1024.0f;
+        const uint32_t q = (b[2 + (lane >> 1)] >> (4*(lane & 1))) & 0xF;
+        return __floats2half2_rn(d*((int) (q & 3) - 1), d*((int) (q >> 2) - 1));
+    } else if constexpr (type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ1_M) {
+        // values v = 64st + 2j, +1: sub-block ib = 2st + j/16, grid group il = (j%16)/4, entries jj = 2*(j%4), +1 (as dequantize_row_*)
+        const int ib = 2*st + (lane >> 4), il = (lane & 15) >> 2, jj = 2*(lane & 3);
+        if constexpr (type == GGML_TYPE_IQ2_S) {
+            const float    d   = __half2float(*(const __half *) rb);
+            const uint32_t qh  = rb[2 + QK_K/4 + ib], sc = rb[2 + QK_K/4 + QK_K/32 + ib];
+            const uint64_t g   = iq2s_grid[rb[2 + 4*ib + il] | ((qh << (8 - 2*il)) & 0x300)];
+            const uint32_t sg  = rb[2 + QK_K/8 + 4*ib + il];
+            const float    dl  = d*(0.5f + ((sc >> 4*(il/2)) & 0xF))*0.25f*1024.0f;
+            const float w0 = (float) ((g >> 8*jj) & 0xFF), w1 = (float) ((g >> (8*jj + 8)) & 0xFF);
+            return __floats2half2_rn(dl*((sg >> jj) & 1 ? -w0 : w0), dl*((sg >> (jj + 1)) & 1 ? -w1 : w1));
+        } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
+            const float    d    = __half2float(*(const __half *) rb);
+            const unsigned char * q2 = rb + 2 + 8*ib;
+            const uint32_t aux1 = q2[4] | (q2[5] << 8) | (q2[6] << 16) | ((uint32_t) q2[7] << 24);
+            const uint64_t g    = iq2xxs_grid[q2[il]];
+            const uint32_t sg   = ksigns_iq2xs[(aux1 >> 7*il) & 127];
+            const float    dl   = d*(0.5f + (aux1 >> 28))*0.25f*1024.0f;
+            const float w0 = (float) ((g >> 8*jj) & 0xFF), w1 = (float) ((g >> (8*jj + 8)) & 0xFF);
+            return __floats2half2_rn(dl*((sg >> jj) & 1 ? -w0 : w0), dl*((sg >> (jj + 1)) & 1 ? -w1 : w1));
+        } else {
+            const uint16_t * sc = (const uint16_t *) (rb + QK_K/8 + QK_K/16);
+            iq1m_scale_t scale;
+            scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+            const int      ib16  = 2*ib + il/2;
+            const float    dl    = __half2float(scale.f16)*(2*((sc[ib16/4] >> 3*(ib16%4)) & 0x7) + 1)*1024.0f;
+            const uint32_t qhb   = rb[QK_K/8 + 2*ib + il/2];
+            const float    delta = qhb & (0x08 << 4*(il%2)) ? -1.0f - IQ1M_DELTA : -1.0f + IQ1M_DELTA;
+            const uint32_t g     = iq1s_grid_gpu[rb[4*ib + il] | (((qhb >> 4*(il%2)) & 7) << 8)];
+            // entries 0..3 = low nibbles of the grid bytes, 4..7 = high nibbles
+            const int sh = jj < 4 ? 8*jj : 8*(jj - 4) + 4;
+            return __floats2half2_rn(dl*((float) ((g >> sh) & 0xF) + delta), dl*((float) ((g >> (sh + 8)) & 0xF) + delta));
+        }
     } else {
         // q4_0 (one step per unit): block j/16, values p = 2*(j%16), p+1; values 0..15 are the low nibbles of qs[0..15], 16..31 the
         // high nibbles
@@ -234,7 +305,7 @@ static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const til
         if constexpr (tr::flat) {                                                                                     \
             _Pragma("unroll") for (int v = 0; v < NRAW; ++v) {                                                        \
                 const int it = t + 256*v, r = it / RW, w = it % RW;                                                   \
-                raw[v] = it < BM*RW ? __ldg((const uint32_t *) tile_mm_unit<type>(W, min(m0 + r, M - 1), row_bytes, (uu)) + w) : 0u; \
+                raw[v] = it < BM*RW ? __ldg((const uint32_t *) ((uintptr_t) tile_mm_unit<type>(W, min(m0 + r, M - 1), row_bytes, (uu)) & ~(uintptr_t) 3) + w) : 0u; \
             }                                                                                                         \
         } else {                                                                                                      \
             _Pragma("unroll") for (int i = 0; i < RPW; ++i) {                                                         \
@@ -424,6 +495,10 @@ static void tile_mm_dispatch(const ggml_type type, const int tn, const tile_mm_p
         case GGML_TYPE_Q4_K: tile_mm_launch_tn<GGML_TYPE_Q4_K, ID>(tn, prm, splits_or_tiles, stream); break;
         case GGML_TYPE_Q8_0: tile_mm_launch_tn<GGML_TYPE_Q8_0, ID>(tn, prm, splits_or_tiles, stream); break;
         case GGML_TYPE_Q4_0: tile_mm_launch_tn<GGML_TYPE_Q4_0, ID>(tn, prm, splits_or_tiles, stream); break;
+        case GGML_TYPE_Q2_0:    tile_mm_launch_tn<GGML_TYPE_Q2_0,    ID>(tn, prm, splits_or_tiles, stream); break;
+        case GGML_TYPE_IQ2_S:   tile_mm_launch_tn<GGML_TYPE_IQ2_S,   ID>(tn, prm, splits_or_tiles, stream); break;
+        case GGML_TYPE_IQ2_XXS: tile_mm_launch_tn<GGML_TYPE_IQ2_XXS, ID>(tn, prm, splits_or_tiles, stream); break;
+        case GGML_TYPE_IQ1_M:   tile_mm_launch_tn<GGML_TYPE_IQ1_M,   ID>(tn, prm, splits_or_tiles, stream); break;
         default: GGML_ABORT("tile_mm: unsupported type");
     }
 }
@@ -470,6 +545,8 @@ static bool tmm_env_on(const char * name) {
 static bool tmm_weights_ok(const ggml_tensor * src0) {
     static const bool q6k_on = tmm_env_on("GGML_CUDA_TILE_Q6K"), q80_on = tmm_env_on("GGML_CUDA_TILE_Q8_0"), q40_on = tmm_env_on("GGML_CUDA_TILE_Q4_0");
     static const bool q5k_on = tmm_env_on("GGML_CUDA_TILE_Q5K"), q4k_on = tmm_env_on("GGML_CUDA_TILE_Q4K");
+    // GGML_CUDA_TILE_LB=0: Q2_0 / IQ2_S / IQ2_XXS / IQ1_M back to MMQ / cuBLAS
+    static const bool lb_on = tmm_env_on("GGML_CUDA_TILE_LB");
     const int64_t K = src0->ne[0], M = src0->ne[1];
     switch (src0->type) {
         case GGML_TYPE_Q6_K: {
@@ -493,6 +570,20 @@ static bool tmm_weights_ok(const ggml_tensor * src0) {
             // units of two blocks: K % 64 keeps every row 4-aligned
             return q40_on && K % (2*QK4_0) == 0 && src0->nb[1] == (size_t) (K/QK4_0)*sizeof(block_q4_0) &&
                    ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
+        case GGML_TYPE_Q2_0:
+            // units of two blocks (36 bytes): K % 128 keeps every row 4-aligned
+            return lb_on && K % (2*QK2_0) == 0 && src0->nb[1] == (size_t) (K/QK2_0)*sizeof(block_q2_0) &&
+                   ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ2_XXS: {
+            // 2-aligned blocks staged from the aligned-down address: never past the matrix when M*nbk is even (as q6_K)
+            const int64_t nbk = K/QK_K;
+            return lb_on && K % QK_K == 0 && (M*nbk) % 2 == 0 && src0->nb[1] == (size_t) nbk*ggml_type_size(src0->type) &&
+                   ((uintptr_t) src0->data % 2) == 0 && src0->nb[2] % 4 == 0;
+        }
+        case GGML_TYPE_IQ1_M:
+            return lb_on && K % QK_K == 0 && src0->nb[1] == (size_t) (K/QK_K)*sizeof(block_iq1_m) &&
+                   ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
         default:
             return false;
     }
@@ -502,12 +593,14 @@ static int tmm_uv(const ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q8_0: return tile_mm_traits<GGML_TYPE_Q8_0>::UV;
         case GGML_TYPE_Q4_0: return tile_mm_traits<GGML_TYPE_Q4_0>::UV;
-        default:             return QK_K;    // q6_K, q5_K, q4_K
+        case GGML_TYPE_Q2_0: return tile_mm_traits<GGML_TYPE_Q2_0>::UV;
+        default:             return QK_K;    // q6_K, q5_K, q4_K, IQ2_S, IQ2_XXS, IQ1_M
     }
 }
 
 static bool tmm_type_ok(const ggml_type type) {
-    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
+    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 ||
+           type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ1_M;
 }
 
 bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
