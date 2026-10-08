@@ -79,6 +79,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -2725,6 +2726,86 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// p100-series graph census (GGML_CUDA_GRAPH_CENSUS=1, exp/graph-probe, experiment E3): per device, how ggml_backend_cuda_graph_compute
+// calls were executed (graph launch / direct and why), node-type and size histograms of the launched CUDA graphs, captures,
+// exec updates and the host cost of the property check. Printed to stderr at exit.
+struct ggml_cuda_graph_census {
+    std::atomic<uint64_t> calls{0}, launches{0}, direct_disabled{0}, direct_incompat{0}, direct_warmup{0}, direct_changed{0};
+    std::atomic<uint64_t> captures{0}, exec_updates{0}, reinstantiates{0}, uid_hits{0}, prop_checks{0}, prop_ns{0};
+    std::atomic<uint64_t> ggml_nodes_launched{0}, ggml_nodes_direct{0}, one_node_calls{0};
+    std::atomic<uint64_t> types_launched[8] = {};
+    std::atomic<uint64_t> size_hist[9] = {}; // CUDA nodes per launched graph: 1, 2, 3-5, 6-10, 11-20, 21-50, 51-100, 101-500, >500
+};
+static ggml_cuda_graph_census g_graph_census[GGML_CUDA_MAX_DEVICES];
+static bool ggml_cuda_graph_census_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_CENSUS");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+static int ggml_cuda_graph_census_bucket(int n) {
+    return n <= 1 ? 0 : n == 2 ? 1 : n <= 5 ? 2 : n <= 10 ? 3 : n <= 20 ? 4 : n <= 50 ? 5 : n <= 100 ? 6 : n <= 500 ? 7 : 8;
+}
+static void ggml_cuda_graph_census_dump() {
+    static const char * tn[8] = {"kernel", "memcpy", "memset", "host", "child", "empty", "event", "other"};
+    static const char * bn[9] = {"1", "2", "3-5", "6-10", "11-20", "21-50", "51-100", "101-500", ">500"};
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; d++) {
+        ggml_cuda_graph_census & c = g_graph_census[d];
+        if (c.calls == 0) {
+            continue;
+        }
+        fprintf(stderr, "graph-census dev%d: calls %llu launches %llu direct{disabled %llu incompat %llu warmup %llu changed %llu} "
+                "one_node_calls %llu captures %llu exec_updates %llu reinstantiates %llu uid_hits %llu prop_checks %llu prop_us %.0f "
+                "ggml_nodes{launched %llu direct %llu}\n", d,
+                (unsigned long long) c.calls, (unsigned long long) c.launches, (unsigned long long) c.direct_disabled,
+                (unsigned long long) c.direct_incompat, (unsigned long long) c.direct_warmup, (unsigned long long) c.direct_changed,
+                (unsigned long long) c.one_node_calls, (unsigned long long) c.captures, (unsigned long long) c.exec_updates,
+                (unsigned long long) c.reinstantiates, (unsigned long long) c.uid_hits, (unsigned long long) c.prop_checks,
+                c.prop_ns / 1e3, (unsigned long long) c.ggml_nodes_launched, (unsigned long long) c.ggml_nodes_direct);
+        fprintf(stderr, "graph-census dev%d: launched node types:", d);
+        for (int t = 0; t < 8; t++) {
+            fprintf(stderr, " %s %llu", tn[t], (unsigned long long) c.types_launched[t]);
+        }
+        fprintf(stderr, "\ngraph-census dev%d: CUDA nodes per launched graph:", d);
+        for (int b = 0; b < 9; b++) {
+            fprintf(stderr, " [%s] %llu", bn[b], (unsigned long long) c.size_hist[b]);
+        }
+        fprintf(stderr, "\n");
+    }
+}
+static void ggml_cuda_graph_census_capture(ggml_cuda_graph * graph) {
+    size_t n = 0;
+    CUDA_CHECK(cudaGraphGetNodes(graph->graph, nullptr, &n));
+    std::vector<cudaGraphNode_t> nodes(n);
+    if (n > 0) {
+        CUDA_CHECK(cudaGraphGetNodes(graph->graph, nodes.data(), &n));
+    }
+    for (int t = 0; t < 8; t++) {
+        graph->census_types[t] = 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        cudaGraphNodeType ty;
+        CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &ty));
+        int k = 7;
+        switch (ty) {
+            case cudaGraphNodeTypeKernel:      k = 0; break;
+            case cudaGraphNodeTypeMemcpy:      k = 1; break;
+            case cudaGraphNodeTypeMemset:      k = 2; break;
+            case cudaGraphNodeTypeHost:        k = 3; break;
+            case cudaGraphNodeTypeGraph:       k = 4; break;
+            case cudaGraphNodeTypeEmpty:       k = 5; break;
+            case cudaGraphNodeTypeWaitEvent:
+            case cudaGraphNodeTypeEventRecord: k = 6; break;
+            default: break;
+        }
+        graph->census_types[k]++;
+    }
+    graph->census_nodes = (int) n;
+}
+#endif // USE_CUDA_GRAPH
+
+#ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -2771,6 +2852,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
+        if (ggml_cuda_graph_census_on()) {
+            g_graph_census[cuda_ctx->device].uid_hits++;
+        }
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
     }
@@ -2824,6 +2908,9 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         // The pre-existing graph exec cannot be updated due to violated constraints
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
+        if (ggml_cuda_graph_census_on()) {
+            g_graph_census[cuda_ctx->device].reinstantiates++;
+        }
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
@@ -4643,6 +4730,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            if (ggml_cuda_graph_census_on()) {
+                g_graph_census[cuda_ctx->device].captures++;
+                ggml_cuda_graph_census_capture(graph);
+            }
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -4660,6 +4751,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+            if (ggml_cuda_graph_census_on()) {
+                g_graph_census[cuda_ctx->device].exec_updates++;
+            }
+        }
+        if (ggml_cuda_graph_census_on()) {
+            ggml_cuda_graph_census & c = g_graph_census[cuda_ctx->device];
+            c.launches++;
+            for (int t = 0; t < 8; t++) {
+                c.types_launched[t] += graph->census_types[t];
+            }
+            c.size_hist[ggml_cuda_graph_census_bucket(graph->census_nodes)]++;
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
@@ -4715,11 +4817,33 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
+    const bool census = ggml_cuda_graph_census_on();
+    if (census) {
+        static std::once_flag census_once;
+        std::call_once(census_once, [] { atexit(ggml_cuda_graph_census_dump); });
+        g_graph_census[cuda_ctx->device].calls++;
+        if (cgraph->n_nodes <= 1) {
+            g_graph_census[cuda_ctx->device].one_node_calls++;
+        }
+    }
+    int census_reason = 0; // 0 disabled, 1 incompatible, 2 warmup, 3 changed post-warmup
+
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
+        census_reason = 1;
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
+            census_reason = 2;
+            const auto census_t0 = census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            if (census) {
+                g_graph_census[cuda_ctx->device].prop_checks++;
+                g_graph_census[cuda_ctx->device].prop_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - census_t0).count();
+                if (graph->warmup_complete && properties_changed) {
+                    census_reason = 3;
+                }
+            }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4741,6 +4865,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+        }
+    }
+
+    if (census) {
+        ggml_cuda_graph_census & c = g_graph_census[cuda_ctx->device];
+        if (use_cuda_graph) {
+            c.ggml_nodes_launched += cgraph->n_nodes;
+        } else {
+            c.ggml_nodes_direct += cgraph->n_nodes;
+            (census_reason == 0 ? c.direct_disabled : census_reason == 1 ? c.direct_incompat :
+             census_reason == 2 ? c.direct_warmup : c.direct_changed)++;
         }
     }
 #endif // USE_CUDA_GRAPH

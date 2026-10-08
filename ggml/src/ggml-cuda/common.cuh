@@ -1304,6 +1304,9 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // p100-series graph census (GGML_CUDA_GRAPH_CENSUS=1, exp/graph-probe): node types of the captured graph
+    int census_types[8] = {0}; // kernel, memcpy, memset, host, child, empty, event record / wait, other
+    int census_nodes = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
