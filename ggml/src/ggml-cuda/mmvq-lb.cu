@@ -468,7 +468,9 @@ bool ggml_cuda_mmvq_lb_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     // integer path, and the 2-bit expert banks gain no accuracy from an fp32 activation)
     static const bool enabled  = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB");       return !s || atoi(s) != 0; }();
     static const bool dense_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB_DENSE"); return !s || atoi(s) != 0; }();
-    static const bool v2_on    = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB_V2");    return  s && atoi(s) != 0; }();
+    // GGML_CUDA_MMVQ_LB_V2: 1 = v2 for dense (types v3 leaves) and one-token MUL_MAT_ID, 2 = MUL_MAT_ID only, 3 = dense only
+    static const int  v2_mode  = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB_V2");    return  s ? atoi(s) : 0; }();
+    const bool v2_on = v2_mode == 1 || (v2_mode == 2 && ids) || (v2_mode == 3 && !ids);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_type type = src0->type;
     if (!enabled || (!ids && !dense_on) || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) ||
