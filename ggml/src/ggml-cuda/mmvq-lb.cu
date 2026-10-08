@@ -180,36 +180,91 @@ static __global__ void __launch_bounds__(MMVQ_LB_WPB*32) mmvq_lb(
 // 16-byte-aligned address at or below it (rows are 8-aligned), and lane l decodes sub-block l from there. Lane l keeps its 32 fp32
 // activation values in registers for the warp's RPW rows. fp32 multiply-adds, one warp reduction per row, deterministic.
 #define MMVQ_LB3_WPB 4
-#define MMVQ_LB3_RPW 4
-#define MMVQ_LB3_U   2   // rows staged at a time
 
-template <bool XS> struct lb3_traits;
-template <> struct lb3_traits<true>  { static constexpr int CH = 4*sizeof(block_iq4_xs); };   // 544 B per 32 sub-blocks
-template <> struct lb3_traits<false> { static constexpr int CH = 32*sizeof(block_iq4_nl); };  // 576 B
+// v3b (10-08): Q4 found small matrices short of blocks at 4 rows per warp (640 rows = 40 blocks on 56 SMs: 14.1 vs 8.7 us integer)
+// -> rows per warp RPW in {1, 2, 4} by M; and IQ3_S added (Sakura's attention gates / GDN out / shared-expert gate+up), which v3
+// had left on the integer path (decode KLD 0.001290 vs v2's 0.000434).
+enum lb3_fmt { LB3_IQ4_NL = 0, LB3_IQ4_XS = 1, LB3_IQ3_S = 2 };
+template <int F> struct lb3_traits;
+template <> struct lb3_traits<LB3_IQ4_NL> { static constexpr int CH = 32*sizeof(block_iq4_nl); static constexpr int SB = sizeof(block_iq4_nl); static constexpr int PER = 1; };
+template <> struct lb3_traits<LB3_IQ4_XS> { static constexpr int CH = 4*sizeof(block_iq4_xs);  static constexpr int SB = sizeof(block_iq4_xs); static constexpr int PER = 8; };
+template <> struct lb3_traits<LB3_IQ3_S>  { static constexpr int CH = 4*sizeof(block_iq3_s);   static constexpr int SB = sizeof(block_iq3_s);  static constexpr int PER = 8; };
 
-template <bool XS>
+// sub-block (32 values) of a staged block b, sub-block index ib, dotted with yv (fp32), exactly dequantize_row_* weights
+template <int F>
+static __device__ __forceinline__ float lb3_sub(const uint8_t * b, const int ib, const float * yv, const float * kv) {
+    if constexpr (F == LB3_IQ4_XS) {
+        const uint32_t sh = b[2] | (b[3] << 8);
+        const int ls = ((b[4 + ib/2] >> 4*(ib & 1)) & 0xf) | (((sh >> 2*ib) & 3) << 4);
+        const float dl = __half2float(__ushort_as_half((unsigned short) (b[0] | (b[1] << 8))))*(ls - 32);
+        const uint32_t * q = (const uint32_t *) (b + 8 + 16*ib);   // 4-aligned in the stage (8-aligned rows)
+        float s = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t w = q[k];
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+                s += kv[(w >> 8*m) & 0xf]*yv[4*k + m] + kv[(w >> (8*m + 4)) & 0xf]*yv[4*k + m + 16];
+            }
+        }
+        return dl*s;
+    } else if constexpr (F == LB3_IQ4_NL) {
+        const float dl = __half2float(__ushort_as_half((unsigned short) (b[0] | (b[1] << 8))));
+        float s = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const uint32_t w = b[2 + k];
+            s += kv[w & 0xf]*yv[k] + kv[w >> 4]*yv[k + 16];
+        }
+        return dl*s;
+    } else {
+        // iq3_s: d(2) qs[64] qh[8] signs[32] scales[4]
+        const float d = __half2float(__ushort_as_half((unsigned short) (b[0] | (b[1] << 8))));
+        const uint8_t * qs = b + 2 + 8*ib;
+        const uint32_t qh = b[2 + 64 + ib];
+        const uint8_t * sg = b + 2 + 64 + 8 + 4*ib;
+        const float db = d*(1 + 2*((b[2 + 64 + 8 + 32 + ib/2] >> 4*(ib & 1)) & 0xf));
+        float s = 0.0f;
+#pragma unroll
+        for (int il = 0; il < 4; ++il) {
+            const uint32_t g1 = iq3s_grid[qs[2*il + 0] | ((qh << (8 - 2*il)) & 256)];
+            const uint32_t g2 = iq3s_grid[qs[2*il + 1] | ((qh << (7 - 2*il)) & 256)];
+            const uint32_t sgn = sg[il];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                s += (float) ((g1 >> 8*j) & 0xff)*lb_sgn(yv[8*il + j],     (sgn >> j) & 1);
+                s += (float) ((g2 >> 8*j) & 0xff)*lb_sgn(yv[8*il + 4 + j], (sgn >> (j + 4)) & 1);
+            }
+        }
+        return db*s;
+    }
+}
+
+template <int F, int RPW>
 static __global__ void __launch_bounds__(MMVQ_LB3_WPB*32) mmvq_lb3(
         const uint8_t * __restrict__ W, const int64_t row_bytes, const float * __restrict__ X, float * __restrict__ Y,
         const int M, const int K) {
-    constexpr int CH  = lb3_traits<XS>::CH;
+    using tr = lb3_traits<F>;
+    constexpr int CH  = tr::CH;
+    constexpr int U   = RPW < 2 ? RPW : 2;      // rows staged at a time
     constexpr int STG = (CH + 15 + 15)/16;      // chunk + slack for the aligned-down start
     constexpr int NLD = (STG + 31)/32;
-    __shared__ uint4 stage[MMVQ_LB3_WPB][MMVQ_LB3_U][STG];
+    __shared__ uint4 stage[MMVQ_LB3_WPB][U][STG];
     __shared__ float kv[16];
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     if (threadIdx.x < 16) {
         kv[threadIdx.x] = kvalues_iq4nl[threadIdx.x];
     }
     __syncthreads();
-    const int r0 = (blockIdx.x*MMVQ_LB3_WPB + wid)*MMVQ_LB3_RPW;
+    const int r0 = (blockIdx.x*MMVQ_LB3_WPB + wid)*RPW;
     if (r0 >= M) {
         return;   // no block-wide barriers below
     }
     ggml_cuda_pdl_sync();
     const int nsub = K/32;
-    float acc[MMVQ_LB3_RPW];
+    float acc[RPW];
 #pragma unroll
-    for (int i = 0; i < MMVQ_LB3_RPW; ++i) {
+    for (int i = 0; i < RPW; ++i) {
         acc[i] = 0.0f;
     }
     for (int cb = 0; cb < nsub; cb += 32) {
@@ -228,14 +283,14 @@ static __global__ void __launch_bounds__(MMVQ_LB3_WPB*32) mmvq_lb3(
                 yv[i] = 0.0f;
             }
         }
-        const int64_t coff  = XS ? (int64_t) (cb/8)*sizeof(block_iq4_xs) : (int64_t) cb*sizeof(block_iq4_nl);
-        const int     nbyte = XS ? (nblk/8)*(int) sizeof(block_iq4_xs) : nblk*(int) sizeof(block_iq4_nl);
+        const int64_t coff  = (int64_t) (cb/tr::PER)*tr::SB;
+        const int     nbyte = (nblk/tr::PER)*tr::SB;
 #pragma unroll
-        for (int rr = 0; rr < MMVQ_LB3_RPW; rr += MMVQ_LB3_U) {
-            uint4 v[MMVQ_LB3_U][NLD];
-            int   mis[MMVQ_LB3_U], nu4[MMVQ_LB3_U];
+        for (int rr = 0; rr < RPW; rr += U) {
+            uint4 v[U][NLD];
+            int   mis[U], nu4[U];
 #pragma unroll
-            for (int u = 0; u < MMVQ_LB3_U; ++u) {
+            for (int u = 0; u < U; ++u) {
                 const int row = min(r0 + rr + u, M - 1);   // rows past M re-read the last row; never written
                 const uintptr_t a = (uintptr_t) (W + (int64_t) row*row_bytes + coff);
                 mis[u] = (int) (a & 15);
@@ -249,7 +304,7 @@ static __global__ void __launch_bounds__(MMVQ_LB3_WPB*32) mmvq_lb3(
                 }
             }
 #pragma unroll
-            for (int u = 0; u < MMVQ_LB3_U; ++u) {
+            for (int u = 0; u < U; ++u) {
 #pragma unroll
                 for (int j = 0; j < NLD; ++j) {
                     if (lane + 32*j < nu4[u]) {
@@ -260,36 +315,9 @@ static __global__ void __launch_bounds__(MMVQ_LB3_WPB*32) mmvq_lb3(
             __syncwarp();
             if (lane < nblk) {
 #pragma unroll
-                for (int u = 0; u < MMVQ_LB3_U; ++u) {
-                    const uint8_t * sb = (const uint8_t *) stage[wid][u] + mis[u];
-                    float dl, s = 0.0f;
-                    if constexpr (XS) {
-                        const uint8_t * b = sb + (lane >> 3)*sizeof(block_iq4_xs);   // 8-aligned
-                        const int ib = lane & 7;
-                        const uint32_t sh = *(const uint16_t *) (b + 2);
-                        const int ls = ((b[4 + ib/2] >> 4*(ib & 1)) & 0xf) | (((sh >> 2*ib) & 3) << 4);
-                        dl = __half2float(*(const __half *) b)*(ls - 32);
-                        const uint32_t * q = (const uint32_t *) (b + 8 + 16*ib);
-#pragma unroll
-                        for (int k = 0; k < 4; ++k) {
-                            const uint32_t w = q[k];
-#pragma unroll
-                            for (int m = 0; m < 4; ++m) {
-                                s += kv[(w >> 8*m) & 0xf]*yv[4*k + m] + kv[(w >> (8*m + 4)) & 0xf]*yv[4*k + m + 16];
-                            }
-                        }
-                    } else {
-                        const uint8_t * b = sb + lane*sizeof(block_iq4_nl);           // 2-aligned
-                        dl = __half2float(*(const __half *) b);
-                        const uint16_t * q = (const uint16_t *) (b + 2);
-#pragma unroll
-                        for (int k = 0; k < 8; ++k) {
-                            const uint32_t w = q[k];
-                            s += kv[w & 0xf]*yv[2*k] + kv[(w >> 4) & 0xf]*yv[2*k + 16] +
-                                 kv[(w >> 8) & 0xf]*yv[2*k + 1] + kv[(w >> 12) & 0xf]*yv[2*k + 17];
-                        }
-                    }
-                    acc[rr + u] += dl*s;
+                for (int u = 0; u < U; ++u) {
+                    const uint8_t * b = (const uint8_t *) stage[wid][u] + mis[u] + (lane/tr::PER)*tr::SB;
+                    acc[rr + u] += lb3_sub<F>(b, lane % tr::PER, yv, kv);
                 }
             }
             __syncwarp();
@@ -297,48 +325,68 @@ static __global__ void __launch_bounds__(MMVQ_LB3_WPB*32) mmvq_lb3(
     }
     ggml_cuda_pdl_lc();
 #pragma unroll
-    for (int i = 0; i < MMVQ_LB3_RPW; ++i) {
+    for (int i = 0; i < RPW; ++i) {
         acc[i] = warp_reduce_sum<32>(acc[i]);
     }
-    if (lane < MMVQ_LB3_RPW && r0 + lane < M) {
+    if (lane < RPW && r0 + lane < M) {
         float v = acc[0];
 #pragma unroll
-        for (int i = 1; i < MMVQ_LB3_RPW; ++i) {
+        for (int i = 1; i < RPW; ++i) {
             v = lane == i ? acc[i] : v;
         }
         Y[r0 + lane] = v;
     }
 }
 
-// dense one-column IQ4_XS / IQ4_NL through v3; false = not handled here
+// dense one-column IQ4_XS / IQ4_NL / IQ3_S through v3; false = not handled here
 static bool mmvq_lb3_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const bool iq3s_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB3_IQ3S"); return !s || atoi(s) != 0; }();
     const ggml_type type = src0->type;
-    if (type != GGML_TYPE_IQ4_XS && type != GGML_TYPE_IQ4_NL) {
-        return false;
+    int fmt;
+    switch (type) {
+        case GGML_TYPE_IQ4_NL: fmt = LB3_IQ4_NL; break;
+        case GGML_TYPE_IQ4_XS: fmt = LB3_IQ4_XS; break;
+        case GGML_TYPE_IQ3_S:  if (!iq3s_on) { return false; } fmt = LB3_IQ3_S; break;
+        default: return false;
     }
-    const bool xs = type == GGML_TYPE_IQ4_XS;
     const int64_t K = src0->ne[0], M = src0->ne[1];
-    const int64_t qk = xs ? QK_K : QK4_NL;
+    const int64_t qk = type == GGML_TYPE_IQ4_NL ? QK4_NL : QK_K;
     const int64_t row_bytes = (K/qk)*(int64_t) ggml_type_size(type);
-    // rows 8-aligned (IQ4_XS: 8-aligned header / qs inside the stage). The aligned-down 16-byte staging can read up to 15 bytes past
-    // a row's end: fine when rows are 16-byte multiples on a 16-byte-aligned base (no overrun at all), or when the tensor owns its
-    // allocation and K is not a multiple of MATRIX_ROW_PADDING (the last row is padded) -- the same rule as mmvq-h1.
+    // IQ4_XS reads its qs words 4-aligned inside the stage -> 8-aligned rows; the others use byte reads. The aligned-down 16-byte
+    // staging can read up to 15 bytes past a row's end: fine when rows are 16-byte multiples on a 16-byte-aligned base, or when the
+    // tensor owns its allocation and K is not a multiple of MATRIX_ROW_PADDING (the last row is padded) -- the same rule as mmvq-h1.
     const bool rows_ok = (row_bytes % 16 == 0 && (uintptr_t) src0->data % 16 == 0) ||
                          (src0->view_src == nullptr && K % MATRIX_ROW_PADDING != 0);
-    if (!rows_ok || K % qk != 0 || K % 32 != 0 || src0->nb[0] != ggml_type_size(type) || (int64_t) src0->nb[1] != row_bytes ||
-            row_bytes % 8 != 0 || ((uintptr_t) src0->data % 8) != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+    const bool align_ok = fmt != LB3_IQ4_XS || (row_bytes % 8 == 0 && (uintptr_t) src0->data % 8 == 0);
+    if (!rows_ok || !align_ok || K % qk != 0 || K % 32 != 0 || src0->nb[0] != ggml_type_size(type) || (int64_t) src0->nb[1] != row_bytes ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 ||
             src1->ne[0] != K || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src1->nb[0] != sizeof(float) ||
             ((uintptr_t) src1->data % 16) != 0 || dst->ne[0] != M || dst->ne[1] != 1 || dst->nb[0] != sizeof(float)) {
         return false;
     }
-    constexpr int RB = MMVQ_LB3_WPB*MMVQ_LB3_RPW;
-    const dim3 grid((unsigned) ((M + RB - 1)/RB));
-    if (xs) {
-        mmvq_lb3<true><<<grid, MMVQ_LB3_WPB*32, 0, ctx.stream()>>>((const uint8_t *) src0->data, row_bytes, (const float *) src1->data,
-            (float *) dst->data, (int) M, (int) K);
-    } else {
-        mmvq_lb3<false><<<grid, MMVQ_LB3_WPB*32, 0, ctx.stream()>>>((const uint8_t *) src0->data, row_bytes, (const float *) src1->data,
-            (float *) dst->data, (int) M, (int) K);
+    // rows per warp: enough blocks for small matrices, activation reuse for big ones (GGML_CUDA_MMVQ_LB3_RPW forces 1 / 2 / 4)
+    static const int rpw_env = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB3_RPW"); return s ? atoi(s) : 0; }();
+    const int rpw = rpw_env == 1 || rpw_env == 2 || rpw_env == 4 ? rpw_env : (M <= 1536 ? 1 : M <= 4096 ? 2 : 4);
+    const uint8_t * Wp = (const uint8_t *) src0->data;
+    const float   * Xp = (const float *) src1->data;
+    float         * Yp = (float *) dst->data;
+    cudaStream_t stream = ctx.stream();
+    auto go = [&](auto fmt_tag, auto rpw_tag) {
+        constexpr int F = decltype(fmt_tag)::value, R = decltype(rpw_tag)::value;
+        const dim3 grid((unsigned) ((M + MMVQ_LB3_WPB*R - 1)/(MMVQ_LB3_WPB*R)));
+        mmvq_lb3<F, R><<<grid, MMVQ_LB3_WPB*32, 0, stream>>>(Wp, row_bytes, Xp, Yp, (int) M, (int) K);
+    };
+    auto byrpw = [&](auto fmt_tag) {
+        switch (rpw) {
+            case 1:  go(fmt_tag, std::integral_constant<int, 1>{}); break;
+            case 2:  go(fmt_tag, std::integral_constant<int, 2>{}); break;
+            default: go(fmt_tag, std::integral_constant<int, 4>{}); break;
+        }
+    };
+    switch (fmt) {
+        case LB3_IQ4_NL: byrpw(std::integral_constant<int, LB3_IQ4_NL>{}); break;
+        case LB3_IQ4_XS: byrpw(std::integral_constant<int, LB3_IQ4_XS>{}); break;
+        default:         byrpw(std::integral_constant<int, LB3_IQ3_S>{});  break;
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
