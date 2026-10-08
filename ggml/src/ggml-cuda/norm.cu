@@ -314,7 +314,7 @@ static __global__ void rms_norm_back_f32(
 //     }
 // }
 
-template <int block_size>
+template <int block_size, bool grid_stride = true>
 static __global__ void l2_norm_f32(
         const float * x, float * dst, const int ncols, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps) {
@@ -326,29 +326,37 @@ static __global__ void l2_norm_f32(
 
     ggml_cuda_pdl_sync();
 
-    // grid.y and grid.z are clamped to the CUDA limit, iterate over the excess channels/samples
+    // one (sample, channel) of this block's row
+    auto row_op = [&](const int sample, const int channel) {
+        const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+        float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+        float tmp = 0.0f; // partial sum for thread in warp
+
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = xc[col];
+            tmp += xi * xi;
+        }
+
+        // sum up partial sums
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        // from https://pytorch.org/docs/stable/generated/torch.nn.functional.normalize.html
+        const float scale = rsqrtf(fmaxf(tmp, eps * eps));
+
+        for (int col = tid; col < ncols; col += block_size) {
+            dstc[col] = scale * xc[col];
+        }
+    };
+
+    // see rms_norm_f32: single pass unless the grid is clamped (#28175)
+    if constexpr (!grid_stride) {
+        row_op(blockIdx.z, blockIdx.y);
+        return;
+    }
     for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
         for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
-            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
-            float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
-
-            float tmp = 0.0f; // partial sum for thread in warp
-
-            for (int col = tid; col < ncols; col += block_size) {
-                const float xi = xc[col];
-                tmp += xi * xi;
-            }
-
-            // sum up partial sums
-            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-            // from https://pytorch.org/docs/stable/generated/torch.nn.functional.normalize.html
-            const float scale = rsqrtf(fmaxf(tmp, eps * eps));
-
-            for (int col = tid; col < ncols; col += block_size) {
-                dstc[col] = scale * xc[col];
-            }
-
+            row_op(sample, channel);
             if constexpr (block_size > WARP_SIZE) {
                 // sync is needed as we reuse s_sum across block_reduce invocations, see #26385
                 __syncthreads();
@@ -505,14 +513,15 @@ static void l2_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+    const bool gs = nchannels > UINT16_MAX || nsamples > UINT16_MAX;   // see rms_norm_f32_cuda
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
-        ggml_cuda_kernel_launch(l2_norm_f32<WARP_SIZE>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps);
+        ggml_cuda_kernel_launch(gs ? l2_norm_f32<WARP_SIZE, true> : l2_norm_f32<WARP_SIZE, false>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-        ggml_cuda_kernel_launch(l2_norm_f32<1024>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps);
+        ggml_cuda_kernel_launch(gs ? l2_norm_f32<1024, true> : l2_norm_f32<1024, false>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps);
     }
 }
 
