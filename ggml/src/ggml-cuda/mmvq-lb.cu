@@ -16,7 +16,8 @@
 // (v1 staged the whole activation per block in shared memory and packed 32-64 rows per block: ~200 blocks for the expert
 // matmuls, 5 serial units per warp, and a block-wide stage + barrier -- slower than the integer path on most shapes.)
 // Accumulation is fp32 throughout; the order differs from the integer path, so results match it to rounding, not bit for bit.
-// GGML_CUDA_MMVQ_LB=0 disables the path; GGML_CUDA_MMVQ_LB_DENSE=0 keeps dense (non-MUL_MAT_ID) matmuls on the integer path.
+// OFF by default (10-08, phases Q3-Q6: every version slower than the integer path in serving); GGML_CUDA_MMVQ_LB=1 enables it,
+// GGML_CUDA_MMVQ_LB_DENSE=0 then keeps dense (non-MUL_MAT_ID) matmuls on the integer path.
 
 #define MMVQ_LB_WPB 4   // warps per block
 #define MMVQ_LB_RPW 2   // rows per warp
@@ -463,10 +464,10 @@ static bool mmvq_lb3_try(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
 bool ggml_cuda_mmvq_lb_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                            const ggml_tensor * ids, ggml_tensor * dst) {
-    // GGML_CUDA_MMVQ_LB=0: everything back to the integer path; GGML_CUDA_MMVQ_LB_DENSE=0: no dense matmuls (v3 is dense-only);
-    // GGML_CUDA_MMVQ_LB_V2=1: also the v2 kernel for the remaining types and the one-token MUL_MAT_ID (off: slower than the
-    // integer path, and the 2-bit expert banks gain no accuracy from an fp32 activation)
-    static const bool enabled  = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB");       return !s || atoi(s) != 0; }();
+    // GGML_CUDA_MMVQ_LB=1 opts in (default OFF: Sakura serving v3c 32.6-33.4 vs integer 33.8-34.3 t/s, phase Q6); the fp32 activation
+    // cuts Sakura's decode KLD 0.001739 -> 0.001219 (v3c dense) -> 0.000556 (+ v2 experts, LB_V2=2) -> 0.000434 (v2 everywhere).
+    // GGML_CUDA_MMVQ_LB_DENSE=0: no dense matmuls (v3 is dense-only); GGML_CUDA_MMVQ_LB_V2: see below.
+    static const bool enabled  = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB");       return  s && atoi(s) != 0; }();
     static const bool dense_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB_DENSE"); return !s || atoi(s) != 0; }();
     // GGML_CUDA_MMVQ_LB_V2: 1 = v2 for dense (types v3 leaves) and one-token MUL_MAT_ID, 2 = MUL_MAT_ID only, 3 = dense only
     static const int  v2_mode  = [] { const char * s = getenv("GGML_CUDA_MMVQ_LB_V2");    return  s ? atoi(s) : 0; }();
