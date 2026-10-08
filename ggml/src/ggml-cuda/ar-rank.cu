@@ -1,5 +1,9 @@
 #include "ar-rank.cuh"
 
+#include <cstdio>
+#include <unistd.h>
+#include <vector>
+
 // p100-series: two-GPU AllReduce launched PER DEVICE, for the meta backend's threaded dispatch (one host thread per device).
 //
 // The threaded path's own AllReduce (peer copy + ADD) needs two host barriers per reduction: the copy may only be enqueued once
@@ -20,18 +24,41 @@ static constexpr int    AR_RANK_MAX_BLOCKS   = 8;
 static constexpr int    AR_RANK_THREADS      = 256;
 static constexpr size_t AR_RANK_STRIDE       = 64; // bytes between arrival ints (one cache line each)
 
+// p100-series AllReduce profiler (GGML_CUDA_AR_PROF=<path prefix>, exp/ar-prof): block 0 / thread 0 of every AllReduce kernel records
+// SM clock64 + %globaltimer at kernel entry, handshake start (own partial written + fenced), handshake end (peer token seen) and
+// kernel end, into a per-rank ring indexed by call token; dumped to <prefix>.<pid>.<n>.csv when the context is freed.
+static constexpr uint32_t AR_PROF_RING = 1u << 16;
+static __device__ __forceinline__ unsigned long long ar_prof_gtime() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+static __device__ __forceinline__ void ar_prof_mark(unsigned long long * prof, const int token, const int k) {
+    unsigned long long * e = prof + (size_t) ((uint32_t) token & (AR_PROF_RING - 1)) * 8;
+    e[k]     = (unsigned long long) clock64();
+    e[4 + k] = ar_prof_gtime();
+}
+struct ar_prof_meta { uint32_t token; uint8_t kind; int32_t n; int32_t nrows; };
+
 struct ggml_cuda_ar_rank_ctx {
     int      devices[2];
     size_t   max_bytes;
     char   * inbox[2];    // device i: AR_RANK_SLOTS * max_bytes, written by the peer
     char   * arrival[2];  // device i: AR_RANK_SLOTS * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE, written by the peer
     uint32_t calls[2];    // per rank; both ranks issue the same sequence of reductions
+    unsigned long long * prof[2] = {nullptr, nullptr};  // GGML_CUDA_AR_PROF: device ring per rank
+    std::vector<ar_prof_meta> prof_meta[2];
 };
 
 static __global__ void ggml_cuda_ar_rank_kernel(float * data, const int n, float * __restrict__ wire_out, const float * __restrict__ wire_in,
-                                                int * signal_out, const int * signal_in, const int token) {
+                                                int * signal_out, const int * signal_in, const int token,
+                                                unsigned long long * prof) {
     const int tid  = threadIdx.x;
     const int bid  = blockIdx.x;
+    const bool pr  = prof != nullptr && bid == 0 && tid == 0;
+    if (pr) {
+        ar_prof_mark(prof, token, 0);
+    }
     const int gtid = bid * blockDim.x + tid;
     const int gnt  = gridDim.x * blockDim.x;
     const int n4   = n / 4;
@@ -55,10 +82,16 @@ static __global__ void ggml_cuda_ar_rank_kernel(float * data, const int n, float
 
     // phase 2: per-block handshake (the peer's block bid reads exactly the stripe our block bid wrote)
     if (tid == 0) {
+        if (pr) {
+            ar_prof_mark(prof, token, 1);
+        }
         *(volatile int *) (signal_out + bid * (AR_RANK_STRIDE / sizeof(int))) = token;
         __threadfence_system();
         const volatile int * in = (const volatile int *) (signal_in + bid * (AR_RANK_STRIDE / sizeof(int)));
         while (*in != token) {
+        }
+        if (pr) {
+            ar_prof_mark(prof, token, 2);
         }
     }
     __syncthreads();
@@ -78,6 +111,12 @@ static __global__ void ggml_cuda_ar_rank_kernel(float * data, const int n, float
     if (bid == 0 && tid < n - 4*n4) {
         data[4*n4 + tid] += __ldcg(wire_in + 4*n4 + tid);
     }
+    if (prof != nullptr) {
+        __syncthreads();
+        if (pr) {
+            ar_prof_mark(prof, token, 3);
+        }
+    }
 }
 
 // AllReduce fused with the RMS norm that opens the next subgraph (exactly rms_norm_f32<BS, true[, true]>'s register path: same
@@ -90,13 +129,18 @@ template <int BS, bool ADD_FIRST, bool ADD_AFTER>
 static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
         float * data, const int ncols, const int nrows, float * __restrict__ wire_out, const float * __restrict__ wire_in,
         int * signal_out, const int * signal_in, const int token,
-        const float * res, float * x_out, const float * w, const float * add2, float * y, const float eps) {
+        const float * res, float * x_out, const float * w, const float * add2, float * y, const float eps,
+        unsigned long long * prof) {
     // no __restrict__ on the fused outputs: the allocator may place an output in an input's buffer (in-place ADD / norm). Every
     // element is read and written by the same thread, y only after the row's reduction, so aliasing is safe.
     constexpr int max_regs = 8;
     __shared__ float s_sum[32];
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
+    const bool pr = prof != nullptr && bid == 0 && tid == 0;
+    if (pr) {
+        ar_prof_mark(prof, token, 0);
+    }
 
     for (int r = bid; r < nrows; r += gridDim.x) {
         for (int col = tid; col < ncols; col += BS) {
@@ -106,10 +150,16 @@ static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
+        if (pr) {
+            ar_prof_mark(prof, token, 1);
+        }
         *(volatile int *) (signal_out + bid * (AR_RANK_STRIDE / sizeof(int))) = token;
         __threadfence_system();
         const volatile int * in = (const volatile int *) (signal_in + bid * (AR_RANK_STRIDE / sizeof(int)));
         while (*in != token) {
+        }
+        if (pr) {
+            ar_prof_mark(prof, token, 2);
         }
     }
     __syncthreads();
@@ -150,6 +200,9 @@ static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
         }
         __syncthreads(); // s_sum reuse by the next row
     }
+    if (pr) {
+        ar_prof_mark(prof, token, 3);
+    }
 }
 
 ggml_cuda_ar_rank_ctx * ggml_cuda_ar_rank_init(int dev0, int dev1, size_t max_bytes) {
@@ -175,6 +228,16 @@ ggml_cuda_ar_rank_ctx * ggml_cuda_ar_rank_init(int dev0, int dev1, size_t max_by
              cudaMemset(c->arrival[i], 0, arrival_bytes) == cudaSuccess &&
              cudaDeviceSynchronize() == cudaSuccess;
     }
+    if (ok && getenv("GGML_CUDA_AR_PROF") != nullptr) {
+        for (int i = 0; i < 2 && ok; ++i) {
+            ggml_cuda_set_device(c->devices[i]);
+            const size_t pb = (size_t) AR_PROF_RING * 8 * sizeof(unsigned long long);
+            ok = cudaMalloc((void **) &c->prof[i], pb) == cudaSuccess && cudaMemset(c->prof[i], 0, pb) == cudaSuccess &&
+                 cudaDeviceSynchronize() == cudaSuccess;
+            c->prof_meta[i].reserve(AR_PROF_RING);
+        }
+        GGML_LOG_INFO("%s: AllReduce profiler on (GGML_CUDA_AR_PROF)\n", __func__);
+    }
     if (!ok) {
         (void) cudaGetLastError();
         ggml_cuda_ar_rank_free(c);
@@ -187,8 +250,38 @@ void ggml_cuda_ar_rank_free(ggml_cuda_ar_rank_ctx * c) {
     if (c == nullptr) {
         return;
     }
+    if (c->prof[0] != nullptr && c->prof[1] != nullptr && !c->prof_meta[0].empty()) {
+        static int seq = 0;
+        const char * pre = getenv("GGML_CUDA_AR_PROF");
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.%d.%d.csv", pre, (int) getpid(), seq++);
+        std::vector<unsigned long long> h[2];
+        for (int i = 0; i < 2; ++i) {
+            ggml_cuda_set_device(c->devices[i]);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            h[i].resize((size_t) AR_PROF_RING * 8);
+            CUDA_CHECK(cudaMemcpy(h[i].data(), c->prof[i], h[i].size() * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        }
+        FILE * f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "rank,token,kind,n,nrows,c0,c1,c2,c3,g0,g1,g2,g3\n");
+            for (int i = 0; i < 2; ++i) {
+                const size_t nm = c->prof_meta[i].size();
+                const size_t first = nm > AR_PROF_RING ? nm - AR_PROF_RING : 0;
+                for (size_t j = first; j < nm; ++j) {
+                    const ar_prof_meta & m = c->prof_meta[i][j];
+                    const unsigned long long * e = h[i].data() + (size_t) (m.token & (AR_PROF_RING - 1)) * 8;
+                    fprintf(f, "%d,%u,%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n", i, m.token, (int) m.kind, m.n, m.nrows,
+                            e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7]);
+                }
+            }
+            fclose(f);
+            GGML_LOG_INFO("%s: AllReduce profile -> %s\n", __func__, path);
+        }
+    }
     for (int i = 0; i < 2; ++i) {
         ggml_cuda_set_device(c->devices[i]);
+        if (c->prof[i])    { CUDA_CHECK(cudaFree(c->prof[i])); }
         if (c->inbox[i])   { CUDA_CHECK(cudaFree(c->inbox[i])); }
         if (c->arrival[i]) { CUDA_CHECK(cudaFree(c->arrival[i])); }
     }
@@ -212,7 +305,11 @@ void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t 
     int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
     int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
 
-    ggml_cuda_ar_rank_kernel<<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, wire_out, wire_in, signal_out, signal_in, (int) token);
+    if (c->prof[rank] != nullptr) {
+        c->prof_meta[rank].push_back({token, 0, n, 1});
+    }
+    ggml_cuda_ar_rank_kernel<<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, wire_out, wire_in, signal_out, signal_in, (int) token,
+                                                                  c->prof[rank]);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -239,9 +336,12 @@ void ggml_cuda_ar_rank_reduce_norm(ggml_cuda_ar_rank_ctx * c, int rank, cudaStre
     int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
 
 #define AR_NORM_LAUNCH(BS, AF, AA) ggml_cuda_ar_rank_norm_kernel<BS, AF, AA><<<nb, BS, 0, stream>>>((float *) t->data, ncols, nrows, \
-        wire_out, wire_in, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps)
+        wire_out, wire_in, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps, c->prof[rank])
     const bool af = a.res != nullptr;
     const bool aa = a.add2 != nullptr;
+    if (c->prof[rank] != nullptr) {
+        c->prof_meta[rank].push_back({token, (uint8_t) (1 + (af ? 1 : 0) + (aa ? 2 : 0)), ncols, nrows});
+    }
     if (ncols < 1024) {
         if (af) { if (aa) AR_NORM_LAUNCH(256, true, true); else AR_NORM_LAUNCH(256, true, false); }
         else    { if (aa) AR_NORM_LAUNCH(256, false, true); else AR_NORM_LAUNCH(256, false, false); }
