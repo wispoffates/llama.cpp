@@ -81,7 +81,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false>
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool grid_stride = true>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -126,88 +126,99 @@ static __global__ void rms_norm_f32(const float * x,
 
     ggml_cuda_pdl_sync();
 
-    // grid.y and grid.z are clamped to the CUDA limit, iterate over the excess channels/samples
+    // one (sample, channel) of this block's row
+    auto row_op = [&](const int sample, const int channel) {
+        const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+        float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+        [[maybe_unused]] const float * mulc = nullptr;
+        if constexpr (do_multiply) {
+            const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+            const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+            const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+            mulc = mul + mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+        }
+
+        [[maybe_unused]] const float * addc = nullptr;
+        if constexpr (do_add) {
+            const int add_row     = fastmodulo(row, add_nrows_packed);
+            const int add_channel = fastmodulo(channel, add_nchannels_packed);
+            const int add_sample  = fastmodulo(sample, add_nsamples_packed);
+            addc = add + add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+        }
+
+        if (ncols <= block_size*max_regs) {
+            float xv[max_regs];
+            float tmp = 0.0f;
+#pragma unroll
+            for (int u = 0; u < max_regs; ++u) {
+                const int col = tid + u*block_size;
+                xv[u] = col < ncols ? xc[col] : 0.0f;
+                tmp += xv[u] * xv[u];
+            }
+
+            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+            const float mean  = tmp / ncols;
+            const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+            for (int u = 0; u < max_regs; ++u) {
+                const int col = tid + u*block_size;
+                if (col < ncols) {
+                    if constexpr (do_multiply && do_add) {
+                        dstc[col] = scale * xv[u] * mulc[fastmodulo(col, mul_ncols_packed)] + addc[fastmodulo(col, add_ncols_packed)];
+                    } else if constexpr (do_multiply) {
+                        dstc[col] = scale * xv[u] * mulc[fastmodulo(col, mul_ncols_packed)];
+                    } else if constexpr (do_scale) {
+                        dstc[col] = scale_out * (scale * xv[u]);
+                    } else {
+                        dstc[col] = scale * xv[u];
+                    }
+                }
+            }
+        } else {
+            float tmp = 0.0f; // partial sum for thread in warp
+
+            for (int col = tid; col < ncols; col += block_size) {
+                const float xi = xc[col];
+                tmp += xi * xi;
+            }
+
+            // sum up partial sums
+            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+            const float mean = tmp / ncols;
+            const float scale = rsqrtf(mean + eps);
+
+            for (int col = tid; col < ncols; col += block_size) {
+                if constexpr (do_multiply && do_add) {
+                    const int mul_col = fastmodulo(col, mul_ncols_packed);
+                    const int add_col = fastmodulo(col, add_ncols_packed);
+                    dstc[col]         = scale * xc[col] * mulc[mul_col] + addc[add_col];
+                } else if constexpr (do_multiply) {
+                    const int mul_col = fastmodulo(col, mul_ncols_packed);
+                    dstc[col]         = scale * xc[col] * mulc[mul_col];
+                } else if constexpr (do_scale) {
+                    dstc[col] = scale_out * (scale * xc[col]);
+                } else {
+                    dstc[col] = scale * xc[col];
+                }
+            }
+        }
+    };
+
+    // grid.y and grid.z are clamped to the CUDA limit (#28175). p100-series: the launcher picks grid_stride = false whenever the
+    // grid covers every channel and sample (all but huge tensors); that instance runs the row once, without the grid-stride loop
+    // and its trailing barrier, at v5.11's register count -- the loop form cost ~1 us per call on Pascal and gemma4 decode 2.5 %
+    // after a prefill (phases R12C-R12G). Larger tensors iterate as upstream does.
+    if constexpr (!grid_stride) {
+        row_op(blockIdx.z, blockIdx.y);
+        return;
+    }
     for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
         for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
-            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
-            float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
-
-            [[maybe_unused]] const float * mulc = nullptr;
-            if constexpr (do_multiply) {
-                const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
-                const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
-                const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
-                mulc = mul + mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
-            }
-
-            [[maybe_unused]] const float * addc = nullptr;
-            if constexpr (do_add) {
-                const int add_row     = fastmodulo(row, add_nrows_packed);
-                const int add_channel = fastmodulo(channel, add_nchannels_packed);
-                const int add_sample  = fastmodulo(sample, add_nsamples_packed);
-                addc = add + add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
-            }
-
-            if (ncols <= block_size*max_regs) {
-                float xv[max_regs];
-                float tmp = 0.0f;
-#pragma unroll
-                for (int u = 0; u < max_regs; ++u) {
-                    const int col = tid + u*block_size;
-                    xv[u] = col < ncols ? xc[col] : 0.0f;
-                    tmp += xv[u] * xv[u];
-                }
-
-                tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-                const float mean  = tmp / ncols;
-                const float scale = rsqrtf(mean + eps);
-
-#pragma unroll
-                for (int u = 0; u < max_regs; ++u) {
-                    const int col = tid + u*block_size;
-                    if (col < ncols) {
-                        if constexpr (do_multiply && do_add) {
-                            dstc[col] = scale * xv[u] * mulc[fastmodulo(col, mul_ncols_packed)] + addc[fastmodulo(col, add_ncols_packed)];
-                        } else if constexpr (do_multiply) {
-                            dstc[col] = scale * xv[u] * mulc[fastmodulo(col, mul_ncols_packed)];
-                        } else if constexpr (do_scale) {
-                            dstc[col] = scale_out * (scale * xv[u]);
-                        } else {
-                            dstc[col] = scale * xv[u];
-                        }
-                    }
-                }
-            } else {
-                float tmp = 0.0f; // partial sum for thread in warp
-
-                for (int col = tid; col < ncols; col += block_size) {
-                    const float xi = xc[col];
-                    tmp += xi * xi;
-                }
-
-                // sum up partial sums
-                tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
-
-                const float mean = tmp / ncols;
-                const float scale = rsqrtf(mean + eps);
-
-                for (int col = tid; col < ncols; col += block_size) {
-                    if constexpr (do_multiply && do_add) {
-                        const int mul_col = fastmodulo(col, mul_ncols_packed);
-                        const int add_col = fastmodulo(col, add_ncols_packed);
-                        dstc[col]         = scale * xc[col] * mulc[mul_col] + addc[add_col];
-                    } else if constexpr (do_multiply) {
-                        const int mul_col = fastmodulo(col, mul_ncols_packed);
-                        dstc[col]         = scale * xc[col] * mulc[mul_col];
-                    } else if constexpr (do_scale) {
-                        dstc[col] = scale_out * (scale * xc[col]);
-                    } else {
-                        dstc[col] = scale * xc[col];
-                    }
-                }
-            }
-
+            row_op(sample, channel);
             if constexpr (block_size > WARP_SIZE) {
                 // sync is needed as we reuse s_sum across block_reduce invocations, see #26385
                 __syncthreads();
@@ -376,10 +387,11 @@ static void rms_norm_f32_cuda(
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream,
         const float scale_out = 1.0f) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+    const bool gs = nchannels > UINT16_MAX || nsamples > UINT16_MAX;   // grid-stride instance only when the grid is clamped
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-        ggml_cuda_kernel_launch(rms_norm_f32<256, false, false, do_scale>, launch_params,
+        ggml_cuda_kernel_launch(gs ? rms_norm_f32<256, false, false, do_scale, true> : rms_norm_f32<256, false, false, do_scale, false>, launch_params,
             x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
         // underlying cudaLaunchKernelEx does not support default params
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
@@ -387,7 +399,7 @@ static void rms_norm_f32_cuda(
     } else {
         const dim3 block_dims(1024, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-        ggml_cuda_kernel_launch(rms_norm_f32<1024, false, false, do_scale>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
+        ggml_cuda_kernel_launch(gs ? rms_norm_f32<1024, false, false, do_scale, true> : rms_norm_f32<1024, false, false, do_scale, false>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
         // underlying cudaLaunchKernelEx does not support default params
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), scale_out);
@@ -422,6 +434,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float    eps,
                                   cudaStream_t   stream) {
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+    const bool gs = nchannels > UINT16_MAX || nsamples > UINT16_MAX;   // see rms_norm_f32_cuda
     if (mul == nullptr) {
         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
         return;
@@ -434,7 +447,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<256, true>, launch_params,
+            ggml_cuda_kernel_launch(gs ? rms_norm_f32<256, true, false, false, true> : rms_norm_f32<256, true, false, false, false>, launch_params,
                 x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
@@ -442,7 +455,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true>, launch_params,
+            ggml_cuda_kernel_launch(gs ? rms_norm_f32<1024, true, false, false, true> : rms_norm_f32<1024, true, false, false, false>, launch_params,
                 x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
@@ -461,7 +474,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims,block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<256, true, true>, launch_params,
+            ggml_cuda_kernel_launch(gs ? rms_norm_f32<256, true, true, false, true> : rms_norm_f32<256, true, true, false, false>, launch_params,
                 x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
@@ -469,7 +482,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, true>, launch_params,
+            ggml_cuda_kernel_launch(gs ? rms_norm_f32<1024, true, true, false, true> : rms_norm_f32<1024, true, true, false, false>, launch_params,
                 x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
