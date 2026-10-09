@@ -409,6 +409,17 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         }
     };
     using I = std::integral_constant<int, 1>;
+    // One column at >= 3072 rows: one warp of 2 rows per block (as for 256..3071 rows), not 2 warps x 4. Measured IN THE MODEL
+    // (phases MG / MG2 / MG3, p100-series 10-09): Swift tg +2.4-2.6 %, glimmer +3.1 %, ornith +2.1 %, gemma4 / qwen36 / nemotron flat;
+    // the q6_K kernel time per token -4 %. Isolated test-backend-ops runs do not show it (Kmic-68's integer kernel, also 2 rows per
+    // block, wins the same way in the model only). Per-row arithmetic is unchanged: bit-identical. GGML_CUDA_MMVQ_F16_BIG1=0 restores
+    // 2 warps x 4 rows.
+    static const bool big1 = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_BIG1"); return !s || atoi(s) != 0; }();
+    if (rows >= 3072 && ncols == 1 && big1) {
+        launch(std::integral_constant<int, 2>{}, I{}, std::false_type{}, std::integral_constant<int, 16>{});
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     if (rows >= 3072) {
         // 6 or 7 blocks per SM (168 or 128 registers): take 7 when it needs fewer waves over the
         // SMs (3072 rows: 2 -> 1 wave, 49 vs 57 us at 5 columns; 6144: 3 -> 2; 8704: 4 -> 3).
