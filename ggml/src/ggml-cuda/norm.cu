@@ -1116,3 +1116,92 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+// p100-series (after Kmic-68's add_rms_norm_mul_f32): residual ADD -> RMS_NORM -> MUL(w), one block per row. The sum is written out
+// (it is the next residual) and kept in registers for the norm. Every value is computed by exactly the operations of the unfused ADD
+// kernel (a + b) and rms_norm_f32<1024, true>'s register path (same accumulation order, reduction, scale and multiply), so the
+// results are bit-identical; saves the ADD launch and one read of the row. GGML_CUDA_FUSE_ADD_NORM=0 disables.
+template <int block_size>
+static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_f32(const float * a, const float * b, float * sum_out,
+        const float * mul, float * dst, const int ncols, const int64_t sa, const int64_t sb, const int64_t ss, const int64_t sd,
+        const float eps) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    a += row*sa; b += row*sb; sum_out += row*ss; dst += row*sd;
+
+    constexpr int max_regs = 8;
+    __shared__ float s_sum[32];
+
+    float xv[max_regs];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        xv[u] = col < ncols ? a[col] + b[col] : 0.0f;
+        tmp += xv[u] * xv[u];
+    }
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        if (col < ncols) {
+            sum_out[col] = xv[u];
+        }
+    }
+
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        if (col < ncols) {
+            dst[col] = scale * xv[u] * mul[col];
+        }
+    }
+}
+
+// shape / aliasing checks shared by the plain and the h1 variant
+bool ggml_cuda_add_rms_norm_mul_ok(const ggml_tensor * add, const ggml_tensor * rms, const ggml_tensor * mul) {
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const int64_t ncols = add->ne[0], nrows = add->ne[1];
+    auto f32_rows = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[0] == ncols && t->ne[1] == nrows &&
+            t->ne[2] == 1 && t->ne[3] == 1 && t->nb[1] % sizeof(float) == 0;
+    };
+    if (a == nullptr || b == nullptr || w == nullptr || !f32_rows(a) || !f32_rows(b) || !f32_rows(add) || !f32_rows(rms) ||
+            !f32_rows(mul) || w->type != GGML_TYPE_F32 || w->ne[0] != ncols || ggml_nelements(w) != ncols || w->nb[0] != sizeof(float) ||
+            ncols < 1024 || ncols > 1024*8 || nrows > 65535 || rms->src[0] != add) {
+        return false;
+    }
+    // the kernel reads a row of a and b, writes it to add and later the norm to mul: outputs must not overlap other operands,
+    // except exact row-for-row aliases (a thread reads its own columns before the block reduction orders any write of the row)
+    auto range = [](const ggml_tensor * t) { return std::make_pair((const char *) t->data, (const char *) t->data + ggml_nbytes(t)); };
+    auto overlap = [&](const ggml_tensor * x, const ggml_tensor * y) {
+        const auto rx = range(x), ry = range(y);
+        return rx.first < ry.second && ry.first < rx.second;
+    };
+    auto same = [](const ggml_tensor * x, const ggml_tensor * y) { return x->data == y->data && x->nb[1] == y->nb[1]; };
+    return !((overlap(mul, a) && !same(mul, a)) || (overlap(mul, b) && !same(mul, b)) || overlap(mul, add) ||
+             overlap(mul, w) || overlap(add, w) || (overlap(add, a) && !same(add, a)) || (overlap(add, b) && !same(add, b)));
+}
+
+bool ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms, ggml_tensor * mul) {
+    if (!ggml_cuda_add_rms_norm_mul_ok(add, rms, mul)) {
+        return false;
+    }
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const int64_t fs = sizeof(float);
+    add_rms_norm_mul_f32<1024><<<(int) add->ne[1], 1024, 0, ctx.stream()>>>(
+        (const float *) a->data, (const float *) b->data, (float *) add->data, (const float *) w->data, (float *) mul->data,
+        (int) add->ne[0], a->nb[1]/fs, b->nb[1]/fs, add->nb[1]/fs, mul->nb[1]/fs, eps);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
