@@ -409,6 +409,26 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         }
     };
     using I = std::integral_constant<int, 1>;
+    // p100-series experiment (exp/mmvq-geom): GGML_CUDA_MMVQ_F16_GEOM=<n> picks the one-column geometry for >= 3072 rows
+    // (rows per warp x warps per block, min blocks per SM): 1 = 2x2/10, 2 = 2x1/16, 3 = 1x2/16, 4 = 4x1/12, 5 = 2x4/6, 6 = 1x4/8,
+    // 7 = 1x1/32. Kmic-68's integer kernel runs 2 rows per block and is faster in-model at these shapes (phase GG).
+    static const int geom = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_GEOM"); return s ? atoi(s) : 0; }();
+    if (rows >= 3072 && ncols == 1 && geom > 0) {
+        switch (geom) {
+            case 1:  launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 2>{}, std::false_type{}, std::integral_constant<int, 10>{}); break;
+            case 2:  launch(std::integral_constant<int, 2>{}, I{},                              std::false_type{}, std::integral_constant<int, 16>{}); break;
+            case 3:  if (odd) { launch(std::integral_constant<int, 2>{}, I{}, std::false_type{}, std::integral_constant<int, 16>{}); }
+                     else     { launch(I{}, std::integral_constant<int, 2>{}, std::false_type{}, std::integral_constant<int, 16>{}); } break;
+            case 4:  launch(std::integral_constant<int, 4>{}, I{},                              std::false_type{}, std::integral_constant<int, 12>{}); break;
+            case 5:  launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 6>{});  break;
+            case 6:  if (odd) { launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 6>{}); }
+                     else     { launch(I{}, std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 8>{}); } break;
+            default: if (odd) { launch(std::integral_constant<int, 2>{}, I{}, std::false_type{}, std::integral_constant<int, 16>{}); }
+                     else     { launch(I{}, I{}, std::false_type{}, std::integral_constant<int, 32>{}); } break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     if (rows >= 3072) {
         // 6 or 7 blocks per SM (168 or 128 registers): take 7 when it needs fewer waves over the
         // SMs (3072 rows: 2 -> 1 wave, 49 vs 57 us at 5 columns; 6144: 3 -> 2; 8704: 4 -> 3).
