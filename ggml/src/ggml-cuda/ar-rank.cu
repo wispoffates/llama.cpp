@@ -332,11 +332,13 @@ static bool ar_ll_enabled() {
     }();
     return on;
 }
-// largest reduction (elements) taken by the LL path; GGML_CUDA_AR_LL_MAX overrides (capped at the buffer size)
+// largest reduction (elements) taken by the LL path; GGML_CUDA_AR_LL_MAX overrides (capped at the buffer size). Default 8192 =
+// single-token decode (gemma4 2816, qwen36 2048, Swift 5120): the LL words double the bytes on the wire, which loses to the flag
+// path once the payload is bandwidth-bound -- Swift's MTP verify reductions (5120 x 2..5 tokens) served 1-2 % slower at 32K (R14S).
 static int64_t ar_ll_max() {
     static const int64_t m = [] {
         const char * e = getenv("GGML_CUDA_AR_LL_MAX");
-        const int64_t v = e ? (int64_t) atoll(e) : (int64_t) AR_LL_MAX_ELEMS;
+        const int64_t v = e ? (int64_t) atoll(e) : (int64_t) 8192;
         return std::min<int64_t>(v, AR_LL_MAX_ELEMS);
     }();
     return m;
