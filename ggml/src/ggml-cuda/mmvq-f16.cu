@@ -411,7 +411,7 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     using I = std::integral_constant<int, 1>;
     // p100-series experiment (exp/mmvq-geom): GGML_CUDA_MMVQ_F16_GEOM=<n> picks the one-column geometry for >= 3072 rows
     // (rows per warp x warps per block, min blocks per SM): 1 = 2x2/10, 2 = 2x1/16, 3 = 1x2/16, 4 = 4x1/12, 5 = 2x4/6, 6 = 1x4/8,
-    // 7 = 1x1/32. Kmic-68's integer kernel runs 2 rows per block and is faster in-model at these shapes (phase GG).
+    // 7 = 1x1/32, 8 = 2x1/12, 9 = 2x1/20, 10 = 2x2/8, 11 = 4x1/16, 12 = 2x1/24. Kmic-68's integer kernel runs 2 rows per block and is faster in-model at these shapes (phase GG).
     static const int geom = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_GEOM"); return s ? atoi(s) : 0; }();
     if (rows >= 3072 && ncols == 1 && geom > 0) {
         switch (geom) {
@@ -423,8 +423,14 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
             case 5:  launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 6>{});  break;
             case 6:  if (odd) { launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 6>{}); }
                      else     { launch(I{}, std::integral_constant<int, 4>{}, std::false_type{}, std::integral_constant<int, 8>{}); } break;
-            default: if (odd) { launch(std::integral_constant<int, 2>{}, I{}, std::false_type{}, std::integral_constant<int, 16>{}); }
+            case 7:  if (odd) { launch(std::integral_constant<int, 2>{}, I{}, std::false_type{}, std::integral_constant<int, 16>{}); }
                      else     { launch(I{}, I{}, std::false_type{}, std::integral_constant<int, 32>{}); } break;
+            // round 2 around 2 = 2x1/16 (phase MG: +2.4 %): the min-blocks bound sets the register cap
+            case 8:  launch(std::integral_constant<int, 2>{}, I{},                              std::false_type{}, std::integral_constant<int, 12>{}); break;
+            case 9:  launch(std::integral_constant<int, 2>{}, I{},                              std::false_type{}, std::integral_constant<int, 20>{}); break;
+            case 10: launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 2>{}, std::false_type{}, std::integral_constant<int, 8>{});  break;
+            case 11: launch(std::integral_constant<int, 4>{}, I{},                              std::false_type{}, std::integral_constant<int, 16>{}); break;
+            default: launch(std::integral_constant<int, 2>{}, I{},                              std::false_type{}, std::integral_constant<int, 24>{}); break;
         }
         CUDA_CHECK(cudaGetLastError());
         return true;
