@@ -2255,7 +2255,22 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // p100-series agreement gate (LLAMA_SPEC_AGREE=k): an n-gram draft is kept only when the draft model's own guess agrees with
+    // its first k tokens (after exllamav3's hybrid drafting); counters for print_stats
+    uint64_t agree_checked = 0, agree_kept = 0, agree_swapped = 0, agree_nomodel = 0;
 };
+
+static bool spec_type_is_model(common_speculative_type t) {
+    return t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+           t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+           t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+}
+
+static int spec_agree_k() {
+    static const int k = [] { const char * e = getenv("LLAMA_SPEC_AGREE"); return e ? std::max(0, atoi(e)) : 0; }();
+    return k;
+}
 
 static common_ngram_map get_common_ngram_map(
         common_speculative_type type,
@@ -2895,11 +2910,72 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    const int agree_k = spec_agree_k();
+
+    // sequences drafting this round (a sequence that is not drafting may still hold its previous draft in *result)
+    std::vector<bool> started(dparams.size());
+    for (size_t i = 0; i < dparams.size(); ++i) {
+        started[i] = dparams[i].drafting;
+    }
+
+    // n-gram drafts held back while the draft model takes its own guess (agreement gate)
+    std::vector<llama_tokens> gate_ngram;
+    std::vector<common_speculative_impl *> gate_ngram_impl;
+
     for (auto & impl : spec->impls) {
+        // agreement gate: before a draft-model implementation runs, let it also draft for the sequences an n-gram drafter
+        // already served this round, holding the n-gram draft aside to compare afterwards
+        const bool gate_here = agree_k > 0 && spec_type_is_model(impl->type);
+        if (gate_here) {
+            gate_ngram.assign(dparams.size(), llama_tokens());
+            gate_ngram_impl.assign(dparams.size(), nullptr);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                auto & dp = dparams[seq_id];
+                common_speculative_impl * won = spec->impl_last[seq_id];
+                if (!started[seq_id] || dp.drafting || dp.result->empty() || won == nullptr || spec_type_is_model(won->type)) {
+                    continue;
+                }
+                gate_ngram[seq_id].swap(*dp.result);
+                gate_ngram_impl[seq_id] = won;
+                dp.drafting = true;
+            }
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
             impl->n_call_draft++;
+        }
+
+        if (gate_here) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+                if (gate_ngram_impl[seq_id] == nullptr) {
+                    continue;
+                }
+                auto & dp     = dparams[seq_id];
+                auto & guess  = *dp.result;            // the draft model's own draft (may be empty: no confident token)
+                auto & ngram  = gate_ngram[seq_id];
+                const size_t m = std::min({ (size_t) agree_k, guess.size(), ngram.size() });
+                const bool agree = guess.empty() || std::equal(guess.begin(), guess.begin() + m, ngram.begin());
+                spec->agree_checked++;
+                if (guess.empty()) {
+                    spec->agree_nomodel++;
+                }
+                if (agree) {
+                    guess.swap(ngram);                  // keep the long n-gram draft
+                    if (dp.result_q) {
+                        dp.result_q->clear();           // n-gram drafts carry no candidates; drop the draft model's
+                    }
+                    spec->impl_last[seq_id] = gate_ngram_impl[seq_id];
+                    spec->agree_kept++;
+                } else {
+                    spec->impl_last[seq_id] = impl.get(); // verify the draft model's guess instead
+                    impl->n_gen_drafts++;
+                    impl->n_gen_tokens += guess.size();
+                    spec->agree_swapped++;
+                }
+                dp.drafting = false;
+            }
         }
 
         int n_drafting = 0;
@@ -2947,7 +3023,7 @@ void common_speculative_draft(common_speculative * spec) {
             }
         }
 
-        if (n_drafting == 0) {
+        if (n_drafting == 0 && agree_k == 0) {
             break;
         }
     }
@@ -3026,6 +3102,12 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
+    }
+
+    if (spec->agree_checked > 0) {
+        LOG_INF("speculative agreement gate (k = %d): n-gram drafts checked = %llu, kept = %llu, swapped for the draft model = %llu, "
+                "draft model had no guess = %llu\n", spec_agree_k(), (unsigned long long) spec->agree_checked,
+                (unsigned long long) spec->agree_kept, (unsigned long long) spec->agree_swapped, (unsigned long long) spec->agree_nomodel);
     }
 
     for (const auto & impl : spec->impls) {
