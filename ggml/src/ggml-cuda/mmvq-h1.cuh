@@ -37,10 +37,6 @@ int ggml_cuda_layer_tail_try(ggml_backend_cuda_context & ctx, const ggml_cgraph 
 bool ggml_cuda_rms_norm_set_rows_try(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * view,
                                      const ggml_tensor * set_rows);
 
-// router rms_norm -> scale -> mul at nodes[i..i+2] together with a later rms_norm -> mul of the same row (written early, with its
-// h1 prep). Returns the index of that later RMS_NORM (the caller defer-skips it and its MUL) or -1.
-int ggml_cuda_rms_norm_twin_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
-
 // GEGLU at nodes[i] that also fills mul_mat_vec_q's q8_1 activation cache for the MUL_MAT_ID reading it. false = not applied.
 bool ggml_cuda_geglu_q8_1_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 
