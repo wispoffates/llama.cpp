@@ -1,6 +1,8 @@
 #include "mmvq-h1.cuh"
 #include "norm.cuh"
 #include "unary.cuh"
+#include "convert.cuh"
+#include "ggml-impl.h"
 
 #include <unordered_map>
 
@@ -992,6 +994,252 @@ bool ggml_cuda_rms_norm_scale_mul_try(ggml_backend_cuda_context & ctx, const ggm
     memcpy(&eps, rms->op_params, sizeof(float));
     rms_norm_scale_mul<1024><<<1, 1024, 0, ctx.stream()>>>((const float *) x->data, (const float *) w->data, (float *) mul->data,
         (int) K, eps, scale_out);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// ---- gemma4 decode chain fusions (p100-series 2026-10-11, phase GC census: 993 kernels per GPU per token on v5.17) ----
+
+// h1 cache entry for `mul` if an h1-eligible matvec reads it within the next 16 nodes (else nullptr: no prep needed)
+static mmvq_h1_entry * mmvq_h1_entry_for(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i_mul, const ggml_tensor * mul) {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_CUDA_MMVQ_H1");
+        const char * n = getenv("GGML_CUDA_MMVQ_H1_NORM");
+        return (!s || atoi(s) != 0) && (!n || atoi(n) != 0);
+    }();
+    static const bool q8_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_Q8"); return !s || atoi(s) != 0; }();
+    const int64_t K = mul->ne[0];
+    if (!enabled || K % H1_QK != 0 || K < 32*H1_QK) {
+        return nullptr;
+    }
+    for (int j = i_mul + 1; j < cgraph->n_nodes && j < i_mul + 16; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && mmvq_h1_key(t->src[1]) == mul && t->src[0]->ne[0] == K &&
+                (t->src[0]->type == GGML_TYPE_Q4_0 || (t->src[0]->type == GGML_TYPE_Q8_0 && q8_on))) {
+            bool hit;
+            return &mmvq_h1_slot(ctx, mul, mul->data, 1, K, 0, hit);
+        }
+    }
+    return nullptr;
+}
+
+// The end of a gemma4 layer and the start of the next, one row (decode), in ONE launch instead of four:
+//   o2 = rms_norm(x0)*w2 + mlp            (post_ffw_norm_2 + combine;   was rms_norm_f32<1024, mul, add>)
+//   o5 = rms_norm(o2)*w3 + ao             (post_ffw_norm + residual;    was rms_norm_f32<1024, mul, add>)
+//   o6 = o5 * s[0]                        (layer_output_scale;          was k_bin_bcast)
+//   o8 = rms_norm(o6)*w4  (+ h1 prep)     (next layer's attn_norm;      was mmvq_h1_rms_norm_mul)
+// Every value comes from the same expressions in the same order as those kernels (register path, per-thread accumulation over
+// cols tid + u*1024, block_reduce<SUM, 1024>), so all four outputs are bit-identical. All inputs are read into registers before the
+// first block reduction (a barrier), so outputs may alias inputs freely.
+template <bool H1>
+static __global__ void __launch_bounds__(1024) layer_tail_f32(
+        const float * x0, const float * __restrict__ w2, const float * mlp, const float * __restrict__ w3, const float * ao,
+        const float * __restrict__ s, const float * __restrict__ w4, float * o2, float * o5, float * o6, float * o8,
+        __half * __restrict__ XH, float * __restrict__ XS, const int ncols, const float eps0, const float eps3, const float eps7) {
+    constexpr int bs = 1024, R = 8;
+    __shared__ float s_a[32], s_b[32], s_c[32];
+    const int tid = threadIdx.x;
+    float xv[R], mv[R], av[R];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int u = 0; u < R; ++u) {
+        const int col = tid + u*bs;
+        xv[u] = col < ncols ? x0[col] : 0.0f;
+        tmp += xv[u] * xv[u];
+        mv[u] = col < ncols ? mlp[col] : 0.0f;
+        av[u] = col < ncols ? ao[col] : 0.0f;
+    }
+    const float sc = s[0];
+    tmp = block_reduce<block_reduce_method::SUM, bs>(tmp, s_a);
+    const float scale0 = rsqrtf(tmp / ncols + eps0);
+
+    float t2 = 0.0f;
+#pragma unroll
+    for (int u = 0; u < R; ++u) {
+        const int col = tid + u*bs;
+        if (col < ncols) {
+            const float v = scale0 * xv[u] * w2[col] + mv[u];
+            o2[col] = v;
+            xv[u] = v;
+        } else {
+            xv[u] = 0.0f;
+        }
+        t2 += xv[u] * xv[u];
+    }
+    t2 = block_reduce<block_reduce_method::SUM, bs>(t2, s_b);
+    const float scale3 = rsqrtf(t2 / ncols + eps3);
+
+    float t3 = 0.0f;
+#pragma unroll
+    for (int u = 0; u < R; ++u) {
+        const int col = tid + u*bs;
+        if (col < ncols) {
+            const float v = scale3 * xv[u] * w3[col] + av[u];
+            o5[col] = v;
+            const float v6 = v * sc;
+            o6[col] = v6;
+            xv[u] = v6;
+        } else {
+            xv[u] = 0.0f;
+        }
+        t3 += xv[u] * xv[u];
+    }
+    t3 = block_reduce<block_reduce_method::SUM, bs>(t3, s_c);
+    const float scale7 = rsqrtf(t3 / ncols + eps7);
+
+#pragma unroll
+    for (int u = 0; u < R; ++u) {
+        const int col = tid + u*bs;
+        if (col < ncols) {
+            const float v = scale7 * xv[u] * w4[col];
+            o8[col] = v;
+            if constexpr (H1) {   // ncols % 32 == 0: whole warps
+                float m = fabsf(v);
+#pragma unroll
+                for (int o = 16; o >= 1; o >>= 1) {
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+                }
+                const float sm = m > 0.0f ? m : 1.0f;
+                XH[col] = __float2half(v/sm);
+                if ((col & 31) == 0) {
+                    XS[col/32] = sm;
+                }
+            }
+        }
+    }
+}
+
+int ggml_cuda_layer_tail_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    // GGML_CUDA_FUSE_TAIL=0: back to four launches (A/B)
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_FUSE_TAIL"); return !s || atoi(s) != 0; }();
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!on || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || i + 8 >= cgraph->n_nodes) {
+        return 0;
+    }
+    static const ggml_op ops[9] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD,
+                                    GGML_OP_MUL, GGML_OP_RMS_NORM, GGML_OP_MUL };
+    ggml_tensor * n[9];
+    for (int k = 0; k < 9; ++k) {
+        n[k] = cgraph->nodes[i + k];
+        if (n[k]->op != ops[k] || n[k]->type != GGML_TYPE_F32 || !(n[k]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return 0;
+        }
+    }
+    const int64_t K = n[0]->ne[0];
+    auto row = [K](const ggml_tensor * t) {
+        return t && t->type == GGML_TYPE_F32 && t->ne[0] == K && ggml_nrows(t) == 1 && ggml_is_contiguous(t);
+    };
+    // the other operand of a binary node whose one operand is `a`
+    auto other = [](const ggml_tensor * b, const ggml_tensor * a) -> const ggml_tensor * {
+        return b->src[0] == a ? b->src[1] : (b->src[1] == a ? b->src[0] : nullptr);
+    };
+    const ggml_tensor * x0 = n[0]->src[0];
+    const ggml_tensor * w2 = other(n[1], n[0]);
+    const ggml_tensor * ml = other(n[2], n[1]);
+    const ggml_tensor * w3 = other(n[4], n[3]);
+    const ggml_tensor * ao = other(n[5], n[4]);
+    const ggml_tensor * s  = other(n[6], n[5]);
+    const ggml_tensor * w4 = other(n[8], n[7]);
+    if (K < 1024 || K > 1024*8 || !row(x0) || !row(w2) || !row(ml) || !row(w3) || !row(ao) || !row(w4) || !s ||
+            s->type != GGML_TYPE_F32 || ggml_nelements(s) != 1 || n[3]->src[0] != n[2] || n[7]->src[0] != n[6]) {
+        return 0;
+    }
+    for (int k = 0; k < 9; ++k) {
+        if (!row(n[k])) {
+            return 0;
+        }
+    }
+    // the elided intermediates (norm outputs and the products feeding the adds) are never written: nothing else may read them
+    for (int k : { 0, 1, 3, 4, 7 }) {
+        if (ggml_node_get_use_count(cgraph, i + k) != 1 || (n[k]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+    }
+    float e0, e3, e7;
+    memcpy(&e0, n[0]->op_params, sizeof(float));
+    memcpy(&e3, n[3]->op_params, sizeof(float));
+    memcpy(&e7, n[7]->op_params, sizeof(float));
+    mmvq_h1_entry * e = mmvq_h1_entry_for(ctx, cgraph, i + 8, n[8]);
+    cudaStream_t stream = ctx.stream();
+    if (e) {
+        __half * xh = (__half *) e->buf;
+        float  * xs = (float *) ((char *) e->buf + (size_t) K*sizeof(__half));
+        layer_tail_f32<true><<<1, 1024, 0, stream>>>((const float *) x0->data, (const float *) w2->data, (const float *) ml->data,
+            (const float *) w3->data, (const float *) ao->data, (const float *) s->data, (const float *) w4->data,
+            (float *) n[2]->data, (float *) n[5]->data, (float *) n[6]->data, (float *) n[8]->data, xh, xs, (int) K, e0, e3, e7);
+    } else {
+        layer_tail_f32<false><<<1, 1024, 0, stream>>>((const float *) x0->data, (const float *) w2->data, (const float *) ml->data,
+            (const float *) w3->data, (const float *) ao->data, (const float *) s->data, (const float *) w4->data,
+            (float *) n[2]->data, (float *) n[5]->data, (float *) n[6]->data, (float *) n[8]->data, nullptr, nullptr, (int) K, e0, e3, e7);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return 8;
+}
+
+// rms_norm (no weight) of one token's heads written straight into a KV cache row (gemma4 V: rms_norm -> view -> set_rows).
+// Per head the register path of rms_norm_f32<BS> (BS = 256 below 1024 columns, as its launcher picks), then the cast set_rows
+// does: bit-identical cache contents, one launch instead of two.
+template <int BS, typename T>
+static __global__ void __launch_bounds__(BS) rms_norm_set_rows_1tok(const float * __restrict__ x, const int64_t sx1,
+        T * __restrict__ dst, const int64_t * __restrict__ idx, const int64_t dst_s1, const int ncols, const float eps) {
+    constexpr int R = 8;
+    __shared__ float s_sum[32];
+    const int h = blockIdx.x, tid = threadIdx.x;
+    x += h*sx1;
+    T * d = dst + idx[0]*dst_s1 + (int64_t) h*ncols;
+    float xv[R];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int u = 0; u < R; ++u) {
+        const int col = tid + u*BS;
+        xv[u] = col < ncols ? x[col] : 0.0f;
+        tmp += xv[u] * xv[u];
+    }
+    tmp = block_reduce<block_reduce_method::SUM, BS>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+#pragma unroll
+    for (int u = 0; u < R; ++u) {
+        const int col = tid + u*BS;
+        if (col < ncols) {
+            d[col] = ggml_cuda_cast<T>(scale * xv[u]);
+        }
+    }
+}
+
+bool ggml_cuda_rms_norm_set_rows_try(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * view,
+                                     const ggml_tensor * set_rows) {
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * idx = set_rows->src[1];
+    const int64_t ncols = rms->ne[0];
+    if (cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || rms->op != GGML_OP_RMS_NORM || view->op != GGML_OP_VIEW ||
+            set_rows->op != GGML_OP_SET_ROWS || set_rows->src[0] != view || view->src[0] != rms || x->type != GGML_TYPE_F32 ||
+            rms->type != GGML_TYPE_F32 || rms->ne[2] != 1 || rms->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+            !ggml_is_contiguous(rms) || !ggml_is_contiguous(view) || view->ne[0] != rms->ne[0]*rms->ne[1] || view->ne[1] != 1 ||
+            idx->type != GGML_TYPE_I64 || ggml_nelements(idx) != 1 || ncols > 8*1024 || set_rows->ne[0] != view->ne[0] ||
+            (set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_F32) || set_rows->nb[0] != ggml_type_size(set_rows->type)) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const int64_t sx1 = x->nb[1]/sizeof(float);
+    const int64_t ds1 = set_rows->nb[1]/ggml_type_size(set_rows->type);
+    const dim3 grid((unsigned) rms->ne[1]);
+    cudaStream_t stream = ctx.stream();
+    const int64_t * id = (const int64_t *) idx->data;
+    if (set_rows->type == GGML_TYPE_F16) {
+        if (ncols < 1024) {
+            rms_norm_set_rows_1tok<256, half><<<grid, 256, 0, stream>>>((const float *) x->data, sx1, (half *) set_rows->data, id, ds1, (int) ncols, eps);
+        } else {
+            rms_norm_set_rows_1tok<1024, half><<<grid, 1024, 0, stream>>>((const float *) x->data, sx1, (half *) set_rows->data, id, ds1, (int) ncols, eps);
+        }
+    } else {
+        if (ncols < 1024) {
+            rms_norm_set_rows_1tok<256, float><<<grid, 256, 0, stream>>>((const float *) x->data, sx1, (float *) set_rows->data, id, ds1, (int) ncols, eps);
+        } else {
+            rms_norm_set_rows_1tok<1024, float><<<grid, 1024, 0, stream>>>((const float *) x->data, sx1, (float *) set_rows->data, id, ds1, (int) ncols, eps);
+        }
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
