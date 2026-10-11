@@ -4750,16 +4750,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    // p100-series: router norm + the experts' input norm of the same row in one launch (the second is written early)
-    if (node->op == GGML_OP_RMS_NORM && cuda_ctx->n_fuse_skip < 7) {
-        const int j_twin = ggml_cuda_rms_norm_twin_try(*cuda_ctx, cgraph, i);
-        if (j_twin > 0) {
-            cuda_ctx->fuse_skip[cuda_ctx->n_fuse_skip++] = cgraph->nodes[j_twin];
-            cuda_ctx->fuse_skip[cuda_ctx->n_fuse_skip++] = cgraph->nodes[j_twin + 1];
-            return 2;
-        }
-    }
-
     // p100-series: gemma4 layer tail + next attn_norm in one launch
     if (node->op == GGML_OP_RMS_NORM) {
         const int n_tail = ggml_cuda_layer_tail_try(*cuda_ctx, cgraph, i);
