@@ -4716,6 +4716,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // p100-series debug: GGML_CUDA_NODE_DUMP=<first>[,<count>] prints the node order of device 0's graph computes number
+            // first .. first+count-1 (default count 128 ~ one gemma4 decode token under tensor split) to stderr, with fused ranges
+            static const int dump_first = [] { const char * s = getenv("GGML_CUDA_NODE_DUMP"); return s ? atoi(s) : -1; }();
+            static const int dump_count = [] { const char * s = getenv("GGML_CUDA_NODE_DUMP"); const char * c = s ? strchr(s, ',') : nullptr; return c ? atoi(c + 1) : 128; }();
+            static int dump_idx = 0;
+            const bool dump = dump_first >= 0 && cuda_ctx->device == 0 && dump_idx >= dump_first && dump_idx < dump_first + dump_count;
+            if (dump_first >= 0 && cuda_ctx->device == 0) {
+                if (dump) {
+                    fprintf(stderr, "NODEDUMP G%d n=%d\n", dump_idx, cgraph->n_nodes);
+                }
+                dump_idx++;
+            }
+            auto dump_node = [&](int k, const char * tag) {
+                const ggml_tensor * t = cgraph->nodes[k];
+                fprintf(stderr, "NODEDUMP %s %4d %-14s %-28s ne=%lldx%lldx%lld s0=%s:%s s1=%s:%s s2=%s\n", tag, k, ggml_op_desc(t), t->name,
+                        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2],
+                        t->src[0] ? ggml_op_desc(t->src[0]) : "-", t->src[0] ? t->src[0]->name : "-",
+                        t->src[1] ? ggml_op_desc(t->src[1]) : "-", t->src[1] ? t->src[1]->name : "-",
+                        t->src[2] ? t->src[2]->name : "-");
+            };
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4759,6 +4780,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (dump) {
+                    for (int k = i; k <= i + nodes_to_skip; ++k) {
+                        dump_node(k, nodes_to_skip == 0 ? "K " : (k == i ? "F[" : (k == i + nodes_to_skip ? "F]" : "F ")));
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
