@@ -3818,6 +3818,56 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+
+// p100-series: the SET_ROWS (via a flattening VIEW) of nodes[i_src]'s result a few nodes later, when nothing between reads or writes
+// that cache and the source / view have no other users -> a fusion at i_src may write the cache rows itself and defer-skip the
+// SET_ROWS (ctx->fuse_skip). Returns the SET_ROWS index or -1. GGML_CUDA_FUSE_SETROWS_AHEAD=0 disables.
+static int ggml_cuda_find_set_rows_ahead(const ggml_cgraph * cgraph, const int i_src, const int i_from, int * i_view) {
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_FUSE_SETROWS_AHEAD"); return !s || atoi(s) != 0; }();
+    if (!on) {
+        return -1;
+    }
+    const ggml_tensor * src = cgraph->nodes[i_src];
+    if (ggml_node_get_use_count(cgraph, i_src) != 1 || (src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    for (int j = i_from; j < cgraph->n_nodes && j < i_from + 12; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_VIEW && t->src[0] == src) {
+            if (ggml_node_get_use_count(cgraph, j) != 1 || j + 1 >= cgraph->n_nodes) {
+                return -1;
+            }
+            // the SET_ROWS reading this view: the next non-view node that has it as src[0]
+            for (int k = j + 1; k < cgraph->n_nodes && k < j + 6; ++k) {
+                const ggml_tensor * sr = cgraph->nodes[k];
+                if (sr->op == GGML_OP_SET_ROWS && sr->src[0] == t && (sr->flags & GGML_TENSOR_FLAG_COMPUTE) && sr->view_src != nullptr) {
+                    const ggml_tensor * cache = sr->view_src;
+                    // nodes i_src+1 .. k-1 must not read or write the cache (or the set_rows result)
+                    for (int m = i_src + 1; m < k; ++m) {
+                        const ggml_tensor * u = cgraph->nodes[m];
+                        if (u == cache || u->view_src == cache) {
+                            return -1;
+                        }
+                        for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                            const ggml_tensor * v = u->src[q];
+                            if (v && (v == cache || v->view_src == cache || v == sr)) {
+                                return -1;
+                            }
+                        }
+                    }
+                    *i_view = j;
+                    return k;
+                }
+                if (sr->op != GGML_OP_VIEW && sr->op != GGML_OP_RESHAPE && sr->op != GGML_OP_SET_ROWS) {
+                    return -1;
+                }
+            }
+            return -1;
+        }
+    }
+    return -1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -4442,6 +4492,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     node->type == GGML_TYPE_F32 && mul->type == GGML_TYPE_F32 && ggml_are_same_shape(mul, node) &&
                     node->nb[0] == sizeof(float) && mul->nb[0] == sizeof(float) && ids->type == GGML_TYPE_I32 &&
                     ids->ne[0] == node->ne[1] && ids->ne[1] == node->ne[2]) {
+                // ...and when the weighted expert sum follows (one token), the scale goes into that kernel: one launch less
+                // (expert_scale[ids[slot]] per slot, the same single multiply before the router weight -> same bits)
+                static const bool wr_scale = [] { const char * s = getenv("GGML_CUDA_FUSE_MOE_SCALE"); return !s || atoi(s) != 0; }();
+                ggml_cuda_moe_weighted_reduction_match wr;
+                if (wr_scale && node->ne[2] == 1 && node->ne[3] == 1 && i + 5 < cgraph->n_nodes &&
+                        ggml_cuda_match_moe_weighted_reduction(cgraph, i + 5, wr) && wr.experts == mul && wr.expert_scale == nullptr &&
+                        ggml_node_get_use_count(cgraph, i + 4) == 1 && !(mul->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                        (cgraph->nodes[i + 5]->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_is_contiguous(node)) {
+                    const ggml_tensor * wdst = cgraph->nodes[i + 5 + wr.node_count - 1];
+                    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                        const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+                        return a0 < b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b) && b0 < a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+                    };
+                    // dst must not overlap the experts (node); weights / scale / ids are staged in shared memory first (1 token)
+                    if (!overlaps(wdst, node)) {
+                        ggml_cuda_mul_mat_id(*cuda_ctx, node);
+                        ggml_cuda_op_moe_weighted_reduction(*cuda_ctx, node, scale, wr.weights, wr.dst, ids);
+                        return 4 + wr.node_count;
+                    }
+                }
                 ggml_cuda_mul_mat_id(*cuda_ctx, node);
                 ggml_cuda_mmid_slot_scale(*cuda_ctx, node, scale, ids, mul);
                 return 4;
@@ -4621,6 +4691,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_mmvq_h1_add_rms_norm_mul_try(*cuda_ctx, cgraph, i) || ggml_cuda_op_add_rms_norm_mul(*cuda_ctx, node, rms, mul)) {
                 return 2;
             }
+        }
+    }
+
+    // p100-series: gemma4 layer tail + next attn_norm in one launch
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_tail = ggml_cuda_layer_tail_try(*cuda_ctx, cgraph, i);
+        if (n_tail > 0) {
+            return n_tail;
+        }
+    }
+
+    // p100-series: rms_norm -> mul -> rope whose SET_ROWS comes a few nodes later (gemma4 K: V's matvec and norm sit between)
+    if (cuda_ctx->n_fuse_skip < 8 && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {}) &&
+            !ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+        int i_view = -1;
+        const int i_sr = ggml_cuda_find_set_rows_ahead(cgraph, i + 2, i + 3, &i_view);
+        if (i_sr > 0 && ggml_cuda_should_fuse_rope_set_rows(cgraph->nodes[i + 2], cgraph->nodes[i_view], cgraph->nodes[i_sr])) {
+            ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i_sr]);
+            cuda_ctx->fuse_skip[cuda_ctx->n_fuse_skip++] = cgraph->nodes[i_sr];
+            return 2;
+        }
+    }
+
+    // p100-series: plain rms_norm whose SET_ROWS comes a few nodes later (gemma4 V)
+    if (node->op == GGML_OP_RMS_NORM && cuda_ctx->n_fuse_skip < 8 && i + 1 < cgraph->n_nodes &&
+            !(cgraph->nodes[i + 1]->op == GGML_OP_MUL && (cgraph->nodes[i + 1]->src[0] == node || cgraph->nodes[i + 1]->src[1] == node))) {
+        int i_view = -1;
+        const int i_sr = ggml_cuda_find_set_rows_ahead(cgraph, i, i + 1, &i_view);
+        if (i_sr > 0 && ggml_cuda_rms_norm_set_rows_try(*cuda_ctx, node, cgraph->nodes[i_view], cgraph->nodes[i_sr])) {
+            cuda_ctx->fuse_skip[cuda_ctx->n_fuse_skip++] = cgraph->nodes[i_sr];
+            return -1;   // this node alone is done (its rows went to the cache, the view is a no-op)
         }
     }
 
@@ -4806,6 +4907,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         t->src[2] ? t->src[2]->name : "-");
             };
 
+            cuda_ctx->n_fuse_skip = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4848,7 +4950,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                if (cuda_ctx->n_fuse_skip > 0) {
+                    bool done = false;
+                    for (int k = 0; k < cuda_ctx->n_fuse_skip; ++k) {
+                        if (cuda_ctx->fuse_skip[k] == node) {
+                            cuda_ctx->fuse_skip[k] = cuda_ctx->fuse_skip[--cuda_ctx->n_fuse_skip];
+                            done = true;
+                            break;
+                        }
+                    }
+                    if (done) {
+                        if (dump) {
+                            dump_node(i, "S ");
+                        }
+                        continue;
+                    }
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+
+                if (nodes_to_skip < 0) {   // p100-series: the fusion handled node i only (and deferred a later node)
+                    if (dump) {
+                        dump_node(i, "F1");
+                    }
+                    continue;
+                }
 
                 if (dump) {
                     for (int k = i; k <= i + nodes_to_skip; ++k) {
