@@ -28,3 +28,11 @@ bool ggml_cuda_rms_norm_scale_mul_try(ggml_backend_cuda_context & ctx, const ggm
 bool ggml_cuda_mmvq_h1_glu_ok(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu);
 bool ggml_cuda_mmvq_h1_glu_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                const ggml_tensor * gate_w, ggml_glu_op op, ggml_tensor * dst);
+
+// gemma4 layer end + next layer start (RMS_NORM MUL ADD RMS_NORM MUL ADD MUL RMS_NORM MUL at nodes[i..i+8]) in one launch,
+// bit-identical. Returns the number of nodes to skip (8) or 0. GGML_CUDA_FUSE_TAIL=0 disables.
+int ggml_cuda_layer_tail_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
+
+// one-token rms_norm (no weight) -> view -> set_rows into the KV cache in one launch (Pascal). Returns false if it does not apply.
+bool ggml_cuda_rms_norm_set_rows_try(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * view,
+                                     const ggml_tensor * set_rows);
