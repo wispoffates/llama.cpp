@@ -3946,6 +3946,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // p100-series: GEGLU feeding an integer-path MUL_MAT_ID also writes the matvec's q8_1 activation (one launch less)
+    if (node->op == GGML_OP_GLU && ggml_cuda_geglu_q8_1_try(*cuda_ctx, cgraph, i)) {
+        return -1;
+    }
+
+    // p100-series: flash attention feeding an h1 matvec: let the combine kernel write the h1 prep (FA itself runs normally)
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        ggml_cuda_mmvq_h1_fa_wants(*cuda_ctx, cgraph, i);
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
@@ -4761,6 +4771,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_mmvq_h1_add_rms_norm_mul_try(*cuda_ctx, cgraph, i) || ggml_cuda_op_add_rms_norm_mul(*cuda_ctx, node, rms, mul)) {
                 return 2;
             }
+        }
+    }
+
+    // p100-series: router norm + the experts' input norm of the same row in one launch (the second is written early)
+    if (node->op == GGML_OP_RMS_NORM && cuda_ctx->n_fuse_skip < 7) {
+        const int j_twin = ggml_cuda_rms_norm_twin_try(*cuda_ctx, cgraph, i);
+        if (j_twin > 0) {
+            cuda_ctx->fuse_skip[cuda_ctx->n_fuse_skip++] = cgraph->nodes[j_twin];
+            cuda_ctx->fuse_skip[cuda_ctx->n_fuse_skip++] = cgraph->nodes[j_twin + 1];
+            return 2;
         }
     }
 
