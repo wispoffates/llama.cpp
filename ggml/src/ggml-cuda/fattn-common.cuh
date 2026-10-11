@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "mmvq-h1.cuh"
 
 #include <cstdint>
 
@@ -977,6 +978,57 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// p100-series: flash_attn_combine_results for ONE token that also writes the h1 prep of its output (the output projection's fp16
+// activation, mmvq-h1.cu): dst is head-major, each warp writes 32 consecutive values = one h1 block, so the block max is a warp
+// reduction. Same dst values as the plain kernel; the prep is mmvq_h1_prep's arithmetic on them.
+template<int D>
+__launch_bounds__(D, 1)
+static __global__ void flash_attn_combine_results_h1(
+        const float  * __restrict__ VKQ_parts,
+        const float2 * __restrict__ VKQ_meta,
+        float * __restrict__ dst,
+        __half * __restrict__ XH,
+        float * __restrict__ XS,
+        const int parallel_blocks) {
+    const int head = blockIdx.y;
+    const int tid  = threadIdx.x;
+    VKQ_parts += head * parallel_blocks*D;
+    VKQ_meta  += head * parallel_blocks;
+    dst       += head * D;
+
+    extern __shared__ float2 meta[];
+    for (int i = tid; i < 2*parallel_blocks; i += D) {
+        ((float *) meta)[i] = ((const float *)VKQ_meta) [i];
+    }
+    __syncthreads();
+
+    float kqmax = meta[0].x;
+    for (int l = 1; l < parallel_blocks; ++l) {
+        kqmax = max(kqmax, meta[l].x);
+    }
+    float VKQ_numerator   = 0.0f;
+    float VKQ_denominator = 0.0f;
+    for (int l = 0; l < parallel_blocks; ++l) {
+        const float KQ_max_scale = expf(meta[l].x - kqmax);
+        VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
+        VKQ_denominator += KQ_max_scale * meta[l].y;
+    }
+    const float v = VKQ_numerator / VKQ_denominator;
+    dst[tid] = v;
+
+    float m = fabsf(v);
+#pragma unroll
+    for (int o = 16; o >= 1; o >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    }
+    const float s = m > 0.0f ? m : 1.0f;
+    const int c = head*D + tid;
+    XH[c] = __float2half(v/s);
+    if ((c & 31) == 0) {
+        XS[c/32] = s;
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1306,9 +1358,18 @@ void launch_fattn(
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
 
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        __half * h1_xh = nullptr;
+        float  * h1_xs = nullptr;
+        if (ctx.fa_h1_dst == KQV && Q->ne[1] == 1 && Q->ne[3] == 1 && DV % 32 == 0 && ggml_is_contiguous(KQV) &&
+                ggml_cuda_mmvq_h1_reserve(ctx, KQV, KQV->ne[0]*KQV->ne[1], &h1_xh, &h1_xs)) {
+            flash_attn_combine_results_h1<DV><<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>(
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, h1_xh, h1_xs, parallel_blocks);
+        } else {
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        }
     }
+    ctx.fa_h1_dst = nullptr;
     CUDA_CHECK(cudaGetLastError());
 }
