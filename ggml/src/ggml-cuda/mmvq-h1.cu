@@ -1243,3 +1243,254 @@ bool ggml_cuda_rms_norm_set_rows_try(ggml_backend_cuda_context & ctx, const ggml
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// ---- more gemma4 decode merges (2026-10-11, second batch) ----
+
+// (b) the MoE router input (rms_norm -> scale -> mul) and a later rms_norm -> mul of the SAME row (gemma4 pre_ffw_norm_2, the
+// experts' input) share one sum of squares: one launch computes both, plus the h1 prep of the second. Expressions and order are
+// those of rms_norm_scale_mul and mmvq_h1_rms_norm_mul (each norm keeps its own eps), so both outputs are bit-identical.
+template <bool H1>
+static __global__ void __launch_bounds__(1024) rms_norm_twin(const float * x, const float * __restrict__ w_r, float * d_r,
+        const float scale_out, const float eps_r, const float * __restrict__ w_n, float * d_n, __half * __restrict__ XH,
+        float * __restrict__ XS, const int ncols, const float eps_n) {
+    constexpr int bs = 1024, R = 8;
+    __shared__ float s_sum[32];
+    const int tid = threadIdx.x;
+    float xv[R];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int u = 0; u < R; ++u) {
+        const int col = tid + u*bs;
+        xv[u] = col < ncols ? x[col] : 0.0f;
+        tmp += xv[u] * xv[u];
+    }
+    tmp = block_reduce<block_reduce_method::SUM, bs>(tmp, s_sum);
+    const float mean    = tmp / ncols;
+    const float scale_r = rsqrtf(mean + eps_r);
+    const float scale_n = rsqrtf(mean + eps_n);
+#pragma unroll
+    for (int u = 0; u < R; ++u) {
+        const int col = tid + u*bs;
+        if (col < ncols) {
+            const float v = scale_out * (scale_r * xv[u]);
+            d_r[col] = v * w_r[col];
+            const float v2 = scale_n * xv[u] * w_n[col];
+            d_n[col] = v2;
+            if constexpr (H1) {
+                float m = fabsf(v2);
+#pragma unroll
+                for (int o = 16; o >= 1; o >>= 1) {
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+                }
+                const float sm = m > 0.0f ? m : 1.0f;
+                XH[col] = __float2half(v2/sm);
+                if ((col & 31) == 0) {
+                    XS[col/32] = sm;
+                }
+            }
+        }
+    }
+}
+
+static bool h1_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (!a || !b || !a->data || !b->data || !a->buffer || !b->buffer) {
+        return false;
+    }
+    const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+    const size_t na = ggml_backend_buffer_get_alloc_size(a->buffer, a), nb = ggml_backend_buffer_get_alloc_size(b->buffer, b);
+    return a0 < b0 + nb && b0 < a0 + na;
+}
+
+int ggml_cuda_rms_norm_twin_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    // GGML_CUDA_FUSE_NORM_TWIN=0 disables
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_FUSE_NORM_TWIN"); return !s || atoi(s) != 0; }();
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!on || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || i + 2 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * rms = cgraph->nodes[i], * scl = cgraph->nodes[i + 1];
+    ggml_tensor * mul = cgraph->nodes[i + 2];
+    const ggml_tensor * x = rms->src[0];
+    const int64_t K = x->ne[0];
+    if (rms->op != GGML_OP_RMS_NORM || scl->op != GGML_OP_SCALE || mul->op != GGML_OP_MUL || scl->src[0] != rms ||
+            (mul->src[0] != scl && mul->src[1] != scl)) {
+        return -1;
+    }
+    const ggml_tensor * w_r = mul->src[0] == scl ? mul->src[1] : mul->src[0];
+    float scale_out, bias;
+    memcpy(&scale_out, (const float *) scl->op_params + 0, sizeof(float));
+    memcpy(&bias,      (const float *) scl->op_params + 1, sizeof(float));
+    auto row = [K](const ggml_tensor * t) { return t && t->type == GGML_TYPE_F32 && t->ne[0] == K && ggml_nrows(t) == 1 && ggml_is_contiguous(t); };
+    if (!row(x) || !row(w_r) || !row(mul) || bias != 0.0f || K < 1024 || K > 8*1024 || K % 32 != 0) {
+        return -1;
+    }
+    // the twin: RMS_NORM of the same x followed by MUL(w), a few nodes on
+    for (int j = i + 3; j + 1 < cgraph->n_nodes && j < i + 24; ++j) {
+        const ggml_tensor * r2 = cgraph->nodes[j];
+        if (r2->op != GGML_OP_RMS_NORM || r2->src[0] != x) {
+            continue;
+        }
+        ggml_tensor * m2 = cgraph->nodes[j + 1];
+        if (m2->op != GGML_OP_MUL || (m2->src[0] != r2 && m2->src[1] != r2) || !(r2->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                !(m2->flags & GGML_TENSOR_FLAG_COMPUTE) || ggml_node_get_use_count(cgraph, j) != 1 || (r2->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return -1;
+        }
+        const ggml_tensor * w_n = m2->src[0] == r2 ? m2->src[1] : m2->src[0];
+        if (!row(w_n) || !row(m2) || !row(r2)) {
+            return -1;
+        }
+        // m2 is written now instead of at node j+1: its memory must not be read or written by anything in between, nor alias
+        // x or the router output
+        if (h1_ranges_overlap(m2, x) || h1_ranges_overlap(m2, mul)) {
+            return -1;
+        }
+        for (int k = i + 3; k < j; ++k) {
+            const ggml_tensor * t = cgraph->nodes[k];
+            if (h1_ranges_overlap(m2, t)) {
+                return -1;
+            }
+            for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                if (t->src[q] && h1_ranges_overlap(m2, t->src[q])) {
+                    return -1;
+                }
+            }
+        }
+        float eps_r, eps_n;
+        memcpy(&eps_r, rms->op_params, sizeof(float));
+        memcpy(&eps_n, r2->op_params, sizeof(float));
+        mmvq_h1_entry * e = mmvq_h1_entry_for(ctx, cgraph, j + 1, m2);
+        cudaStream_t stream = ctx.stream();
+        if (e) {
+            rms_norm_twin<true><<<1, 1024, 0, stream>>>((const float *) x->data, (const float *) w_r->data, (float *) mul->data,
+                scale_out, eps_r, (const float *) w_n->data, (float *) m2->data, (__half *) e->buf,
+                (float *) ((char *) e->buf + (size_t) K*sizeof(__half)), (int) K, eps_n);
+        } else {
+            rms_norm_twin<false><<<1, 1024, 0, stream>>>((const float *) x->data, (const float *) w_r->data, (float *) mul->data,
+                scale_out, eps_r, (const float *) w_n->data, (float *) m2->data, nullptr, nullptr, (int) K, eps_n);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return j;
+    }
+    return -1;
+}
+
+// (d) GEGLU of one token's expert slots that feed an integer-path MUL_MAT_ID (gemma4 ffn_down_exps, K 320 < the h1 minimum):
+// write the GLU result AND its q8_1 quantization into the mul_mat_vec_q activation cache, so the matvec skips its quantize
+// launch. Values: unary_gated_op_kernel's expression, then quantize_q8_1's exactly (padding columns quantize 0) -> same bits.
+static __global__ void geglu_q8_1(const float * __restrict__ x, const float * __restrict__ g, float * __restrict__ dst,
+                                  block_q8_1 * __restrict__ y, const int ne00, const int64_t ox, const int64_t og, const int ne0p) {
+    const int i0 = blockIdx.x*blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (i0 >= ne0p) {
+        return;   // ne0p % 32 == 0: whole warps
+    }
+    float xi = 0.0f;
+    if (i0 < ne00) {
+        xi = ggml_cuda_cast<float>(ggml_cuda_op_gelu_single(ggml_cuda_cast<float>(x[row*ox + i0])) * ggml_cuda_cast<float>(g[row*og + i0]));
+        dst[(int64_t) row*ne00 + i0] = xi;
+    }
+    const int64_t i_cont = (int64_t) row*ne0p + i0;
+    const int64_t ib  = i_cont / QK8_1;
+    const int64_t iqs = i_cont % QK8_1;
+    float amax = fabsf(xi);
+    float sum = xi;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    y[ib].qs[iqs] = q;
+    if (iqs > 0) {
+        return;
+    }
+    y[ib].ds = make_half2(d, sum);
+}
+
+bool ggml_cuda_geglu_q8_1_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    // GGML_CUDA_FUSE_GLU_Q8=0 disables
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_FUSE_GLU_Q8"); return !s || atoi(s) != 0; }();
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    ggml_tensor * glu = cgraph->nodes[i];
+    if (!on || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+    const ggml_tensor * a = glu->src[0], * b = glu->src[1];
+    if (!a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+            a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) || !ggml_is_contiguous_1(a) || !ggml_is_contiguous_1(b) ||
+            glu->ne[2] != 1 || glu->ne[3] != 1 || a->ne[0] != glu->ne[0] || b->ne[0] != glu->ne[0] || glu->ne[1] > 8 ||
+            a->ne[1] != glu->ne[1] || b->ne[1] != glu->ne[1] || glu->ne[0] % QK8_1 != 0) {
+        return false;
+    }
+    // the consumer: the next computed node, a MUL_MAT_ID on this GLU whose K is below the h1 minimum (-> integer mmvq + q8_1)
+    const ggml_tensor * mm = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + 4; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu) {
+            mm = t;
+            break;
+        }
+        if (!ggml_is_empty(t) && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE) {
+            return false;
+        }
+    }
+    const int64_t K = glu->ne[0];
+    if (!mm || !ggml_is_quantized(mm->src[0]->type) || K >= 32*H1_QK || mm->src[0]->ne[0] != K) {
+        return false;
+    }
+    const int64_t ne0p = GGML_PAD(K, MATRIX_ROW_PADDING);
+    const size_t need = (size_t) glu->ne[1]*ne0p*sizeof(block_q8_1)/QK8_1;
+    const int dev = ggml_cuda_get_device();
+    if (ctx.mmvq_q8_1_cap[dev] < need) {
+        if (ctx.mmvq_q8_1_ptr[dev] != nullptr) {
+            CUDA_CHECK(cudaFree(ctx.mmvq_q8_1_ptr[dev]));
+            ctx.mmvq_q8_1_ptr[dev] = nullptr;
+        }
+        CUDA_CHECK(cudaMalloc(&ctx.mmvq_q8_1_ptr[dev], need + 16));   // + 16: same slack as mul_mat_vec_q's allocation
+        ctx.mmvq_q8_1_cap[dev] = need;
+    }
+    const dim3 grid((unsigned) ((ne0p + 255)/256), (unsigned) glu->ne[1]);
+    geglu_q8_1<<<grid, 256, 0, ctx.stream()>>>((const float *) a->data, (const float *) b->data, (float *) glu->data,
+        (block_q8_1 *) ctx.mmvq_q8_1_ptr[dev], (int) K, (int64_t) (a->nb[1]/sizeof(float)), (int64_t) (b->nb[1]/sizeof(float)), (int) ne0p);
+    CUDA_CHECK(cudaGetLastError());
+    ctx.mmvq_q8_1_src1[dev] = glu;
+    ctx.mmvq_q8_1_data[dev] = glu->data;
+    ctx.mmvq_q8_1_type[dev] = mm->src[0]->type;
+    ctx.mmvq_q8_1_need[dev] = need;
+    return true;
+}
+
+// (e) the attention output -> output projection: flash-attention's combine kernel writes the h1 prep of its result (each warp
+// writes 32 consecutive values = one h1 block). _wants: called at the FLASH_ATTN_EXT node, records the request when an h1 matvec
+// reads the result; _reserve: called by launch_fattn when it actually runs the combine kernel for one token.
+bool ggml_cuda_mmvq_h1_fa_wants(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_FUSE_FA_H1"); return !s || atoi(s) != 0; }();
+    static const bool q8_on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_Q8"); return !s || atoi(s) != 0; }();
+    ctx.fa_h1_dst = nullptr;
+    const ggml_tensor * fa = cgraph->nodes[i];
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!on || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || fa->type != GGML_TYPE_F32 || fa->ne[2] != 1 || fa->ne[3] != 1 ||
+            !ggml_is_contiguous(fa)) {
+        return false;
+    }
+    const int64_t K = fa->ne[0]*fa->ne[1];
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + 5; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_MUL_MAT && mmvq_h1_key(t->src[1]) == fa && t->src[1]->data == fa->data && t->src[1]->ne[0] == K &&
+                ggml_nrows(t->src[1]) == 1 && t->src[0]->ne[0] == K && K % H1_QK == 0 && K >= 32*H1_QK &&
+                (t->src[0]->type == GGML_TYPE_Q4_0 || (t->src[0]->type == GGML_TYPE_Q8_0 && q8_on))) {
+            ctx.fa_h1_dst = fa;
+            return true;
+        }
+        if (t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE && t->op != GGML_OP_CONT) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool ggml_cuda_mmvq_h1_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * key, const int64_t K, __half ** xh, float ** xs) {
+    bool hit;
+    mmvq_h1_entry & e = mmvq_h1_slot(ctx, key, key->data, 1, K, 0, hit);
+    *xh = (__half *) e.buf;
+    *xs = (float *) ((char *) e.buf + (size_t) K*sizeof(__half));
+    return true;
+}
