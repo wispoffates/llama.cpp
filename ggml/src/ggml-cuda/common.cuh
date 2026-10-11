@@ -1489,6 +1489,11 @@ struct ggml_backend_cuda_context {
     void * mmvq_h1_cache  = nullptr;
     void * mmvq_f16_cache = nullptr;
 
+    // p100-series: nodes a fusion already computed out of order (e.g. a SET_ROWS a few nodes after the norm that wrote its rows);
+    // the graph loop skips them. Cleared at the start of every graph evaluation.
+    const ggml_tensor * fuse_skip[8] = { nullptr };
+    int n_fuse_skip = 0;
+
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
