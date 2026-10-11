@@ -4,12 +4,16 @@
 // weights), then views and a left-to-right chain of adds -- so the fused kernel gives the same bits as the fallback path. Which path
 // runs depends on buffer placement (graph_optimize, which adds the alloc deps, never runs under -sm tensor), so this keeps the result
 // independent of it.
-static __device__ __forceinline__ float moe_wr_term(const float e, const float * __restrict__ expert_scale, const float w, const uint64_t row) {
-    return __fmul_rn(expert_scale != nullptr ? __fmul_rn(e, expert_scale[row]) : e, w);
+// p100-series: ids != nullptr -> the scale is per expert (expert_scale[ids[row]], MUL_MAT_ID's per-expert weight scale that
+// mmid_slot_scale applied as a separate launch; same single multiply, so the same bits)
+static __device__ __forceinline__ float moe_wr_term(const float e, const float * __restrict__ expert_scale, const int32_t * __restrict__ ids,
+                                                    const float w, const uint64_t row) {
+    return __fmul_rn(expert_scale != nullptr ? __fmul_rn(e, expert_scale[ids != nullptr ? ids[row] : row]) : e, w);
 }
 
 static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
                                                   const float * __restrict__ expert_scale,
+                                                  const int32_t * __restrict__ ids,
                                                   const float * __restrict__ weights,
                                                   float * __restrict__ dst,
                                                   const int64_t n_embd,
@@ -21,11 +25,11 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
     }
 
     const uint64_t first_row = (uint64_t) token * n_expert_used;
-    float          sum       = moe_wr_term(experts[first_row * n_embd + col], expert_scale, weights[first_row], first_row);
+    float          sum       = moe_wr_term(experts[first_row * n_embd + col], expert_scale, ids, weights[first_row], first_row);
 
     for (int expert = 1; expert < n_expert_used; ++expert) {
         const uint64_t row = first_row + expert;
-        sum = __fadd_rn(sum, moe_wr_term(experts[row * n_embd + col], expert_scale, weights[row], row));
+        sum = __fadd_rn(sum, moe_wr_term(experts[row * n_embd + col], expert_scale, ids, weights[row], row));
     }
     dst[token * n_embd + col] = sum;
 }
@@ -37,6 +41,7 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
 template <bool VEC4, int MAX_E>
 static __global__ void __launch_bounds__(1024) moe_weighted_reduction_f32_1tok(const float * __restrict__ experts,
                                                        const float * expert_scale,
+                                                       const int32_t * ids,
                                                        const float * weights,
                                                        float * dst,
                                                        const int64_t n_embd,
@@ -45,7 +50,7 @@ static __global__ void __launch_bounds__(1024) moe_weighted_reduction_f32_1tok(c
     __shared__ float s_s[MAX_E];
     if (threadIdx.x < n_expert_used) {
         w_s[threadIdx.x] = weights[threadIdx.x];
-        s_s[threadIdx.x] = expert_scale != nullptr ? expert_scale[threadIdx.x] : 1.0f;
+        s_s[threadIdx.x] = expert_scale != nullptr ? expert_scale[ids != nullptr ? ids[threadIdx.x] : threadIdx.x] : 1.0f;
     }
     __syncthreads();
 
@@ -90,6 +95,7 @@ static __global__ void __launch_bounds__(1024) moe_weighted_reduction_f32_1tok(c
 
 static void launch_moe_weighted_reduction(const float * experts,
                                           const float * expert_scale,
+                                          const int32_t * ids,
                                           const float * weights,
                                           float *       dst,
                                           int64_t       n_embd,
@@ -101,26 +107,27 @@ static void launch_moe_weighted_reduction(const float * experts,
         const bool vec4 = n_embd % 4 == 0 && n_embd / 4 <= 1024 && ((uintptr_t) experts % 16) == 0 && ((uintptr_t) dst % 16) == 0;
         if (vec4 && n_expert_used <= 8) {
             const int threads = (int) ((n_embd / 4 + 31) / 32 * 32);
-            moe_weighted_reduction_f32_1tok<true, 8><<<1, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+            moe_weighted_reduction_f32_1tok<true, 8><<<1, threads, 0, stream>>>(experts, expert_scale, ids, weights, dst, n_embd, n_expert_used);
         } else if (vec4 && n_embd / 4 <= 512) {  // 16 float4 per thread: keep the block small enough for the register file
             const int threads = (int) ((n_embd / 4 + 31) / 32 * 32);
-            moe_weighted_reduction_f32_1tok<true, 16><<<1, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+            moe_weighted_reduction_f32_1tok<true, 16><<<1, threads, 0, stream>>>(experts, expert_scale, ids, weights, dst, n_embd, n_expert_used);
         } else {
-            moe_weighted_reduction_f32_1tok<false, 16><<<1, 1024, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+            moe_weighted_reduction_f32_1tok<false, 16><<<1, 1024, 0, stream>>>(experts, expert_scale, ids, weights, dst, n_embd, n_expert_used);
         }
         return;
     }
     constexpr int threads = 256;
     const dim3 blocks(n_tokens, (n_embd + threads - 1) / threads, 1);
     moe_weighted_reduction_f32
-        <<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+        <<<blocks, threads, 0, stream>>>(experts, expert_scale, ids, weights, dst, n_embd, n_expert_used);
 }
 
 void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                          const ggml_tensor *         experts,
                                          const ggml_tensor *         expert_scale,
                                          const ggml_tensor *         weights,
-                                         ggml_tensor *               dst) {
+                                         ggml_tensor *               dst,
+                                         const ggml_tensor *         ids) {
     GGML_ASSERT(experts->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
@@ -137,6 +144,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
 
     launch_moe_weighted_reduction((const float *) experts->data,
                                   expert_scale ? (const float *) expert_scale->data : nullptr,
+                                  ids ? (const int32_t *) ids->data : nullptr,
                                   (const float *) weights->data,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
