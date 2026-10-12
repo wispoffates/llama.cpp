@@ -1391,7 +1391,7 @@ static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
     // weights first: the slot's expert rows r0 .. r0+RB-1 are one contiguous run. All of a thread's 16-byte loads are ISSUED
     // before any is stored (registers), and the activation is built while they are in flight: one load at a time held ~4 KB in flight
     // per SM, i.e. ~200 GB/s -- exactly what the first version measured (20.4 us, same as the integer path).
-    constexpr int MAXU = 14;   // uint4 per thread per pass (K 384 at RB 128 needs 13.5)
+    constexpr int MAXU = (14*128)/RB < 28 ? (14*128)/RB : 28;   // uint4 per thread per pass (K 384 at RB 128 needs 13.5)
     const int nrows = min(RB, M - r0);
     const uint8_t * wb = W + (int64_t) ids[slot]*nb2 + (int64_t) r0*row_bytes;
     const int nbytes = nrows*row_bytes;
@@ -1409,30 +1409,44 @@ static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
         }
     }
 
-    // activation -> fp16 blocks: warp w takes 32-value blocks w, w + RB/32, ...
-    for (int b = wid; b < nb; b += RB/32) {
-        const int i = b*H1_QK + lane;
-        float a;
-        if constexpr (GLU == 1) {
-            a = ggml_cuda_op_gelu_single(X[slot*sx + i]) * U[slot*su + i];
-        } else if constexpr (GLU == 2) {
-            a = ggml_cuda_op_silu_single(X[slot*sx + i]) * U[slot*su + i];
-        } else {
-            a = X[slot*sx + i];
-        }
-        float m = fabsf(a);
+    // activation -> fp16 blocks. Thread t owns elements t + RB*k: ALL its loads are issued first (one memory latency, not one per 32-value
+    // block), and since RB is a multiple of 32 each warp's 32 elements of one k are one h1 block (warp max = the block scale).
+    constexpr int MAXK = 512/RB;
+    float a[MAXK], g[MAXK];
 #pragma unroll
-        for (int o = 16; o >= 1; o >>= 1) {
-            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-        }
-        const float s = m > 0.0f ? m : 1.0f;
-        xh[i] = __float2half(a/s);
-        if (lane == 0) {
-            xs[b] = s;
+    for (int k = 0; k < MAXK; ++k) {
+        const int i = tid + RB*k;
+        if (i < K) {
+            a[k] = X[slot*sx + i];
+            if constexpr (GLU != 0) {
+                g[k] = U[slot*su + i];
+            }
         }
     }
-
-
+#pragma unroll
+    for (int k = 0; k < MAXK; ++k) {
+        const int i = tid + RB*k;
+        if (i < K) {   // K % 32 == 0: whole warps
+            float x;
+            if constexpr (GLU == 1) {
+                x = ggml_cuda_op_gelu_single(a[k]) * g[k];
+            } else if constexpr (GLU == 2) {
+                x = ggml_cuda_op_silu_single(a[k]) * g[k];
+            } else {
+                x = a[k];
+            }
+            float m = fabsf(x);
+#pragma unroll
+            for (int o = 16; o >= 1; o >>= 1) {
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            }
+            const float sc = m > 0.0f ? m : 1.0f;
+            xh[i] = __float2half(x/sc);
+            if (lane == 0) {
+                xs[i/H1_QK] = sc;
+            }
+        }
+    }
     if (vec) {
         uint4 * d = (uint4 *) ws;
 #pragma unroll
@@ -1548,7 +1562,8 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         GGML_ASSERT(!deferred && "h1s: a GLU was deferred to a matvec that does not take it");
         return false;
     }
-    static const int rb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_RB"); return s && atoi(s) == 64 ? 64 : 128; }();
+    // rows per block (= threads): 64 default -- 12 KB of shared memory, so ~5 blocks per SM hide each other's phases (128: 2 per SM)
+    static const int rb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_RB"); const int v = s ? atoi(s) : 64; return v == 32 || v == 128 ? v : 64; }();
     const int64_t K = src0->ne[0], M = src0->ne[1];
     const int row_bytes = (int) ((K/H1_QK)*18);
     const int64_t n_used = ids->ne[0];
@@ -1580,10 +1595,12 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
             default: go(rb_tag, std::integral_constant<int, 0>{}); break;
         }
     };
-    if (rb == 64) {
-        by_glu(std::integral_constant<int, 64>{});
-    } else {
+    if (rb == 32) {
+        by_glu(std::integral_constant<int, 32>{});
+    } else if (rb == 128) {
         by_glu(std::integral_constant<int, 128>{});
+    } else {
+        by_glu(std::integral_constant<int, 64>{});
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
