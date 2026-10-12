@@ -43,3 +43,9 @@ bool ggml_cuda_geglu_q8_1_try(ggml_backend_cuda_context & ctx, const ggml_cgraph
 // flash attention -> h1 matvec: _wants records ctx.fa_h1_dst at the FA node; launch_fattn's combine calls _reserve and writes it.
 bool ggml_cuda_mmvq_h1_fa_wants(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 bool ggml_cuda_mmvq_h1_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * key, int64_t K, __half ** xh, float ** xs);
+
+// fp16 one-token MUL_MAT_ID for short K (q4_0, K 64..512, one thread per row; gemma4 ffn_down_exps under -sm tensor). _try runs it
+// (returns false if the shape is not handled); _glu_defer at a GLU node whose only reader it is skips the GLU launch (ctx.h1s_glu).
+bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                            const ggml_tensor * ids, ggml_tensor * dst);
+bool ggml_cuda_mmvq_h1s_glu_defer(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

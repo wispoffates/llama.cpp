@@ -1490,6 +1490,9 @@ struct ggml_backend_cuda_context {
     // p100-series: the FLASH_ATTN_EXT node whose combine kernel should also write the h1 prep (mmvq-h1.cu, launch_fattn)
     const ggml_tensor * fa_h1_dst = nullptr;
 
+    // p100-series: GLU node whose launch was skipped because the h1s matvec reading it computes it (mmvq-h1.cu)
+    const ggml_tensor * h1s_glu = nullptr;
+
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
