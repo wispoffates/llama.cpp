@@ -1730,6 +1730,12 @@ void ggml_cuda_mul_mat_vec_q(
     cudaStream_t stream = ctx.stream();
 
     if (ids) {
+        // Pascal: fp16 one-thread-per-row path for short-K expert banks (mmvq-h1.cu h1s); must come first -- it may own a
+        // deferred GLU (ctx.h1s_glu) that no other path computes
+        GGML_ASSERT(!(fusion && ctx.h1s_glu == src1) && "h1s: deferred GLU reached a fused matvec");
+        if (!fusion && ggml_cuda_mmvq_h1s_try(ctx, src0, src1, ids, dst)) {
+            return;
+        }
         if (ggml_cuda_hybrid_mmvq_id_enabled() &&
                 ggml_cuda_gp100_mmvq_id_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion)) {
             ggml_cuda_gp100_mmvq_id(ctx, src0, src1, ids, dst, fusion);
