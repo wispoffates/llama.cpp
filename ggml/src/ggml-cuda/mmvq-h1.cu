@@ -1388,38 +1388,62 @@ static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
     const int slot = blockIdx.y;
     const int r0 = blockIdx.x * RB;
 
+    // weights first: the slot's expert rows r0 .. r0+RB-1 are one contiguous run. All of a thread's 16-byte loads are ISSUED
+    // before any is stored (registers), and the activation is built while they are in flight: one load at a time held ~4 KB in flight
+    // per SM, i.e. ~200 GB/s -- exactly what the first version measured (20.4 us, same as the integer path).
+    constexpr int MAXU = 14;   // uint4 per thread per pass (K 384 at RB 128 needs 13.5)
+    const int nrows = min(RB, M - r0);
+    const uint8_t * wb = W + (int64_t) ids[slot]*nb2 + (int64_t) r0*row_bytes;
+    const int nbytes = nrows*row_bytes;
+    const bool vec = ((uintptr_t) wb & 15) == 0 && (nbytes & 15) == 0;
+    const int n16 = nbytes/16;
+    uint4 v[MAXU];
+    if (vec) {
+        const uint4 * src = (const uint4 *) wb;
+#pragma unroll
+        for (int u = 0; u < MAXU; ++u) {
+            const int j = tid + u*RB;
+            if (j < n16) {
+                v[u] = __ldg(src + j);
+            }
+        }
+    }
+
     // activation -> fp16 blocks: warp w takes 32-value blocks w, w + RB/32, ...
     for (int b = wid; b < nb; b += RB/32) {
         const int i = b*H1_QK + lane;
-        float v;
+        float a;
         if constexpr (GLU == 1) {
-            v = ggml_cuda_op_gelu_single(X[slot*sx + i]) * U[slot*su + i];
+            a = ggml_cuda_op_gelu_single(X[slot*sx + i]) * U[slot*su + i];
         } else if constexpr (GLU == 2) {
-            v = ggml_cuda_op_silu_single(X[slot*sx + i]) * U[slot*su + i];
+            a = ggml_cuda_op_silu_single(X[slot*sx + i]) * U[slot*su + i];
         } else {
-            v = X[slot*sx + i];
+            a = X[slot*sx + i];
         }
-        float m = fabsf(v);
+        float m = fabsf(a);
 #pragma unroll
         for (int o = 16; o >= 1; o >>= 1) {
             m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
         }
         const float s = m > 0.0f ? m : 1.0f;
-        xh[i] = __float2half(v/s);
+        xh[i] = __float2half(a/s);
         if (lane == 0) {
             xs[b] = s;
         }
     }
 
-    // weights: the slot's expert rows r0 .. r0+RB-1 are one contiguous run
-    const int nrows = min(RB, M - r0);
-    const uint8_t * wb = W + (int64_t) ids[slot]*nb2 + (int64_t) r0*row_bytes;
-    const int nbytes = nrows*row_bytes;
-    if (((uintptr_t) wb & 15) == 0 && (nbytes & 15) == 0) {
-        const uint4 * src = (const uint4 *) wb;
+
+    if (vec) {
         uint4 * d = (uint4 *) ws;
-        for (int j = tid; j < nbytes/16; j += RB) {
-            d[j] = __ldg(src + j);
+#pragma unroll
+        for (int u = 0; u < MAXU; ++u) {
+            const int j = tid + u*RB;
+            if (j < n16) {
+                d[j] = v[u];
+            }
+        }
+        for (int j = tid + MAXU*RB; j < n16; j += RB) {   // K > 384: the rest (not unrolled)
+            d[j] = __ldg((const uint4 *) wb + j);
         }
     } else {
         const uint16_t * src = (const uint16_t *) wb;   // rows are 2-byte aligned (q4_0 blocks are 18 bytes)
