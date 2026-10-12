@@ -1366,3 +1366,201 @@ bool ggml_cuda_mmvq_h1_reserve(ggml_backend_cuda_context & ctx, const ggml_tenso
     *xs = (float *) ((char *) e.buf + (size_t) K*sizeof(__half));
     return true;
 }
+
+// ---- h1s: fp16 one-token MUL_MAT_ID for SHORT K (2026-10-12, optimization item #2) ----
+// gemma4's ffn_down_exps is split by K under -sm tensor (320 / 384 per GPU = 10 / 12 q4_0 blocks per row), below the 32 blocks
+// the h1 layout needs, so it ran on the integer path (quantize_q8_1 + mul_mat_vec_q short-K, ~215 GB/s). Here ONE THREAD OWNS ONE
+// ROW: a block stages RB consecutive rows of the slot's expert (contiguous bytes, 16-byte coalesced loads) in shared memory, builds
+// the fp16 activation in shared memory (per 32-value block x / max|x|, h1's numerics), and each thread runs h1's HFMA2 chain over
+// its row. Optional GLU mode computes op(gate) * up on the fly from the two GLU operands, so the GLU node needs no launch.
+// GGML_CUDA_MMVQ_H1S=0 disables, GGML_CUDA_MMVQ_H1S_GLU=0 keeps the GLU launch, GGML_CUDA_MMVQ_H1S_RB=64|128 rows per block.
+template <int RB, int GLU>   // GLU: 0 = plain fp32 activation, 1 = GEGLU(gate, up), 2 = SWIGLU(gate, up)
+static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
+        const uint8_t * __restrict__ W, const int row_bytes, const int64_t nb2, const int32_t * __restrict__ ids,
+        const float * __restrict__ X, const int64_t sx, const float * __restrict__ U, const int64_t su,
+        float * __restrict__ dst, const int64_t sy, const int M, const int K) {
+    extern __shared__ __align__(16) uint8_t h1s_smem[];
+    const int nb = K / H1_QK;
+    float  * xs = (float *) h1s_smem;                         // nb scales (<= 16)
+    __half * xh = (__half *) (h1s_smem + 64);                  // K halfs (<= 512)
+    uint8_t * ws = h1s_smem + 64 + 1024;                       // RB rows of weights
+    const int tid = threadIdx.x, lane = tid % 32, wid = tid / 32;
+    const int slot = blockIdx.y;
+    const int r0 = blockIdx.x * RB;
+
+    // activation -> fp16 blocks: warp w takes 32-value blocks w, w + RB/32, ...
+    for (int b = wid; b < nb; b += RB/32) {
+        const int i = b*H1_QK + lane;
+        float v;
+        if constexpr (GLU == 1) {
+            v = ggml_cuda_op_gelu_single(X[slot*sx + i]) * U[slot*su + i];
+        } else if constexpr (GLU == 2) {
+            v = ggml_cuda_op_silu_single(X[slot*sx + i]) * U[slot*su + i];
+        } else {
+            v = X[slot*sx + i];
+        }
+        float m = fabsf(v);
+#pragma unroll
+        for (int o = 16; o >= 1; o >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        }
+        const float s = m > 0.0f ? m : 1.0f;
+        xh[i] = __float2half(v/s);
+        if (lane == 0) {
+            xs[b] = s;
+        }
+    }
+
+    // weights: the slot's expert rows r0 .. r0+RB-1 are one contiguous run
+    const int nrows = min(RB, M - r0);
+    const uint8_t * wb = W + (int64_t) ids[slot]*nb2 + (int64_t) r0*row_bytes;
+    const int nbytes = nrows*row_bytes;
+    if (((uintptr_t) wb & 15) == 0 && (nbytes & 15) == 0) {
+        const uint4 * src = (const uint4 *) wb;
+        uint4 * d = (uint4 *) ws;
+        for (int j = tid; j < nbytes/16; j += RB) {
+            d[j] = __ldg(src + j);
+        }
+    } else {
+        const uint16_t * src = (const uint16_t *) wb;   // rows are 2-byte aligned (q4_0 blocks are 18 bytes)
+        uint16_t * d = (uint16_t *) ws;
+        for (int j = tid; j < nbytes/2; j += RB) {
+            d[j] = src[j];
+        }
+    }
+    __syncthreads();
+
+    if (tid >= nrows) {
+        return;
+    }
+    const uint8_t * wr = ws + tid*row_bytes;
+    const half2 * xh2 = (const half2 *) xh;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const uint16_t * blk = (const uint16_t *) (wr + b*18);
+        const float d = __half2float(__ushort_as_half(blk[0]));
+        half2 h = __float2half2_rn(0.0f);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t q = (uint32_t) blk[1 + 2*i] | ((uint32_t) blk[2 + 2*i] << 16);
+            half2 a, c;
+            mmvq_h1_nib(q & 0x0f0f0f0fu, a, c);
+            h = __hfma2(a, xh2[b*16 + 2*i], h);
+            h = __hfma2(c, xh2[b*16 + 2*i + 1], h);
+            mmvq_h1_nib((q >> 4) & 0x0f0f0f0fu, a, c);
+            h = __hfma2(a, xh2[b*16 + 8 + 2*i], h);
+            h = __hfma2(c, xh2[b*16 + 8 + 2*i + 1], h);
+        }
+        const float2 f = __half22float2(h);
+        acc += xs[b]*(d*(f.x + f.y));
+    }
+    dst[slot*sy + r0 + tid] = acc;
+}
+
+static bool mmvq_h1s_on() {
+    static const bool on = [] {
+        const char * s = getenv("GGML_CUDA_MMVQ_H1S");
+        const char * h = getenv("GGML_CUDA_MMVQ_H1");
+        return (!s || atoi(s) != 0) && (!h || atoi(h) != 0);
+    }();
+    return on;
+}
+
+// shape check shared by the matvec and the GLU deferral (they must agree: a deferred GLU is only computed inside the matvec)
+static bool mmvq_h1s_ok(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst) {
+    if (!mmvq_h1s_on() || !ids) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int64_t K = src0->ne[0], M = src0->ne[1];
+    const int64_t row_bytes = (K/H1_QK)*18;
+    const int64_t n_used = ids->ne[0];
+    return cc < GGML_CUDA_CC_VOLTA && !GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_Q4_0 && K % H1_QK == 0 && K >= 64 &&
+           K <= 512 && src0->nb[0] == 18 && src0->nb[1] == (size_t) row_bytes && src0->ne[3] == 1 && ((uintptr_t) src0->data % 2) == 0 &&
+           src0->nb[2] == (size_t) (M*row_bytes) &&
+           ids->type == GGML_TYPE_I32 && ids->ne[1] == 1 && ids->nb[0] == sizeof(int32_t) && n_used <= 65535 &&
+           src1->type == GGML_TYPE_F32 && src1->ne[0] == K && src1->nb[0] == sizeof(float) && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           (src1->ne[1] == 1 || src1->ne[1] == n_used) && src1->nb[1] % sizeof(float) == 0 &&
+           dst->type == GGML_TYPE_F32 && dst->ne[0] == M && dst->ne[1] == n_used && dst->ne[2] == 1 && dst->nb[0] == sizeof(float) &&
+           dst->nb[1] % sizeof(float) == 0;
+}
+
+// GLU node whose only reader is an h1s matvec: skip its launch, the matvec computes it (ctx.h1s_glu). nodes[i] = the GLU.
+bool ggml_cuda_mmvq_h1s_glu_defer(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_GLU"); return !s || atoi(s) != 0; }();
+    const ggml_tensor * glu = cgraph->nodes[i];
+    if (!on || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    const ggml_glu_op op = ggml_get_glu_op(glu);
+    const ggml_tensor * a = glu->src[0], * b = glu->src[1];
+    if ((op != GGML_GLU_OP_GEGLU && op != GGML_GLU_OP_SWIGLU) || !a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+            glu->type != GGML_TYPE_F32 || a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) || a->ne[0] != glu->ne[0] ||
+            b->ne[0] != glu->ne[0] || a->ne[1] != glu->ne[1] || b->ne[1] != glu->ne[1] || a->ne[2] != 1 || b->ne[2] != 1 ||
+            a->nb[1] % sizeof(float) != 0 || b->nb[1] % sizeof(float) != 0 || ggml_node_get_use_count(cgraph, i) != 1 ||
+            (glu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    for (int j = i + 1; j < cgraph->n_nodes && j < i + 4; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu) {
+            if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE) || !mmvq_h1s_ok(t->src[0], glu, t->src[2], t)) {
+                return false;
+            }
+            ctx.h1s_glu = glu;
+            return true;
+        }
+        if (!ggml_is_empty(t) && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE) {
+            return false;
+        }
+    }
+    return false;
+}
+
+bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                            const ggml_tensor * ids, ggml_tensor * dst) {
+    const bool deferred = ctx.h1s_glu != nullptr && ctx.h1s_glu == src1;
+    if (!mmvq_h1s_ok(src0, src1, ids, dst)) {
+        GGML_ASSERT(!deferred && "h1s: a GLU was deferred to a matvec that does not take it");
+        return false;
+    }
+    static const int rb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_RB"); return s && atoi(s) == 64 ? 64 : 128; }();
+    const int64_t K = src0->ne[0], M = src0->ne[1];
+    const int row_bytes = (int) ((K/H1_QK)*18);
+    const int64_t n_used = ids->ne[0];
+    const int64_t sy = dst->nb[1]/sizeof(float);
+    const float * X; const float * Uv = nullptr; int64_t sx, su = 0; int glu = 0;
+    if (deferred) {
+        const ggml_tensor * a = src1->src[0], * b = src1->src[1];
+        glu = ggml_get_glu_op(src1) == GGML_GLU_OP_GEGLU ? 1 : 2;
+        X = (const float *) a->data; sx = a->nb[1]/sizeof(float);
+        Uv = (const float *) b->data; su = b->nb[1]/sizeof(float);
+        if (src1->ne[1] == 1) { sx = 0; su = 0; }
+        ctx.h1s_glu = nullptr;
+    } else {
+        X = (const float *) src1->data;
+        sx = src1->ne[1] == 1 ? 0 : (int64_t) (src1->nb[1]/sizeof(float));
+    }
+    const dim3 grid((unsigned) ((M + rb - 1)/rb), (unsigned) n_used);
+    const size_t smem = 64 + 1024 + (size_t) rb*row_bytes;
+    cudaStream_t stream = ctx.stream();
+    auto go = [&](auto rb_tag, auto glu_tag) {
+        constexpr int R = decltype(rb_tag)::value, G = decltype(glu_tag)::value;
+        mmvq_h1s_id<R, G><<<grid, R, smem, stream>>>((const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2],
+            (const int32_t *) ids->data, X, sx, Uv, su, (float *) dst->data, sy, (int) M, (int) K);
+    };
+    auto by_glu = [&](auto rb_tag) {
+        switch (glu) {
+            case 1:  go(rb_tag, std::integral_constant<int, 1>{}); break;
+            case 2:  go(rb_tag, std::integral_constant<int, 2>{}); break;
+            default: go(rb_tag, std::integral_constant<int, 0>{}); break;
+        }
+    };
+    if (rb == 64) {
+        by_glu(std::integral_constant<int, 64>{});
+    } else {
+        by_glu(std::integral_constant<int, 128>{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
