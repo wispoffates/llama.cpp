@@ -1512,6 +1512,192 @@ static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
     }
 }
 
+// h1s v7 (2026-10-12, microbench tilegemm/moebw.cu): per-warp streaming. The v1-v4 one-thread-per-row kernels sat at ~19-21 us for gemma4's
+// down (the pure load pattern takes 10 us): per row one dependent 16-HFMA2 chain, nothing to overlap it with. Here a CTA of WPB warps builds
+// the slot's fp16 activation once; lane l owns 32-value block (l % NB) of row (l / NB) of a step of RPS = 32/NB rows, keeps that block's 16
+// activation half2 in registers, and computes it for G steps at once (G independent chains, h1's rows-per-warp trick). A warp streams NG
+// groups of G*RPS consecutive rows through a double-buffered staging buffer (next group loading while this one computes); row sums go through
+// a small scratch in block order (= v4's order). moebw: K 320 18.9 -> 13.2 us, K 384 20.8 -> 16.6 us (G 3, NG 4, WPB 4 best of 14).
+template <int NB, int GLU>
+static __global__ void __launch_bounds__(128) mmvq_h1s7_id(
+        const uint8_t * __restrict__ W, const int64_t nb2, const int32_t * __restrict__ ids,
+        const float * __restrict__ X, const int64_t sx, const float * __restrict__ U, const int64_t su,
+        float * __restrict__ dst, const int64_t sy, const int M) {
+    constexpr int G = 3, NG = 4, WPB = 4, K = NB*H1_QK, ROWB = NB*18;
+    constexpr int RPS = 32/NB, GROWS = G*RPS, GB = GROWS*ROWB, NU4 = (GB + 15 + 15)/16, LPL = (NU4 + 31)/32;
+    __shared__ __align__(16) uint8_t stage[WPB][2][NU4*16];
+    __shared__ __align__(16) __half xh[K];
+    __shared__ float xs[NB];
+    __shared__ float red[WPB][G][32];
+    const int tid = threadIdx.x, lane = tid % 32, wid = tid / 32, slot = blockIdx.y;
+    constexpr int NT = WPB*32, MAXK = (K + NT - 1)/NT;
+
+    float a[MAXK], g[MAXK];
+#pragma unroll
+    for (int k = 0; k < MAXK; ++k) {
+        const int i = tid + NT*k;
+        if (i < K) {
+            a[k] = X[slot*sx + i];
+            if constexpr (GLU != 0) {
+                g[k] = U[slot*su + i];
+            }
+        }
+    }
+    const int row0 = (blockIdx.x*WPB + wid)*NG*GROWS;
+    const uint8_t * wexp = W + (int64_t) ids[slot]*nb2;
+    // group gr: rows [row0 + gr*GROWS, +GROWS) clipped to M; loads only the bytes of the valid rows (+ the <= 15-byte alignment over-read,
+    // covered by the tensor padding -- see mmvq_h1s_ok); a group wholly past M loads nothing (warp-uniform)
+    auto ld = [&](const int gr, uint4 * v, int & mis) {
+        const int r = row0 + gr*GROWS;
+        mis = 0;
+        if (r >= M) {
+            return;
+        }
+        const int nbytes = min(GROWS, M - r)*ROWB;
+        const uintptr_t ad = (uintptr_t) (wexp + (int64_t) r*ROWB);
+        mis = (int) (ad & 15);
+        const int nu4 = (mis + nbytes + 15)/16;
+        const uint4 * p = (const uint4 *) (ad - mis);
+#pragma unroll
+        for (int j = 0; j < LPL; ++j) {
+            if (lane + 32*j < nu4) {
+                v[j] = __ldg(p + lane + 32*j);
+            }
+        }
+    };
+    auto st = [&](const int buf, const uint4 * v) {
+#pragma unroll
+        for (int j = 0; j < LPL; ++j) {
+            if (lane + 32*j < NU4) {
+                ((uint4 *) stage[wid][buf])[lane + 32*j] = v[j];
+            }
+        }
+    };
+    uint4 v[LPL];
+    int mis;
+    ld(0, v, mis);
+
+#pragma unroll
+    for (int k = 0; k < MAXK; ++k) {
+        const int i = tid + NT*k;
+        if (i < K) {   // K % 32 == 0: whole warps
+            float x;
+            if constexpr (GLU == 1) {
+                x = ggml_cuda_op_gelu_single(a[k]) * g[k];
+            } else if constexpr (GLU == 2) {
+                x = ggml_cuda_op_silu_single(a[k]) * g[k];
+            } else {
+                x = a[k];
+            }
+            float m = fabsf(x);
+#pragma unroll
+            for (int o = 16; o >= 1; o >>= 1) {
+                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            }
+            const float sc = m > 0.0f ? m : 1.0f;
+            xh[i] = __float2half(x/sc);
+            if (lane == 0) {
+                xs[i/H1_QK] = sc;
+            }
+        }
+    }
+    __syncthreads();
+
+    const int rr = lane / NB, b = lane % NB;
+    const bool act = rr < RPS;
+    half2 xv[16];
+    float sb = 0.0f;
+    if (act) {
+        const uint4 * xp = (const uint4 *) (xh + b*H1_QK);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint4 q = xp[i];
+            xv[4*i + 0] = *(const half2 *) &q.x; xv[4*i + 1] = *(const half2 *) &q.y;
+            xv[4*i + 2] = *(const half2 *) &q.z; xv[4*i + 3] = *(const half2 *) &q.w;
+        }
+        sb = xs[b];
+    }
+    st(0, v);
+    int mis_cur = mis;
+    __syncwarp();
+
+    for (int gr = 0; gr < NG; ++gr) {
+        if (row0 + gr*GROWS >= M) {
+            break;   // warp-uniform
+        }
+        int mis_nx = 0;
+        if (gr + 1 < NG) {
+            ld(gr + 1, v, mis_nx);
+        }
+        float p[G];
+        if (act) {
+            uint32_t w[G][5];
+            bool hi[G];
+#pragma unroll
+            for (int q = 0; q < G; ++q) {
+                const int off = mis_cur + (q*RPS + rr)*ROWB + b*18;   // 2-byte aligned; rows past M read stale staging, never written
+                const uint32_t * wd = (const uint32_t *) (stage[wid][gr & 1] + (off & ~3));
+                hi[q] = off & 2;
+#pragma unroll
+                for (int i = 0; i < 5; ++i) {
+                    w[q][i] = wd[i];
+                }
+            }
+            half2 h[G];
+#pragma unroll
+            for (int q = 0; q < G; ++q) {
+                h[q] = __float2half2_rn(0.0f);
+            }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+#pragma unroll
+                for (int q = 0; q < G; ++q) {
+                    const uint32_t qq = __funnelshift_rc(w[q][i], w[q][i + 1], hi[q] ? 32 : 16);
+                    half2 lo, hh;
+                    mmvq_h1_nib(qq & 0x0f0f0f0fu, lo, hh);
+                    h[q] = __hfma2(lo, xv[2*i], h[q]);
+                    h[q] = __hfma2(hh, xv[2*i + 1], h[q]);
+                    mmvq_h1_nib((qq >> 4) & 0x0f0f0f0fu, lo, hh);
+                    h[q] = __hfma2(lo, xv[8 + 2*i], h[q]);
+                    h[q] = __hfma2(hh, xv[8 + 2*i + 1], h[q]);
+                }
+            }
+#pragma unroll
+            for (int q = 0; q < G; ++q) {
+                const float d = __half2float(__ushort_as_half((unsigned short) (hi[q] ? w[q][0] >> 16 : w[q][0] & 0xffff)));
+                const float2 f = __half22float2(h[q]);
+                p[q] = sb*(d*(f.x + f.y));
+            }
+        } else {
+#pragma unroll
+            for (int q = 0; q < G; ++q) {
+                p[q] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int q = 0; q < G; ++q) {
+            red[wid][q][lane] = p[q];
+        }
+        __syncwarp();
+        if (lane < GROWS) {
+            const int q = lane / RPS, r2 = lane % RPS, r = row0 + gr*GROWS + lane;
+            if (r < M) {
+                float acc = 0.0f;
+                for (int k = 0; k < NB; ++k) {
+                    acc += red[wid][q][r2*NB + k];
+                }
+                dst[slot*sy + r] = acc;
+            }
+        }
+        __syncwarp();
+        if (gr + 1 < NG) {
+            st((gr + 1) & 1, v);
+        }
+        mis_cur = mis_nx;
+        __syncwarp();
+    }
+}
+
 static bool mmvq_h1s_on() {
     static const bool on = [] {
         const char * s = getenv("GGML_CUDA_MMVQ_H1S");
@@ -1533,6 +1719,10 @@ static bool mmvq_h1s_ok(const ggml_tensor * src0, const ggml_tensor * src1, cons
     return cc < GGML_CUDA_CC_VOLTA && !GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_Q4_0 && K % H1_QK == 0 && K >= 64 &&
            K <= 512 && src0->nb[0] == 18 && src0->nb[1] == (size_t) row_bytes && src0->ne[3] == 1 && ((uintptr_t) src0->data % 2) == 0 &&
            src0->nb[2] == (size_t) (M*row_bytes) &&
+           // v7 stages from the 16-byte-aligned address at or below each row group: up to 15 bytes past the last row of the last expert,
+           // covered when the tensor owns its allocation and K is not a multiple of MATRIX_ROW_PADDING (last row padded), or when nothing
+           // is ever misaligned
+           ((row_bytes % 16 == 0 && (uintptr_t) src0->data % 16 == 0) || (src0->view_src == nullptr && K % MATRIX_ROW_PADDING != 0)) &&
            ids->type == GGML_TYPE_I32 && ids->ne[1] == 1 && ids->nb[0] == sizeof(int32_t) && n_used <= 65535 &&
            src1->type == GGML_TYPE_F32 && src1->ne[0] == K && src1->nb[0] == sizeof(float) && src1->ne[2] == 1 && src1->ne[3] == 1 &&
            (src1->ne[1] == 1 || src1->ne[1] == n_used) && src1->nb[1] % sizeof(float) == 0 &&
@@ -1604,6 +1794,38 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const dim3 grid((unsigned) ((nchunks + cpb - 1)/cpb), (unsigned) n_used);
     const size_t smem = 64 + 1024 + (size_t) rb*row_bytes;
     cudaStream_t stream = ctx.stream();
+    static const bool v7 = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_V7"); return !s || atoi(s) != 0; }();
+    const int nb = (int) (K/H1_QK);
+    if (v7 && nb >= 8 && nb <= 16) {
+        // rows per CTA = WPB 4 x NG 4 x G 3 x RPS (32/NB)
+        const int rows_cta = 4*4*3*(32/nb);
+        const dim3 grid7((unsigned) ((M + rows_cta - 1)/rows_cta), (unsigned) n_used);
+        auto go7 = [&](auto nb_tag, auto glu_tag) {
+            constexpr int NBv = decltype(nb_tag)::value, Gv = decltype(glu_tag)::value;
+            mmvq_h1s7_id<NBv, Gv><<<grid7, 128, 0, stream>>>((const uint8_t *) src0->data, (int64_t) src0->nb[2],
+                (const int32_t *) ids->data, X, sx, Uv, su, (float *) dst->data, sy, (int) M);
+        };
+        auto by_glu7 = [&](auto nb_tag) {
+            switch (glu) {
+                case 1:  go7(nb_tag, std::integral_constant<int, 1>{}); break;
+                case 2:  go7(nb_tag, std::integral_constant<int, 2>{}); break;
+                default: go7(nb_tag, std::integral_constant<int, 0>{}); break;
+            }
+        };
+        switch (nb) {
+            case 8:  by_glu7(std::integral_constant<int, 8>{});  break;
+            case 9:  by_glu7(std::integral_constant<int, 9>{});  break;
+            case 10: by_glu7(std::integral_constant<int, 10>{}); break;
+            case 11: by_glu7(std::integral_constant<int, 11>{}); break;
+            case 12: by_glu7(std::integral_constant<int, 12>{}); break;
+            case 13: by_glu7(std::integral_constant<int, 13>{}); break;
+            case 14: by_glu7(std::integral_constant<int, 14>{}); break;
+            case 15: by_glu7(std::integral_constant<int, 15>{}); break;
+            default: by_glu7(std::integral_constant<int, 16>{}); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
     auto go = [&](auto rb_tag, auto glu_tag) {
         constexpr int R = decltype(rb_tag)::value, G = decltype(glu_tag)::value;
         mmvq_h1s_id<R, G><<<grid, R, smem, stream>>>((const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2],
