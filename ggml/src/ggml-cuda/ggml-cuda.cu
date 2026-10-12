@@ -3802,6 +3802,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // p100-series: GLU read only by an h1s (fp16 short-K) MUL_MAT_ID: no launch, the matvec computes it
+    if (node->op == GGML_OP_GLU && ggml_cuda_mmvq_h1s_glu_defer(*cuda_ctx, cgraph, i)) {
+        return -1;
+    }
+
     // p100-series: GEGLU feeding an integer-path MUL_MAT_ID also writes the matvec's q8_1 activation (one launch less)
     if (node->op == GGML_OP_GLU && ggml_cuda_geglu_q8_1_try(*cuda_ctx, cgraph, i)) {
         return -1;
