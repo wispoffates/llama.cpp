@@ -1373,126 +1373,143 @@ bool ggml_cuda_mmvq_h1_reserve(ggml_backend_cuda_context & ctx, const ggml_tenso
 // ROW: a block stages RB consecutive rows of the slot's expert (contiguous bytes, 16-byte coalesced loads) in shared memory, builds
 // the fp16 activation in shared memory (per 32-value block x / max|x|, h1's numerics), and each thread runs h1's HFMA2 chain over
 // its row. Optional GLU mode computes op(gate) * up on the fly from the two GLU operands, so the GLU node needs no launch.
-// GGML_CUDA_MMVQ_H1S=0 disables, GGML_CUDA_MMVQ_H1S_GLU=0 keeps the GLU launch, GGML_CUDA_MMVQ_H1S_RB=64|128 rows per block.
+// GGML_CUDA_MMVQ_H1S=0 disables, GGML_CUDA_MMVQ_H1S_GLU=0 keeps the GLU launch, GGML_CUDA_MMVQ_H1S_RB=32|64|128 rows per chunk,
+// GGML_CUDA_MMVQ_H1S_CPB=1..8 chunks per block.
 template <int RB, int GLU>   // GLU: 0 = plain fp32 activation, 1 = GEGLU(gate, up), 2 = SWIGLU(gate, up)
 static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
         const uint8_t * __restrict__ W, const int row_bytes, const int64_t nb2, const int32_t * __restrict__ ids,
         const float * __restrict__ X, const int64_t sx, const float * __restrict__ U, const int64_t su,
-        float * __restrict__ dst, const int64_t sy, const int M, const int K) {
+        float * __restrict__ dst, const int64_t sy, const int M, const int K, const int cpb) {
     extern __shared__ __align__(16) uint8_t h1s_smem[];
     const int nb = K / H1_QK;
     float  * xs = (float *) h1s_smem;                         // nb scales (<= 16)
     __half * xh = (__half *) (h1s_smem + 64);                  // K halfs (<= 512)
-    uint8_t * ws = h1s_smem + 64 + 1024;                       // RB rows of weights
-    const int tid = threadIdx.x, lane = tid % 32, wid = tid / 32;
+    uint8_t * ws = h1s_smem + 64 + 1024;                       // RB rows of weights (one chunk)
+    const int tid = threadIdx.x, lane = tid % 32;
     const int slot = blockIdx.y;
-    const int r0 = blockIdx.x * RB;
+    // this block: chunks blockIdx.x*cpb .. +cpb-1 (RB rows each) of the slot's expert; the activation is built once for all of them,
+    // and chunk c+1's weights are loaded into registers while chunk c is computed from shared memory
+    const int c0 = blockIdx.x*cpb;
+    const int nchunks = (M + RB - 1)/RB;
+    const int c_end = min(c0 + cpb, nchunks);
+    const uint8_t * wexp = W + (int64_t) ids[slot]*nb2;
 
-    // weights first: the slot's expert rows r0 .. r0+RB-1 are one contiguous run. All of a thread's 16-byte loads are ISSUED
-    // before any is stored (registers), and the activation is built while they are in flight: one load at a time held ~4 KB in flight
-    // per SM, i.e. ~200 GB/s -- exactly what the first version measured (20.4 us, same as the integer path).
-    constexpr int MAXU = (14*128)/RB < 28 ? (14*128)/RB : 28;   // uint4 per thread per pass (K 384 at RB 128 needs 13.5)
-    const int nrows = min(RB, M - r0);
-    const uint8_t * wb = W + (int64_t) ids[slot]*nb2 + (int64_t) r0*row_bytes;
-    const int nbytes = nrows*row_bytes;
-    const bool vec = ((uintptr_t) wb & 15) == 0 && (nbytes & 15) == 0;
-    const int n16 = nbytes/16;
+    constexpr int MAXU = (14*128)/RB < 28 ? (14*128)/RB : 28;   // uint4 per thread per chunk (K 384 at RB 128 needs 13.5)
     uint4 v[MAXU];
-    if (vec) {
-        const uint4 * src = (const uint4 *) wb;
+    auto load = [&](const int c, int & n16, bool & vec) {
+        const int nrows = min(RB, M - c*RB);
+        const uint8_t * wb = wexp + (int64_t) c*RB*row_bytes;
+        const int nbytes = nrows*row_bytes;
+        vec = ((uintptr_t) wb & 15) == 0 && (nbytes & 15) == 0 && nbytes/16 <= MAXU*RB;
+        n16 = nbytes/16;
+        if (vec) {
+            const uint4 * src = (const uint4 *) wb;
 #pragma unroll
-        for (int u = 0; u < MAXU; ++u) {
-            const int j = tid + u*RB;
-            if (j < n16) {
-                v[u] = __ldg(src + j);
+            for (int u = 0; u < MAXU; ++u) {
+                const int j = tid + u*RB;
+                if (j < n16) {
+                    v[u] = __ldg(src + j);
+                }
+            }
+        }
+    };
+    auto store = [&](const int c, const int n16, const bool vec) {
+        if (vec) {
+            uint4 * d = (uint4 *) ws;
+#pragma unroll
+            for (int u = 0; u < MAXU; ++u) {
+                const int j = tid + u*RB;
+                if (j < n16) {
+                    d[j] = v[u];
+                }
+            }
+        } else {   // unaligned / oversized chunk: plain 2-byte copy (rows are 2-byte aligned)
+            const uint16_t * src = (const uint16_t *) (wexp + (int64_t) c*RB*row_bytes);
+            uint16_t * d = (uint16_t *) ws;
+            const int n2 = min(RB, M - c*RB)*row_bytes/2;
+            for (int j = tid; j < n2; j += RB) {
+                d[j] = src[j];
+            }
+        }
+    };
+
+    int n16; bool vec;
+    load(c0, n16, vec);
+
+    // activation -> fp16 blocks. Thread t owns elements t + RB*k: all its loads are issued first, and since RB is a multiple of 32 each
+    // warp's 32 elements of one k are one h1 block (warp max = the block scale).
+    {
+        constexpr int MAXK = 512/RB;
+        float a[MAXK], g[MAXK];
+#pragma unroll
+        for (int k = 0; k < MAXK; ++k) {
+            const int i = tid + RB*k;
+            if (i < K) {
+                a[k] = X[slot*sx + i];
+                if constexpr (GLU != 0) {
+                    g[k] = U[slot*su + i];
+                }
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < MAXK; ++k) {
+            const int i = tid + RB*k;
+            if (i < K) {   // K % 32 == 0: whole warps
+                float x;
+                if constexpr (GLU == 1) {
+                    x = ggml_cuda_op_gelu_single(a[k]) * g[k];
+                } else if constexpr (GLU == 2) {
+                    x = ggml_cuda_op_silu_single(a[k]) * g[k];
+                } else {
+                    x = a[k];
+                }
+                float m = fabsf(x);
+#pragma unroll
+                for (int o = 16; o >= 1; o >>= 1) {
+                    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+                }
+                const float sc = m > 0.0f ? m : 1.0f;
+                xh[i] = __float2half(x/sc);
+                if (lane == 0) {
+                    xs[i/H1_QK] = sc;
+                }
             }
         }
     }
 
-    // activation -> fp16 blocks. Thread t owns elements t + RB*k: ALL its loads are issued first (one memory latency, not one per 32-value
-    // block), and since RB is a multiple of 32 each warp's 32 elements of one k are one h1 block (warp max = the block scale).
-    constexpr int MAXK = 512/RB;
-    float a[MAXK], g[MAXK];
-#pragma unroll
-    for (int k = 0; k < MAXK; ++k) {
-        const int i = tid + RB*k;
-        if (i < K) {
-            a[k] = X[slot*sx + i];
-            if constexpr (GLU != 0) {
-                g[k] = U[slot*su + i];
-            }
-        }
-    }
-#pragma unroll
-    for (int k = 0; k < MAXK; ++k) {
-        const int i = tid + RB*k;
-        if (i < K) {   // K % 32 == 0: whole warps
-            float x;
-            if constexpr (GLU == 1) {
-                x = ggml_cuda_op_gelu_single(a[k]) * g[k];
-            } else if constexpr (GLU == 2) {
-                x = ggml_cuda_op_silu_single(a[k]) * g[k];
-            } else {
-                x = a[k];
-            }
-            float m = fabsf(x);
-#pragma unroll
-            for (int o = 16; o >= 1; o >>= 1) {
-                m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
-            }
-            const float sc = m > 0.0f ? m : 1.0f;
-            xh[i] = __float2half(x/sc);
-            if (lane == 0) {
-                xs[i/H1_QK] = sc;
-            }
-        }
-    }
-    if (vec) {
-        uint4 * d = (uint4 *) ws;
-#pragma unroll
-        for (int u = 0; u < MAXU; ++u) {
-            const int j = tid + u*RB;
-            if (j < n16) {
-                d[j] = v[u];
-            }
-        }
-        for (int j = tid + MAXU*RB; j < n16; j += RB) {   // K > 384: the rest (not unrolled)
-            d[j] = __ldg((const uint4 *) wb + j);
-        }
-    } else {
-        const uint16_t * src = (const uint16_t *) wb;   // rows are 2-byte aligned (q4_0 blocks are 18 bytes)
-        uint16_t * d = (uint16_t *) ws;
-        for (int j = tid; j < nbytes/2; j += RB) {
-            d[j] = src[j];
-        }
-    }
-    __syncthreads();
-
-    if (tid >= nrows) {
-        return;
-    }
-    const uint8_t * wr = ws + tid*row_bytes;
     const half2 * xh2 = (const half2 *) xh;
-    float acc = 0.0f;
-    for (int b = 0; b < nb; ++b) {
-        const uint16_t * blk = (const uint16_t *) (wr + b*18);
-        const float d = __half2float(__ushort_as_half(blk[0]));
-        half2 h = __float2half2_rn(0.0f);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const uint32_t q = (uint32_t) blk[1 + 2*i] | ((uint32_t) blk[2 + 2*i] << 16);
-            half2 a, c;
-            mmvq_h1_nib(q & 0x0f0f0f0fu, a, c);
-            h = __hfma2(a, xh2[b*16 + 2*i], h);
-            h = __hfma2(c, xh2[b*16 + 2*i + 1], h);
-            mmvq_h1_nib((q >> 4) & 0x0f0f0f0fu, a, c);
-            h = __hfma2(a, xh2[b*16 + 8 + 2*i], h);
-            h = __hfma2(c, xh2[b*16 + 8 + 2*i + 1], h);
+    for (int c = c0; c < c_end; ++c) {
+        store(c, n16, vec);
+        __syncthreads();
+        if (c + 1 < c_end) {
+            load(c + 1, n16, vec);   // in flight while this chunk is computed
         }
-        const float2 f = __half22float2(h);
-        acc += xs[b]*(d*(f.x + f.y));
+        const int nrows = min(RB, M - c*RB);
+        if (tid < nrows) {
+            const uint8_t * wr = ws + tid*row_bytes;
+            float acc = 0.0f;
+            for (int b = 0; b < nb; ++b) {
+                const uint16_t * blk = (const uint16_t *) (wr + b*18);
+                const float d = __half2float(__ushort_as_half(blk[0]));
+                half2 h = __float2half2_rn(0.0f);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t q = (uint32_t) blk[1 + 2*i] | ((uint32_t) blk[2 + 2*i] << 16);
+                    half2 lo, hi;
+                    mmvq_h1_nib(q & 0x0f0f0f0fu, lo, hi);
+                    h = __hfma2(lo, xh2[b*16 + 2*i], h);
+                    h = __hfma2(hi, xh2[b*16 + 2*i + 1], h);
+                    mmvq_h1_nib((q >> 4) & 0x0f0f0f0fu, lo, hi);
+                    h = __hfma2(lo, xh2[b*16 + 8 + 2*i], h);
+                    h = __hfma2(hi, xh2[b*16 + 8 + 2*i + 1], h);
+                }
+                const float2 f = __half22float2(h);
+                acc += xs[b]*(d*(f.x + f.y));
+            }
+            dst[slot*sy + c*RB + tid] = acc;
+        }
+        __syncthreads();   // before the next chunk overwrites ws
     }
-    dst[slot*sy + r0 + tid] = acc;
 }
 
 static bool mmvq_h1s_on() {
@@ -1562,8 +1579,8 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         GGML_ASSERT(!deferred && "h1s: a GLU was deferred to a matvec that does not take it");
         return false;
     }
-    // rows per block (= threads): 64 default -- 12 KB of shared memory, so ~5 blocks per SM hide each other's phases (128: 2 per SM)
-    static const int rb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_RB"); const int v = s ? atoi(s) : 64; return v == 32 || v == 128 ? v : 64; }();
+    // rows per chunk (= threads per block): 128 default (H1C in-model: 128 20.0 us, 64 22.4, 32 27.4 -- per-block overhead dominates)
+    static const int rb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_RB"); const int v = s ? atoi(s) : 128; return v == 32 || v == 64 ? v : 128; }();
     const int64_t K = src0->ne[0], M = src0->ne[1];
     const int row_bytes = (int) ((K/H1_QK)*18);
     const int64_t n_used = ids->ne[0];
@@ -1580,13 +1597,16 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         X = (const float *) src1->data;
         sx = src1->ne[1] == 1 ? 0 : (int64_t) (src1->nb[1]/sizeof(float));
     }
-    const dim3 grid((unsigned) ((M + rb - 1)/rb), (unsigned) n_used);
+    // chunks per block: 2 by default -- one wave on 56 SMs for gemma4 (11 x 8 blocks of 128 rows) with chunk 2's load hidden
+    static const int cpb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_CPB"); const int v = s ? atoi(s) : 2; return v >= 1 && v <= 8 ? v : 2; }();
+    const int nchunks = (int) ((M + rb - 1)/rb);
+    const dim3 grid((unsigned) ((nchunks + cpb - 1)/cpb), (unsigned) n_used);
     const size_t smem = 64 + 1024 + (size_t) rb*row_bytes;
     cudaStream_t stream = ctx.stream();
     auto go = [&](auto rb_tag, auto glu_tag) {
         constexpr int R = decltype(rb_tag)::value, G = decltype(glu_tag)::value;
         mmvq_h1s_id<R, G><<<grid, R, smem, stream>>>((const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2],
-            (const int32_t *) ids->data, X, sx, Uv, su, (float *) dst->data, sy, (int) M, (int) K);
+            (const int32_t *) ids->data, X, sx, Uv, su, (float *) dst->data, sy, (int) M, (int) K, cpb);
     };
     auto by_glu = [&](auto rb_tag) {
         switch (glu) {
