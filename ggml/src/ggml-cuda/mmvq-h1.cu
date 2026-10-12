@@ -1597,8 +1597,9 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         X = (const float *) src1->data;
         sx = src1->ne[1] == 1 ? 0 : (int64_t) (src1->nb[1]/sizeof(float));
     }
-    // chunks per block: 2 by default -- one wave on 56 SMs for gemma4 (11 x 8 blocks of 128 rows) with chunk 2's load hidden
-    static const int cpb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_CPB"); const int v = s ? atoi(s) : 2; return v >= 1 && v <= 8 ? v : 2; }();
+    // chunks per block: 1 by default. H1D in-model (gemma4 ffn_down_exps, 128-row chunks): CPB 1 19.4 us, 2 21.9, 3 25.2, 4 25.0 -- block
+    // count (parallelism) beats reusing the activation and prefetching the next chunk; all variants sit near ~200 GB/s (open question)
+    static const int cpb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_CPB"); const int v = s ? atoi(s) : 1; return v >= 1 && v <= 8 ? v : 1; }();
     const int nchunks = (int) ((M + rb - 1)/rb);
     const dim3 grid((unsigned) ((nchunks + cpb - 1)/cpb), (unsigned) n_used);
     const size_t smem = 64 + 1024 + (size_t) rb*row_bytes;
