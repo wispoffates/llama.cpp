@@ -1403,97 +1403,106 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 
 /// kernels
 
-// single-thread kernel: the state update must be deterministic for CUDA
-// graph replay. ids may be a strided view (nb[1] != n_used*4), so every read
-// goes through the row stride
+// one warp: hits are looked up in parallel, misses are handled in order (each eviction depends on the previous one) with the
+// least-recently-used slot found by a warp argmin (lowest slot on ties, as a sequential scan would pick). The state update is
+// deterministic. ids may be a strided view (nb[1] != n_used*4), so every read goes through the row stride
 static __global__ void k_lru_decide(
-        const int32_t * __restrict__ ids, int32_t * __restrict__ slot_ids,
-        int32_t * __restrict__ state, int32_t * __restrict__ fill_list,
+        const int32_t * __restrict__ ids, int32_t * slot_ids,   // no __restrict__: lanes read what lane 0 wrote
+        int32_t * state, int32_t * fill_list,
         int n_used, int n_tokens, int n_expert, int n_slot, int ids_stride) {
+    const int lane = threadIdx.x;
     int32_t * owner    = state;                     // expert -> slot
     int32_t * slot_of  = state + n_expert;          // slot -> expert
     int32_t * last_use = state + n_expert + n_slot; // tick of the last use per slot
     const int32_t t0   = state[n_expert + 2 * n_slot];
     const int n_total = n_used * n_tokens;
 
-    int n_fill = 0;
-    for (int i = 0; i < n_total; i++) {
+    for (int i = lane; i < n_total; i += WARP_SIZE) {
         const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
         if (e < 0 || e >= n_expert) continue;
         const int32_t s = owner[e];
         slot_ids[i] = s;
         if (s >= 0) last_use[s] = t0;
     }
+    __syncwarp();
+
+    int n_fill = 0;
     for (int i = 0; i < n_total; i++) {
         if (slot_ids[i] >= 0) continue;
         const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
         if (e < 0 || e >= n_expert) continue;
-        if (owner[e] >= 0) {
-            slot_ids[i] = owner[e];
+        const int32_t own = owner[e];
+        if (own >= 0) {                              // a duplicate of an expert filled earlier in this batch
+            if (lane == 0) slot_ids[i] = own;
+            __syncwarp();
             continue;
         }
-        int best = 0;
-        for (int s = 1; s < n_slot; s++) {
-            if (last_use[s] < last_use[best]) best = s;
+        int32_t bv = INT_MAX; int bs = n_slot;
+        for (int s = lane; s < n_slot; s += WARP_SIZE) {
+            const int32_t v = last_use[s];
+            if (v < bv) { bv = v; bs = s; }
         }
-        const int32_t prev = slot_of[best];
-        if (prev >= 0) owner[prev] = -1;
-        slot_of[best] = e;
-        owner[e] = best;
-        last_use[best] = t0;
-        slot_ids[i] = best;
-        fill_list[2 * n_fill + 0] = e;
-        fill_list[2 * n_fill + 1] = best;
+#pragma unroll
+        for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+            const int32_t ov = __shfl_down_sync(0xffffffff, bv, off);
+            const int     os = __shfl_down_sync(0xffffffff, bs, off);
+            if (ov < bv || (ov == bv && os < bs)) { bv = ov; bs = os; }
+        }
+        const int best = __shfl_sync(0xffffffff, bs, 0);
+        if (lane == 0) {
+            const int32_t prev = slot_of[best];
+            if (prev >= 0) owner[prev] = -1;
+            slot_of[best] = e;
+            owner[e] = best;
+            last_use[best] = t0;
+            slot_ids[i] = best;
+            fill_list[2 * n_fill + 0] = e;
+            fill_list[2 * n_fill + 1] = best;
+        }
         n_fill++;
+        __syncwarp();
     }
-    state[n_expert + 2 * n_slot] = t0 + 1;
-    state[n_expert + 2 * n_slot + 1] += n_total;
-    state[n_expert + 2 * n_slot + 2] += n_fill;
-    fill_list[2 * n_slot] = n_fill;
-}
-
-
-static __global__ void k_lru_fill(
-        const int32_t * __restrict__ fill_list, int n_slot,
-        const char * __restrict__ src, char * __restrict__ pool,
-        size_t estride, size_t sstride, size_t bytes, size_t src_col_off) {
-    const int j = blockIdx.y;
-    if (j >= fill_list[2 * n_slot]) return;
-    const int32_t e = fill_list[2 * j + 0];
-    const int32_t s = fill_list[2 * j + 1];
-    const char * src_e = src + (size_t) e * estride + src_col_off;
-    char * dst = pool + (size_t) s * sstride;
-    const size_t n16 = bytes / 16;
-    const uint4 * s4 = (const uint4 *) src_e;
-    uint4 * d4 = (uint4 *) dst;
-    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n16;
-         i += (size_t) gridDim.x * blockDim.x) {
-        d4[i] = s4[i];
-    }
-    for (size_t i = n16 * 16 + blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < bytes;
-         i += (size_t) gridDim.x * blockDim.x) {
-        dst[i] = src_e[i];
+    if (lane == 0) {
+        state[n_expert + 2 * n_slot] = t0 + 1;
+        state[n_expert + 2 * n_slot + 1] += n_total;
+        state[n_expert + 2 * n_slot + 2] += n_fill;
+        fill_list[2 * n_slot] = n_fill;
     }
 }
 
-// split along ne[0]: every local row is a column slice of a source row
-static __global__ void k_lru_fill_col(
-        const int32_t * __restrict__ fill_list, int n_slot,
-        const char * __restrict__ src, char * __restrict__ pool,
-        size_t estride, size_t sstride,
-        size_t seg_bytes, size_t n_rows, size_t src_row_stride, size_t src_col_off) {
-    const int j = blockIdx.y;
-    if (j >= fill_list[2 * n_slot]) return;
-    const int32_t e = fill_list[2 * j + 0];
-    const int32_t s = fill_list[2 * j + 1];
-    const char * src_e = src + (size_t) e * estride + src_col_off;
-    char * dst_e = pool + (size_t) s * sstride;
-    const size_t total = n_rows * seg_bytes;
-    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total;
-         i += (size_t) gridDim.x * blockDim.x) {
-        const size_t row = i / seg_bytes;
-        const size_t b = i % seg_bytes;
-        dst_e[row * seg_bytes + b] = src_e[row * src_row_stride + b];
+
+// one fill descriptor: the expert slice of one pool. Row mode: n_rows = 1, seg_bytes = the slice. Column split (ne[0]): every
+// local row is a seg_bytes slice at src_off of a source row (src_row_stride apart). vec: all strides/offsets 16-byte aligned.
+struct lru_fill_desc {
+    const char * src; char * pool;
+    size_t src_estride, estride, seg_bytes, n_rows, src_row_stride, src_off;
+    int vec;
+};
+struct lru_fill_descs { lru_fill_desc d[3]; };
+
+// blockIdx.z = descriptor, block rows walk the fill list (the grid is sized by the batch's ids, not by the slot count:
+// most decode steps fill nothing, and 16K blocks that only read the count cost ~45 us per launch on sm_60)
+static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_slot, const lru_fill_descs descs) {
+    const lru_fill_desc & d = descs.d[blockIdx.z];
+    const int n_fill = fill_list[2 * n_slot];
+    for (int j = blockIdx.y; j < n_fill; j += gridDim.y) {
+        const int32_t e = fill_list[2 * j + 0];
+        const int32_t s = fill_list[2 * j + 1];
+        const char * src_e = d.src + (size_t) e * d.src_estride + d.src_off;
+        char * dst_e = d.pool + (size_t) s * d.estride;
+        if (d.vec) {
+            const size_t seg16 = d.seg_bytes / 16, total = d.n_rows * seg16;
+            for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+                const size_t row = i / seg16, c = i % seg16;
+                ((uint4 *) (dst_e + row * d.seg_bytes))[c] = ((const uint4 *) (src_e + row * d.src_row_stride))[c];
+            }
+        } else {
+            const size_t total = d.n_rows * d.seg_bytes;
+            for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+                const size_t row = i / d.seg_bytes, b = i % d.seg_bytes;
+                dst_e[row * d.seg_bytes + b] = src_e[row * d.src_row_stride + b];
+            }
+        }
     }
 }
 
@@ -2288,53 +2297,54 @@ static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int n_tokens = (int) ids->ne[1];
     int32_t * fill_list = (int32_t *) dst->data + (size_t) n_used * n_tokens;
 
-    k_lru_decide<<<1, 1, 0, ctx.stream()>>>(
+    k_lru_decide<<<1, WARP_SIZE, 0, ctx.stream()>>>(
         (const int32_t *) ids->data, (int32_t *) dst->data,
         (int32_t *) state->data, fill_list,
         n_used, n_tokens, n_expert, n_slot, ids_stride);
 }
 
-static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * fill_list = dst->src[0];
-    ggml_tensor * pool            = dst->src[1];
-
+static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {
+    const ggml_tensor * pool = dst->src[1];
     ggml_tensor * src;
     memcpy(&src, dst->op_params, sizeof(src));
-
-    const int n_rows = (int) ((fill_list->ne[0] - 1) / 2);
     GGML_ASSERT(pool->nb[2] % 16 == 0);
     GGML_ASSERT(src->nb[2] % 16 == 0);
-    const dim3 grid(64, n_rows < 1 ? 1 : n_rows), block(256);
 
-    // under a device split this dispatch runs once per device with a pool
-    // view of that device's slice, so the source offset needs the device index
-    if (pool->nb[1] != src->nb[1]) {
-        // columnar: local rows are column slices of the source rows (ne[0] split)
-        int dev = 0;
+    // under a device split this dispatch runs once per device with a pool view of that device's slice, so the source offset
+    // needs the device index (device i holds slice i of an even split)
+    lru_fill_desc d{};
+    d.src = (const char *) src->data; d.pool = (char *) pool->data;
+    d.src_estride = src->nb[2]; d.estride = pool->nb[2];
+    int dev = 0;
+    if (pool->nb[1] != src->nb[1]) {          // columnar: local rows are column slices of the source rows (ne[0] split)
         cudaGetDevice(&dev);
-        k_lru_fill_col<<<grid, block, 0, ctx.stream()>>>(
-            (const int32_t *) fill_list->data, n_rows,
-            (const char *) src->data, (char *) pool->data,
-            src->nb[2], pool->nb[2],
-            pool->nb[1], pool->ne[1], src->nb[1], (size_t) dev * pool->nb[1]);
-    } else if (pool->ne[1] != src->ne[1]) {
-        // row split: local rows are whole source rows, this device holds a
-        // slice of the row set (ne[1] split)
-        int dev = 0;
-        cudaGetDevice(&dev);
-        k_lru_fill<<<grid, block, 0, ctx.stream()>>>(
-            (const int32_t *) fill_list->data, n_rows,
-            (const char *) src->data, (char *) pool->data,
-            src->nb[2], pool->nb[2], pool->nb[2],
-            (size_t) dev * pool->ne[1] * pool->nb[1]);
-    } else {
-        // whole pool: single device or layer split, no source offset
-        k_lru_fill<<<grid, block, 0, ctx.stream()>>>(
-            (const int32_t *) fill_list->data, n_rows,
-            (const char *) src->data, (char *) pool->data,
-            src->nb[2], pool->nb[2], pool->nb[2], 0);
+        d.seg_bytes = pool->nb[1]; d.n_rows = pool->ne[1]; d.src_row_stride = src->nb[1]; d.src_off = (size_t) dev * pool->nb[1];
+    } else {                                  // whole rows: this device holds a slice of the row set (or the whole pool)
+        if (pool->ne[1] != src->ne[1]) {
+            cudaGetDevice(&dev);
+        }
+        d.seg_bytes = pool->nb[2]; d.n_rows = 1; d.src_row_stride = 0; d.src_off = (size_t) dev * pool->ne[1] * pool->nb[1];
     }
+    d.vec = d.seg_bytes % 16 == 0 && d.src_row_stride % 16 == 0 && d.src_off % 16 == 0 && (uintptr_t) src->data % 16 == 0;
+    return d;
+}
 
+// fills nodes[0..n) share one fill list (the gate/up/down fills of a layer): one launch
+static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n) {
+    const ggml_tensor * fill_list = nodes[0]->src[0];
+    const int n_slot = (int) ((fill_list->ne[0] - 1) / 2);
+    const int n_ids  = ggml_get_op_params_i32(nodes[0], 2);   // at most this many fills (0: unknown -> n_slot)
+    const int rows   = std::max(1, std::min(n_slot, n_ids > 0 ? n_ids : n_slot));
+    lru_fill_descs descs{};
+    for (int k = 0; k < n; k++) {
+        descs.d[k] = ggml_cuda_lru_fill_desc(nodes[k]);
+    }
+    const dim3 grid(64, rows, n), block(256);
+    k_lru_fill<<<grid, block, 0, ctx.stream()>>>((const int32_t *) fill_list->data, n_slot, descs);
+}
+
+static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_lru_fill_n(ctx, &dst, 1);
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -4035,6 +4045,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // p100-series: the gate/up/down LRU fills of a layer (same fill list, consecutive) in one launch
+    if (node->op == GGML_OP_LRU_FILL && i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_LRU_FILL && cgraph->nodes[i + 1]->src[0] == node->src[0] &&
+            cgraph->nodes[i + 2]->op == GGML_OP_LRU_FILL && cgraph->nodes[i + 2]->src[0] == node->src[0]) {
+        ggml_cuda_lru_fill_n(*cuda_ctx, &cgraph->nodes[i], 3);
+        return 2;
+    }
 
     // p100-series: GLU read only by an h1s (fp16 short-K) MUL_MAT_ID: no launch, the matvec computes it
     if (node->op == GGML_OP_GLU && ggml_cuda_mmvq_h1s_glu_defer(*cuda_ctx, cgraph, i)) {
