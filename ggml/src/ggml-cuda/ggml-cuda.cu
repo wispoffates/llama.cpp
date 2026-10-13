@@ -1450,7 +1450,7 @@ static __global__ void k_lru_decide(
         const int32_t * __restrict__ ids, int32_t * slot_ids,   // no __restrict__: lanes read what lane 0 wrote
         int32_t * state, int32_t * fill_list,
         int n_used, int n_tokens, int n_expert, int n_slot, int ids_stride, int exclusive,
-        ggml_lru_ctrl * ctrl, int layer, int log_dev) {
+        ggml_lru_ctrl * ctrl, int layer, int log_dev, int log_dev_index) {
     const int lane = threadIdx.x;
     int32_t * owner    = state;                     // expert -> slot
     int32_t * slot_of  = state + n_expert;          // slot -> expert
@@ -1500,16 +1500,30 @@ static __global__ void k_lru_decide(
                 h = hslot[e];
                 hslot[e] = -1;
                 if (prev >= 0) hslot[prev] = h;
-                // disk refill: the victim is dropped; tell the host which slot it gets (only one device logs)
-                if (ctrl != nullptr && log_dev && prev >= 0) {
-                    const uint32_t hd = ctrl->head;
-                    while (hd - ctrl->tail >= ctrl->cap) {   // ring full: wait for the refill thread
+                // disk refill: tell the host which slot the victim gets. Hybrid: when the host is behind (ring backlog >=
+                // swap_backlog) this device writes the victim back itself (swap) instead of leaving it to the host
+                if (ctrl != nullptr && prev >= 0) {
+                    int32_t * lcount = state + 2 * n_expert + 2 * n_slot + 3;   // this device's log counter
+                    const uint32_t idx = (uint32_t) *lcount;
+                    uint32_t tl = ctrl->tail;
+                    while (idx - tl >= ctrl->cap) {         // ring full: wait for the refill thread
+                        tl = ctrl->tail;
                     }
-                    int32_t * en = ctrl->entries + 4 * (size_t) (hd % ctrl->cap);
-                    en[0] = layer; en[1] = prev; en[2] = h; en[3] = t0;
+                    const int swap = (idx - tl) >= ctrl->swap_backlog;
+                    ctrl->mode[(size_t) log_dev_index * ctrl->cap + idx % ctrl->cap] = swap;
+                    if (log_dev) {
+                        int32_t * en = ctrl->entries + 4 * (size_t) (idx % ctrl->cap);
+                        en[0] = layer; en[1] = prev; en[2] = h; en[3] = t0;
+                    }
                     __threadfence_system();
-                    ctrl->head = hd + 1;
-                    __threadfence_system();
+                    if (log_dev) {
+                        ctrl->head = idx + 1;
+                        __threadfence_system();
+                    }
+                    *lcount = (int32_t) (idx + 1);
+                    if (swap) {
+                        h |= 1 << 30;                      // the fill swaps this entry
+                    }
                 }
             }
             slot_of[best] = e;
@@ -1597,7 +1611,9 @@ static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_
     const int n_fill = fill_list[3 * n_slot];
     for (int j = blockIdx.y; j < n_fill; j += gridDim.y) {
         const int32_t s = fill_list[3 * j + 1];
-        const int32_t h = fill_list[3 * j + 2];     // inclusive: the expert id (row of the model tensor)
+        const int32_t hraw = fill_list[3 * j + 2];  // inclusive: the expert id (row of the model tensor)
+        const int32_t h = hraw & 0x3fffffff;
+        const bool swap = d.swap || ((hraw >> 30) & 1);   // hybrid refill: this device writes the victim back itself
         if (ctrl != nullptr) {
             lru_wait_content(ctrl, layer, h, fill_list[3 * j + 0]);
         }
@@ -1610,12 +1626,12 @@ static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_
                 uint4 * pd = (uint4 *) (dst_e + row * d.seg_bytes) + c;
                 uint4 * ps = (uint4 *) (src_e + row * d.src_row_stride) + c;
                 const uint4 incoming = *ps;
-                if (d.swap) {
+                if (swap) {
                     *ps = *pd;
                 }
                 *pd = incoming;
             }
-        } else if (d.swap) {
+        } else if (swap) {
             // byte-wise swap of unaligned slices (decode moves only a few experts per token)
             const size_t rs = d.n_rows > 1 ? d.src_row_stride : d.seg_bytes, total = d.n_rows * d.seg_bytes;
             for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
@@ -2574,7 +2590,7 @@ static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * 
     k_lru_decide<<<1, WARP_SIZE, 0, ctx.stream()>>>(
         (const int32_t *) ids->data, (int32_t *) dst->data,
         (int32_t *) state->data, fill_list,
-        n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, ctrl, layer, dev == 0);
+        n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, ctrl, layer, dev == 0, dev);
 }
 
 static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {
