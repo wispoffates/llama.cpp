@@ -2761,8 +2761,10 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const dim3 grid(64, rows, n), block(256);
     const int32_t * fl = (const int32_t *) fill_list->data;
 
-    // exclusive: staged write-back (GGML_CUDA_LRU_STAGED=0: in-place swap inside the fill)
-    static const bool staged_on = [] { const char * e = getenv("GGML_CUDA_LRU_STAGED"); return e == nullptr || atoi(e) != 0; }();
+    // exclusive: staged write-back, opt-in (GGML_CUDA_LRU_STAGED=1). WB (10-13): identical text but SLOWER than the in-place
+    // swap (Flash-Next 288 slots 22.5 vs 28.4 t/s, Qwen Q5 96 slots 28.1 vs 34.3): two extra kernels + a main/side-stream
+    // event round trip per layer cost more than the write-back they hide on the decode path
+    static const bool staged_on = [] { const char * e = getenv("GGML_CUDA_LRU_STAGED"); return e != nullptr && atoi(e) != 0; }();
     bool staged = staged_on && descs.d[0].swap && rows <= LRU_STAGING_FILLS;
     for (int k = 0; k < n && staged; k++) {
         staged = descs.d[k].estride % 16 == 0;
