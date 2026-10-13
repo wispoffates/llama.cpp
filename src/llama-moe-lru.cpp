@@ -169,8 +169,10 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     {
         const char * env = getenv("LLAMA_MOE_LRU_ASSEMBLE");
         use_assemble = env == nullptr || atoi(env) != 0;
+        // FZD (10-13): prefetch + side stream = identical text but no faster (the zero-copy assembly competes with the matmuls
+        // for the SMs) and ~1.2 GB/GPU fewer pool slots -> opt-in
         const char * envp = getenv("LLAMA_MOE_LRU_PREFETCH");
-        use_prefetch = envp == nullptr || atoi(envp) != 0;
+        use_prefetch = envp != nullptr && atoi(envp) != 0;
     }
     this->n_slot = n_slot;
     this->n_expert = n_expert;
