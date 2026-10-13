@@ -2426,7 +2426,8 @@ static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * ds
 // a narrow grid (GGML_CUDA_LRU_ASYNC_GX, default 4 blocks per expert): zero-copy reads need only a few warps in flight to fill
 // PCIe, and every SM the assembly takes is one the overlapped compute does not get.
 static bool ggml_cuda_lru_async_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_CUDA_LRU_ASYNC"); return e == nullptr || atoi(e) != 0; }();
+    // opt-in (FZD: no gain; useful only with LLAMA_MOE_LRU_PREFETCH=1)
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LRU_ASYNC"); return e != nullptr && atoi(e) != 0; }();
     return on;
 }
 
