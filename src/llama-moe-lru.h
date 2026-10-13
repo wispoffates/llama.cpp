@@ -36,6 +36,9 @@ struct llama_moe_lru {
     int n_pooled() const { return n_layers; }
     int n_slots() const { return n_slot; }
 
+    // large batches assemble the experts from the pools on the GPU (LLAMA_MOE_LRU_ASSEMBLE=0: scheduler upload of every expert)
+    bool assemble() const { return use_assemble; }
+
     // per-layer and total counters at teardown (hit rates)
     void log_final_stats();
 
@@ -54,6 +57,7 @@ private:
     };
 
     int n_layers = 0, n_slot = 0;
+    bool use_assemble = true;
     int64_t n_expert = 0;
 
     // model layer -> index into layers, -1 when not pooled
