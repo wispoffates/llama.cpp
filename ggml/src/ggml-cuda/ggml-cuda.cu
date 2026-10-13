@@ -2438,9 +2438,11 @@ static void ggml_cuda_lru_assemble_async(ggml_backend_cuda_context & ctx, ggml_t
     ctx.n_lru_pending++;
 }
 
-// before computing node i (and the nodes a fusion may take with it): wait for any pending assembly they read
+// before computing node i (and the nodes a fusion may take with it): wait for any pending assembly they read. The window is
+// wide on purpose: a fused MoE launch can consume many nodes at once (FZ run 2 with a window of 8: 3/18 short-prompt texts
+// differed -- a matmul past the window read a half-assembled expert tensor)
 static void ggml_cuda_lru_wait_srcs(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-    const int last = std::min(cgraph->n_nodes, i + 8);
+    const int last = std::min(cgraph->n_nodes, i + 64);
     for (int n = i; n < last && ctx.n_lru_pending > 0; ++n) {
         const ggml_tensor * node = cgraph->nodes[n];
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
