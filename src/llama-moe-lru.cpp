@@ -17,6 +17,9 @@ bool llama_moe_lru::init_model_overrides(llama_model_loader & ml, const std::vec
     if (n_slot <= 0) {
         return false; // LRU disabled, keep the overrides as-is
     }
+    if (exclusive_requested()) {
+        return false; // exclusive cache: the context copies the experts out of the (mapped) model tensors, no pinning
+    }
 
     ggml_backend_buffer_type_t pinned_buft = nullptr;
     for (const auto & d : devices) {
@@ -73,6 +76,11 @@ bool llama_moe_lru::init_model_overrides(llama_model_loader & ml, const std::vec
     return true;
 }
 
+bool llama_moe_lru::exclusive_requested() {
+    const char * e = getenv("LLAMA_MOE_LRU_EXCLUSIVE");
+    return e != nullptr && atoi(e) != 0;
+}
+
 bool llama_moe_lru::backend_supports(ggml_backend_dev_t dev) {
     // capability probe: excludes GPU backends without LRU kernels
     // (e.g. Vulkan); meta devices pass by forwarding to their children
@@ -100,6 +108,12 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     }
 
     ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(backend_of.begin()->first);
+    for (size_t i = 0; i < ggml_backend_dev_count() && (host_buft == nullptr || host_buft == ggml_backend_cpu_buffer_type()); i++) {
+        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            host_buft = ggml_backend_dev_host_buffer_type(d);
+        }
+    }
 
     const int64_t n_expert = model.hparams.n_expert;
     const int64_t n_used_h = model.hparams.n_expert_used();
@@ -123,8 +137,14 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             if (!up->data) {
                 throw std::runtime_error("llama_moe_lru: expert weights not mapped");
             }
-            // pageable host memory hangs the fill kernel
-            if (ggml_backend_buffer_get_type(up->buffer) != host_buft) {
+            // pageable host memory hangs the fill kernel (exclusive: the kernels read the context's pinned host pool instead)
+            if (exclusive_requested()) {
+                // the experts are copied out byte for byte: a CPU repack buffer (e.g. Q8_0/Q4_0 interleaved) would be garbage
+                const char * bn = ggml_backend_buft_name(ggml_backend_buffer_get_type(up->buffer));
+                if (bn && strstr(bn, "REPACK")) {
+                    throw std::runtime_error("llama_moe_lru: exclusive cache needs plain expert weights, got a repack buffer (use --no-repack)");
+                }
+            } else if (ggml_backend_buffer_get_type(up->buffer) != host_buft) {
                 throw std::runtime_error("llama_moe_lru: expert weights are host but not pinned "
                                          "(use --n-cpu-moe or -ot with --moe-lru-slots and a non-lazy load mode)");
             }
@@ -154,6 +174,10 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     }
     this->n_slot = n_slot;
     this->n_expert = n_expert;
+    // exclusive: every expert lives in exactly one place -- the first n_slot of a layer in the VRAM pool, the rest in a pinned
+    // host pool of (n_expert - n_slot) slots owned by this context; a miss swaps the incoming expert with the pool's victim
+    this->exclusive = exclusive_requested() && n_slot < n_expert;
+    const int64_t n_host = this->exclusive ? n_expert - n_slot : 0;
 
     // model layer -> pool index; the pooled set may be any subset (-ot)
     layer_to_pool.assign(n_layer_tot, -1);
@@ -192,9 +216,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             ggml_format_name(t, "blk.%d.moe_lru_pool.%s", il, kind_name[k]);
             L.pool[k] = t;
         }
-        // +tick +cum_ids +cum_fills
+        // +tick +cum_ids +cum_fills (+ exclusive: expert -> host slot)
         L.state = ggml_new_tensor_1d(pctx.get(), GGML_TYPE_I32,
-                                     n_expert + 2 * (int64_t) n_slot + 3);
+                                     n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? n_expert : 0));
         ggml_format_name(L.state, "blk.%d.moe_lru_state", il);
 
         ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(pctx.get(), L.buft);
@@ -205,12 +229,42 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         pool_ctxs.emplace_back(std::move(pctx));
 
         // owner = -1, slot owner = -1, last_use = 0, tick = 1, counters = 0
-        const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3;
+        const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? n_expert : 0);
         std::vector<int32_t> h(n_state, -1);
         for (int64_t i = n_expert + n_slot; i < n_expert + 2 * n_slot; i++) h[i] = 0;
         h[n_expert + 2 * n_slot] = 1;      // tick
         h[n_expert + 2 * n_slot + 1] = 0;  // cum_ids
         h[n_expert + 2 * n_slot + 2] = 0;  // cum_fills
+        if (this->exclusive) {
+            // experts 0..n_slot-1 start in the pool (slot = expert), the rest in host slots 0..n_host-1
+            int32_t * owner = h.data(), * slot_of = h.data() + n_expert, * hslot = h.data() + n_expert + 2 * n_slot + 3;
+            for (int64_t e = 0; e < n_expert; e++) {
+                owner[e] = e < n_slot ? (int32_t) e : -1;
+                hslot[e] = e < n_slot ? -1 : (int32_t) (e - n_slot);
+            }
+            for (int64_t s = 0; s < n_slot; s++) {
+                slot_of[s] = (int32_t) s;
+            }
+
+            ggml_context_ptr hctx(ggml_init({ N_KIND * ggml_tensor_overhead(), nullptr, true }));
+            for (int k = 0; k < N_KIND; k++) {
+                L.hpool[k] = ggml_new_tensor_3d(hctx.get(), exps[k]->type, exps[k]->ne[0], exps[k]->ne[1], n_host);
+                ggml_format_name(L.hpool[k], "blk.%d.moe_lru_host.%s", il, kind_name[k]);
+            }
+            ggml_backend_buffer_t hb = ggml_backend_alloc_ctx_tensors_from_buft(hctx.get(), host_buft);
+            if (!hb) {
+                throw std::runtime_error("llama_moe_lru: host pool alloc failed");
+            }
+            bufs.emplace_back(hb);
+            pool_ctxs.emplace_back(std::move(hctx));
+            for (int k = 0; k < N_KIND; k++) {
+                const size_t es = exps[k]->nb[2];
+                // the pool's slots hold the model's first n_slot experts (full layout; the meta buffer splits it per device)
+                ggml_backend_tensor_set(L.pool[k], exps[k]->data, 0, ggml_nbytes(L.pool[k]));
+                memcpy(L.hpool[k]->data, (const char *) exps[k]->data + (size_t) n_slot * es, (size_t) n_host * es);
+                L.exps[k] = L.hpool[k];   // the kernels' source: host slots instead of expert rows
+            }
+        }
         ggml_backend_tensor_set(L.state, h.data(), 0, h.size() * 4);
     }
 
@@ -219,9 +273,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         pool_bytes += ggml_backend_buffer_get_size(b.get());
     }
     LLAMA_LOG_INFO("llama_moe_lru: %d pooled layers x %d slots, %d experts, topk %lld, "
-                   "max verification batch %d, %.2f GiB\n",
+                   "max verification batch %d, %.2f GiB%s\n",
                    this->n_layers, n_slot, (int) n_expert, (long long) n_used_h, max_batch,
-                   pool_bytes / 1073741824.0);
+                   pool_bytes / 1073741824.0, this->exclusive ? " (exclusive: incl. the pinned host pool)" : "");
 }
 
 
