@@ -2391,6 +2391,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         gate_exps = upd[llama_moe_lru::KIND_GATE];
         down_exps = upd[llama_moe_lru::KIND_DOWN];
         selected_experts = slot;
+    } else if (lru != nullptr && lru->pooled(il) && n_tokens > 0 && lru->assemble()) {
+        // large batch: the pools hold the recently used experts, so build the full expert tensors on the GPU from the
+        // pools plus the missing experts from pinned host memory, instead of the scheduler uploading every expert
+        ggml_tensor * asmb[llama_moe_lru::N_KIND];
+        for (int fk = 0; fk < 3; fk++) {
+            asmb[fk] = ggml_lru_assemble(ctx0, lru->state_get(il), lru->exps_get(il, fk), lru->pool_get(il, fk));
+        }
+        up_exps   = asmb[llama_moe_lru::KIND_UP];
+        gate_exps = asmb[llama_moe_lru::KIND_GATE];
+        down_exps = asmb[llama_moe_lru::KIND_DOWN];
     }
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
