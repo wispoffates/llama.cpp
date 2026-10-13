@@ -166,6 +166,15 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
 
+// Host-weight ops (CPU-resident experts during prefill) are offloaded when every simple device would offload them
+// (buun 0d8923a77). Without this hook, -sm tensor ran every prefill MUL_MAT_ID with host experts on the CPU.
+static bool ggml_backend_meta_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
+        [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_offload_op(simple_dev, op); });
+}
+
 static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     ggml_backend_dev_t dev_buft = ggml_backend_buft_get_device(buft);
@@ -197,7 +206,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
-    /* .offload_op           = */ nullptr,
+    /* .offload_op           = */ ggml_backend_meta_device_offload_op,
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
@@ -889,6 +898,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
                 } else {
                     split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                    // A scheduler copy of a host-resident weight ("<backend>#<weight>#<n>") keeps the weight's own split, so
+                    // each device uploads and runs only its share of a host expert tensor during prefill instead of every
+                    // device uploading the full tensor (buun 893bd25ae, generalized from his expert axis to any split axis:
+                    // our tensor split slices experts -- gate/up on axis 1, down on axis 0).
+                    const char * first = strchr(tensor->name, '#');
+                    const char * last  = strrchr(tensor->name, '#');
+                    if (first != nullptr && last > first + 1 && tensor->buffer != nullptr) {
+                        ggml_tensor weight = *tensor;
+                        snprintf(weight.name, sizeof(weight.name), "%.*s", int(last - first - 1), first + 1);
+                        const ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+                        if (dev != nullptr && ggml_backend_dev_is_meta(dev)) {
+                            const auto * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+                            const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(&weight, dev_ctx->get_split_state_ud);
+                            if (ss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                                return ss; // absolute sizes from the weight, not a ratio taken over from a source
+                            }
+                        }
+                    }
                 }
             } break;
             case GGML_OP_DUP: {
