@@ -2686,7 +2686,8 @@ extern "C" {
     //   mode     [n_dev][cap]        hybrid: per device and entry, 1 = this device wrote the victim back itself (swap, chosen
     //                                when the ring backlog >= swap_backlog), 0 = left to the host; the host copies from the
     //                                model if any device left it (identical bytes), else only publishes the content
-    // The LRU state carries a per-device log counter (after the host-slot map) so every device knows the entry index.
+    //   lcount   [16]                per-device count of logged entries (the ring index; one counter per device across all
+    //                                layers -- each device's decides run in order on its stream, so only it touches its counter)
     struct ggml_lru_ctrl {
         volatile uint32_t head;   // written by the GPU
         volatile uint32_t tail;   // written by the host
@@ -2696,6 +2697,7 @@ extern "C" {
         uint32_t * done;
         int32_t  * mode;
         uint32_t swap_backlog;
+        volatile uint32_t lcount[16];
     };
 
     GGML_API struct ggml_tensor * ggml_lru_decide_ext(
