@@ -41,7 +41,7 @@ struct llama_moe_lru {
 
     // large batches assemble the experts from the pools on the GPU (LLAMA_MOE_LRU_ASSEMBLE=0: scheduler upload of every expert)
     bool assemble() const { return use_assemble; }
-    // build the next pooled layer's assembly one layer ahead (LLAMA_MOE_LRU_PREFETCH=0: off)
+    // build the next pooled layer's assembly one layer ahead (opt-in: LLAMA_MOE_LRU_PREFETCH=1)
     bool prefetch() const { return use_assemble && use_prefetch; }
 
     // per-layer and total counters at teardown (hit rates)
@@ -65,7 +65,7 @@ private:
     int n_layers = 0, n_slot = 0;
     bool exclusive = false;
     bool use_assemble = true;
-    bool use_prefetch = true;
+    bool use_prefetch = false;
     int64_t n_expert = 0;
 
     // model layer -> index into layers, -1 when not pooled
