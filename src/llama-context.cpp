@@ -2927,6 +2927,13 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     auto & st = lctx->copy_experts;
 
+    // tensor split: the ids are a (strided) meta tensor that cannot be read back here, and a partial expert range cannot be
+    // written into a meta-split copy -> let the scheduler copy the whole weight; the meta backend gives that copy the weight's
+    // split, so each GPU uploads only its slice (a large batch uses nearly every expert anyway)
+    if (lctx->model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        return false;
+    }
+
     // the ids must be computed before the split starts, so only the first node of the split is considered
     if (ggml_graph_n_nodes(graph) == 0) {
         return false;
