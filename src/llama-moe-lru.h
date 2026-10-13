@@ -6,6 +6,8 @@
 
 #include <vector>
 #include <cstdint>
+#include <atomic>
+#include <thread>
 
 struct llama_model;
 struct llama_device;
@@ -27,6 +29,14 @@ struct llama_moe_lru {
 
     // LLAMA_MOE_LRU_EXCLUSIVE=1: each expert lives either in a VRAM pool slot or in a host slot of the context (misses swap)
     static bool exclusive_requested();
+    // LLAMA_MOE_LRU_REFILL=1 (implies exclusive): a miss drops the victim; a host thread refills its host slot from the mapped
+    // model weights (no write-back from the GPU)
+    static bool refill_requested();
+
+    ~llama_moe_lru();
+    // disk refill control block shared with the backend (nullptr unless refill is active)
+    struct ggml_lru_ctrl * ctrl() const { return refill_ctrl; }
+    int pool_index(int il) const { return pooled(il) ? layer_to_pool[il] : -1; }
 
     // true if the device can run the LRU ops; capability probe instead of
     // device-type filtering, so meta devices pass through (tensor split)
@@ -58,12 +68,19 @@ private:
         ggml_tensor * pool[N_KIND] = {};   // [ne0, ne1, n_slot] in VRAM
         ggml_tensor * exps[N_KIND] = {};  // the kernels' source: expert weights in pinned host memory (exclusive: = hpool)
         ggml_tensor * hpool[N_KIND] = {}; // exclusive: [ne0, ne1, n_expert - n_slot] pinned host slots
+        ggml_tensor * mexps[N_KIND] = {}; // refill: the model's (mapped) expert tensors, the refill source
         ggml_tensor * state = nullptr;     // i32 [n_expert + 2*n_slot + 3]
                                            // (owner | slot_of | last_use | tick | cum_ids | cum_fills)
     };
 
     int n_layers = 0, n_slot = 0;
     bool exclusive = false;
+
+    // disk refill
+    struct ggml_lru_ctrl * refill_ctrl = nullptr;
+    std::thread refill_thread;
+    std::atomic<bool> refill_stop{false};
+    void refill_loop();
     bool use_assemble = true;
     bool use_prefetch = false;
     int64_t n_expert = 0;
