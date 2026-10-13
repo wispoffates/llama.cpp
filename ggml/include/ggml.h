@@ -2640,8 +2640,8 @@ extern "C" {
     // ids: i32 [n_used, n_tokens]  router top-k expert ids per token
     // returns one flat i32 tensor, laid out as [slot ids | fill list]:
     //   [0, n_used*n_tokens)             slot id per input id, valid after fill
-    //   [n_used*n_tokens, +2*n_slot)     fill list: (expert, slot) pairs
-    //   [n_used*n_tokens + 2*n_slot]     fill count this call (the position is
+    //   [n_used*n_tokens, +3*n_slot)     fill list: (expert, slot, host slot) triples (host slot = expert unless exclusive)
+    //   [n_used*n_tokens + 3*n_slot]     fill count this call (the position is
     //                                     capacity-derived so views of the two
     //                                     regions keep a fixed shape)
     GGML_API struct ggml_tensor * ggml_lru_decide(
@@ -2673,7 +2673,8 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * state,
             struct ggml_tensor  * src,
-            struct ggml_tensor  * pool);
+            struct ggml_tensor  * pool,
+            int64_t               n_expert);
 
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix
     *  without zeroes on the diagonal (i.e. invertible).
