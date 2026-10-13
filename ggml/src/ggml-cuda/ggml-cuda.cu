@@ -1509,8 +1509,8 @@ static __global__ void k_lru_decide(
                 // disk refill: tell the host which slot the victim gets. Hybrid: when the host is behind (ring backlog >=
                 // swap_backlog) this device writes the victim back itself (swap) instead of leaving it to the host
                 if (ctrl != nullptr && prev >= 0) {
-                    int32_t * lcount = state + 2 * n_expert + 2 * n_slot + 3;   // this device's log counter
-                    const uint32_t idx = (uint32_t) *lcount;
+                    volatile uint32_t * lcount = ctrl->lcount + log_dev_index;  // this device's ring index (all layers)
+                    const uint32_t idx = *lcount;
                     uint32_t tl = ctrl->tail;
                     while (idx - tl >= ctrl->cap) {         // ring full: wait for the refill thread
                         tl = ctrl->tail;
@@ -1526,7 +1526,7 @@ static __global__ void k_lru_decide(
                         ctrl->head = idx + 1;
                         __threadfence_system();
                     }
-                    *lcount = (int32_t) (idx + 1);
+                    *lcount = idx + 1;
                     if (swap) {
                         h |= 1 << 30;                      // the fill swaps this entry
                     }
