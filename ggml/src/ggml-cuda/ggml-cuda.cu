@@ -1453,6 +1453,74 @@ static __global__ void k_lru_fill_col(
     }
 }
 
+// prefill through the pools: one block row per expert of the assembled tensor. A pooled expert (owner[e] = slot) is copied
+// from the pool in device memory, a missing one is read from the pinned host tensor in place. Under a device split the
+// pool, dst and the src offsets are this device's slice (row split: src_off = first row; column split: every local row is a
+// seg_bytes column slice at src_off of a source row). vec: 16-byte copies (all strides / offsets 16-byte aligned).
+template <bool vec>
+static __global__ void k_lru_assemble(
+        const int32_t * __restrict__ owner, int n_slot,
+        const char * __restrict__ src, const char * __restrict__ pool, char * __restrict__ dst,
+        size_t src_estride, size_t estride, size_t seg_bytes, size_t n_rows, size_t src_row_stride, size_t src_off) {
+    const int e = blockIdx.y;
+    const int32_t s = owner[e];
+    char * dst_e = dst + (size_t) e * estride;
+    const bool pooled = s >= 0 && s < n_slot;
+    const char * src_e = pooled ? pool + (size_t) s * estride : src + (size_t) e * src_estride + src_off;
+    const size_t rstride = pooled ? seg_bytes : src_row_stride;   // pool slices are packed
+    if (vec) {
+        const size_t seg16 = seg_bytes / 16, total = n_rows * seg16;
+        for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+            const size_t row = i / seg16, c = i % seg16;
+            ((uint4 *) (dst_e + row * seg_bytes))[c] = ((const uint4 *) (src_e + row * rstride))[c];
+        }
+    } else {
+        const size_t total = n_rows * seg_bytes;
+        for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+            const size_t row = i / seg_bytes, b = i % seg_bytes;
+            dst_e[row * seg_bytes + b] = src_e[row * rstride + b];
+        }
+    }
+}
+
+static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * state = dst->src[0];
+    const ggml_tensor * pool  = dst->src[1];
+
+    ggml_tensor * src;
+    memcpy(&src, dst->op_params, sizeof(src));
+
+    GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(pool));
+    GGML_ASSERT(dst->nb[1] == pool->nb[1] && dst->nb[2] == pool->nb[2] && dst->ne[1] == pool->ne[1]);
+    const int n_expert = (int) dst->ne[2];
+    const int n_slot   = (int) pool->ne[2];
+
+    // same device-index rule as ggml_cuda_lru_fill: device i holds slice i of an even split
+    int dev = 0;
+    size_t seg_bytes, n_rows, src_row_stride, src_off;
+    if (pool->nb[1] != src->nb[1]) {          // column split (ne[0]): each local row is a slice of a source row
+        cudaGetDevice(&dev);
+        seg_bytes = pool->nb[1]; n_rows = pool->ne[1]; src_row_stride = src->nb[1]; src_off = (size_t) dev * pool->nb[1];
+    } else {                                  // whole rows: one contiguous run per expert
+        if (pool->ne[1] != src->ne[1]) {
+            cudaGetDevice(&dev);
+        }
+        seg_bytes = pool->nb[2]; n_rows = 1; src_row_stride = 0; src_off = (size_t) dev * pool->ne[1] * pool->nb[1];
+    }
+    const bool vec = seg_bytes % 16 == 0 && src_row_stride % 16 == 0 && src_off % 16 == 0 && src->nb[2] % 16 == 0 &&
+                     pool->nb[2] % 16 == 0 && (uintptr_t) src->data % 16 == 0;
+    const dim3 grid(32, n_expert), block(256);
+    if (vec) {
+        k_lru_assemble<true><<<grid, block, 0, ctx.stream()>>>((const int32_t *) state->data, n_slot,
+            (const char *) src->data, (const char *) pool->data, (char *) dst->data,
+            src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off);
+    } else {
+        k_lru_assemble<false><<<grid, block, 0, ctx.stream()>>>((const int32_t *) state->data, n_slot,
+            (const char *) src->data, (const char *) pool->data, (char *) dst->data,
+            src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off);
+    }
+}
+
 typedef void (*ggml_cuda_op_mul_mat_t)(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -2519,6 +2587,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LRU_FILL:
             ggml_cuda_lru_fill(ctx, dst);
+            break;
+        case GGML_OP_LRU_ASSEMBLE:
+            ggml_cuda_lru_assemble(ctx, dst);
             break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(dst)) {
@@ -5915,6 +5986,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             break;
         case GGML_OP_LRU_DECIDE:
         case GGML_OP_LRU_FILL:
+        case GGML_OP_LRU_ASSEMBLE:
             return true;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {

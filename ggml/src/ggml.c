@@ -1102,9 +1102,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "LRU_DECIDE",
     "LRU_FILL",
+    "LRU_ASSEMBLE",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1219,9 +1220,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
     "lru_decide(ids,state)",
     "pool[slot]=src[expert]",
+    "w[expert]=pool[slot]|src[expert]",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6050,6 +6052,25 @@ struct ggml_tensor * ggml_lru_fill(
     ggml_set_op_params(result, &src, sizeof(src));
     result->op     = GGML_OP_LRU_FILL;
     result->src[0] = fill_list;
+    result->src[1] = pool;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lru_assemble(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * src,
+        struct ggml_tensor  * pool) {
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+    GGML_ASSERT(src->type == pool->type && src->ne[0] == pool->ne[0] && src->ne[1] == pool->ne[1]);
+    GGML_ASSERT(ggml_nelements(state) >= src->ne[2] + 2 * pool->ne[2] + 3);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, pool->type, pool->ne[0], pool->ne[1], src->ne[2]);
+
+    ggml_set_op_params(result, &src, sizeof(src));
+    result->op     = GGML_OP_LRU_ASSEMBLE;
+    result->src[0] = state;
     result->src[1] = pool;
 
     return result;

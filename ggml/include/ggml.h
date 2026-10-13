@@ -603,6 +603,7 @@ extern "C" {
 
         GGML_OP_LRU_DECIDE,
         GGML_OP_LRU_FILL,
+        GGML_OP_LRU_ASSEMBLE,
 
         GGML_OP_COUNT,
     };
@@ -2661,6 +2662,16 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_lru_fill(
             struct ggml_context * ctx,
             struct ggml_tensor  * fill_list,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * pool);
+
+    // ggml_lru_assemble: builds the full expert tensor [ne0, ne1, n_expert] in device memory for a large batch (prefill) that
+    // does not fit the pool: experts the LRU state maps to a slot are copied from the pool, the others are read from src
+    // (device-readable host memory, captured by pointer like ggml_lru_fill). The state is only read. Under a device split
+    // the result has the pool's split, so every device assembles its own slice.
+    GGML_API struct ggml_tensor * ggml_lru_assemble(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state,
             struct ggml_tensor  * src,
             struct ggml_tensor  * pool);
 
