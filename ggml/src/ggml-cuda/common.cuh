@@ -1516,6 +1516,8 @@ struct ggml_backend_cuda_context {
     cudaEvent_t  lru_wb_event = nullptr;
     cudaEvent_t  lru_fill_event = nullptr;
     bool         lru_wb_pending = false;
+    // exclusive LRU with disk refill: last-block counter of the fill kernel (device memory, reset by the last block)
+    unsigned int * lru_counter = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

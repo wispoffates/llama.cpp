@@ -2682,6 +2682,32 @@ extern "C" {
             struct ggml_tensor  * pool,
             int64_t               n_expert);
 
+    // Exclusive LRU with disk refill: the GPU drops a miss's victim instead of writing it back; a host thread refills the
+    // victim's host slot from the (mapped) model weights. Shared through device-readable host memory:
+    //   entries  [cap][4]            ring of (layer, victim, host slot, step) logged by the decide on device 0
+    //   content  [n_layer][n_host]   expert whose bytes a host slot holds (set by the host after the copy); every reader
+    //                                of a host slot waits until it holds the expert it wants
+    //   done     [n_dev][n_layer]    fill launches finished per device and layer (+kinds per launch); the host overwrites a
+    //                                slot only after every device finished the fill of the step that freed it
+    struct ggml_lru_ctrl {
+        volatile uint32_t head;   // written by the GPU
+        volatile uint32_t tail;   // written by the host
+        uint32_t cap, n_layer, n_host, n_dev;
+        int32_t  * entries;
+        int32_t  * content;
+        uint32_t * done;
+    };
+
+    GGML_API struct ggml_tensor * ggml_lru_decide_ext(
+            struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+            int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer);
+    GGML_API struct ggml_tensor * ggml_lru_fill_ext(
+            struct ggml_context * ctx, struct ggml_tensor * fill_list, struct ggml_tensor * src, struct ggml_tensor * pool,
+            struct ggml_lru_ctrl * ctrl, int32_t layer);
+    GGML_API struct ggml_tensor * ggml_lru_assemble_ext(
+            struct ggml_context * ctx, struct ggml_tensor * state, struct ggml_tensor * src, struct ggml_tensor * pool,
+            int64_t n_expert, struct ggml_lru_ctrl * ctrl, int32_t layer);
+
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix
     *  without zeroes on the diagonal (i.e. invertible).
     *  B can have any number of columns, but must have the same number of rows as A
