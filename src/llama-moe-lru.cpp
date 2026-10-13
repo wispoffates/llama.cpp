@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <unordered_map>
 #include <stdexcept>
+#include <chrono>
+#include <atomic>
 
 bool llama_moe_lru::init_model_overrides(llama_model_loader & ml, const std::vector<llama_device> & devices,
                                      std::vector<llama_model_tensor_buft_override> & storage, int n_slot) {
@@ -76,9 +78,56 @@ bool llama_moe_lru::init_model_overrides(llama_model_loader & ml, const std::vec
     return true;
 }
 
+bool llama_moe_lru::refill_requested() {
+    const char * e = getenv("LLAMA_MOE_LRU_REFILL");
+    return e != nullptr && atoi(e) != 0;
+}
+
 bool llama_moe_lru::exclusive_requested() {
     const char * e = getenv("LLAMA_MOE_LRU_EXCLUSIVE");
-    return e != nullptr && atoi(e) != 0;
+    return (e != nullptr && atoi(e) != 0) || refill_requested();
+}
+
+llama_moe_lru::~llama_moe_lru() {
+    if (refill_thread.joinable()) {
+        refill_stop = true;
+        refill_thread.join();
+    }
+}
+
+// one entry at a time, in log order: wait until every device finished the fill of the step that freed the slot (the slot
+// still held the incoming expert until then), copy the victim from the mapped model weights, then publish the content
+void llama_moe_lru::refill_loop() {
+    ggml_lru_ctrl * c = refill_ctrl;
+    uint32_t tail = c->tail;
+    while (!refill_stop.load(std::memory_order_relaxed)) {
+        const uint32_t head = c->head;
+        if (head == tail) {
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+            continue;
+        }
+        const int32_t * en = c->entries + 4 * (size_t) (tail % c->cap);
+        const int32_t li = en[0], v = en[1], hs = en[2], step = en[3];
+        for (uint32_t d = 0; d < c->n_dev; d++) {
+            const volatile uint32_t * dn = c->done + (size_t) d * c->n_layer + li;
+            while ((int64_t) *dn < 3 * (int64_t) step) {
+                if (refill_stop.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                std::this_thread::yield();
+            }
+        }
+        const per_layer & L = layers[li];
+        for (int k = 0; k < N_KIND; k++) {
+            const size_t es = L.mexps[k]->nb[2];
+            memcpy((char *) L.hpool[k]->data + (size_t) hs * es, (const char *) L.mexps[k]->data + (size_t) v * es, es);
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        ((volatile int32_t *) c->content)[(size_t) li * c->n_host + hs] = v;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        tail++;
+        c->tail = tail;
+    }
 }
 
 bool llama_moe_lru::backend_supports(ggml_backend_dev_t dev) {
@@ -264,10 +313,48 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
                 // the pool's slots hold the model's first n_slot experts (full layout; the meta buffer splits it per device)
                 ggml_backend_tensor_set(L.pool[k], exps[k]->data, 0, ggml_nbytes(L.pool[k]));
                 memcpy(L.hpool[k]->data, (const char *) exps[k]->data + (size_t) n_slot * es, (size_t) n_host * es);
+                L.mexps[k] = exps[k];
                 L.exps[k] = L.hpool[k];   // the kernels' source: host slots instead of expert rows
             }
         }
         ggml_backend_tensor_set(L.state, h.data(), 0, h.size() * 4);
+    }
+
+    // disk refill: control block in device-readable host memory + the refill thread. The done tally needs every device that
+    // fills a layer: all GPUs under -sm tensor, or a single GPU
+    if (this->exclusive && refill_requested()) {
+        uint32_t n_dev = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            n_dev += ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
+        }
+        if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR && n_dev != 1) {
+            LLAMA_LOG_WARN("llama_moe_lru: disk refill needs -sm tensor or one GPU, using the write-back swap\n");
+        } else {
+            const uint32_t cap = 16384;
+            const size_t sz = sizeof(ggml_lru_ctrl) + 64 + (size_t) cap * 4 * sizeof(int32_t) +
+                              (size_t) n_layers * n_host * sizeof(int32_t) + (size_t) 16 * n_layers * sizeof(uint32_t);
+            ggml_backend_buffer_t cb = ggml_backend_buft_alloc_buffer(host_buft, sz);
+            if (!cb) {
+                throw std::runtime_error("llama_moe_lru: refill control block alloc failed");
+            }
+            bufs.emplace_back(cb);
+            char * base = (char *) ggml_backend_buffer_get_base(cb);
+            memset(base, 0, sz);
+            ggml_lru_ctrl * c = (ggml_lru_ctrl *) base;
+            char * p = base + ((sizeof(ggml_lru_ctrl) + 63) & ~(size_t) 63);
+            c->cap = cap; c->n_layer = (uint32_t) n_layers; c->n_host = (uint32_t) n_host; c->n_dev = n_dev;
+            c->entries = (int32_t *) p;  p += (size_t) cap * 4 * sizeof(int32_t);
+            c->content = (int32_t *) p;  p += (size_t) n_layers * n_host * sizeof(int32_t);
+            c->done    = (uint32_t *) p;
+            for (int li = 0; li < n_layers; li++) {
+                for (int64_t hs = 0; hs < n_host; hs++) {
+                    c->content[(size_t) li * n_host + hs] = (int32_t) (n_slot + hs);   // host slot hs starts with expert n_slot + hs
+                }
+            }
+            refill_ctrl = c;
+            refill_thread = std::thread([this] { refill_loop(); });
+            LLAMA_LOG_INFO("llama_moe_lru: disk refill on (%u devices, ring %u)\n", n_dev, cap);
+        }
     }
 
     size_t pool_bytes = 0;
