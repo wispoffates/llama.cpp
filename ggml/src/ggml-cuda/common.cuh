@@ -1503,6 +1503,8 @@ struct ggml_backend_cuda_context {
     cudaEvent_t  lru_events[LRU_MAX_PENDING] = {};
     const ggml_tensor * lru_pending[LRU_MAX_PENDING] = {};   // nullptr = slot free
     int n_lru_pending = 0;
+    // host mirrors of LRU states for the copy-engine assembly (ggml_cuda_lru_mirror in ggml-cuda.cu)
+    void * lru_mirror = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};

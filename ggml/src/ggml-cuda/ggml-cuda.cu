@@ -754,7 +754,23 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+// p100-series: host mirrors of the LRU states, so the host can issue copy-engine transfers for the experts a prefill assembly
+// misses. A state changes only when LRU_DECIDE runs on it (marked dirty there); a dirty mirror is re-read after one stream sync.
+struct ggml_cuda_lru_mirror {
+    struct entry { const ggml_tensor * state; std::vector<int32_t> h; bool dirty; };
+    std::vector<entry> entries;
+    entry * find(const ggml_tensor * s) {
+        for (auto & e : entries) {
+            if (e.state == s) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+};
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    delete (ggml_cuda_lru_mirror *) lru_mirror;
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         if (mmvq_q8_1_ptr[i] != nullptr) {
             ggml_cuda_set_device(i);
@@ -1594,11 +1610,14 @@ static __global__ void k_lru_assemble(
         const int32_t * __restrict__ owner, int n_slot,
         const char * __restrict__ src, const char * __restrict__ pool, char * __restrict__ dst,
         size_t src_estride, size_t estride, size_t seg_bytes, size_t n_rows, size_t src_row_stride, size_t src_off,
-        const int32_t * __restrict__ hslot) {
+        const int32_t * __restrict__ hslot, int pooled_only) {
     const int e = blockIdx.y;
     const int32_t s = owner[e];
     char * dst_e = dst + (size_t) e * estride;
     const bool pooled = s >= 0 && s < n_slot;
+    if (pooled_only && !pooled) {
+        return;                                  // the copy engine brings this one
+    }
     const size_t h = hslot ? (size_t) hslot[e] : (size_t) e;   // exclusive: the expert's host slot
     const char * src_e = pooled ? pool + (size_t) s * estride : src + h * src_estride + src_off;
     const size_t rstride = pooled ? seg_bytes : src_row_stride;   // pool slices are packed
@@ -1614,7 +1633,7 @@ static __global__ void k_lru_assemble(
     }
 }
 
-static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cudaStream_t stream = nullptr, int gx = 32) {
+static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cudaStream_t stream = nullptr, int gx = 32, int pooled_only = 0) {
     if (stream == nullptr) {
         stream = ctx.stream();
     }
@@ -1649,12 +1668,104 @@ static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor 
     if (vec) {
         k_lru_assemble<true><<<grid, block, 0, stream>>>((const int32_t *) state->data, n_slot,
             (const char *) src->data, (const char *) pool->data, (char *) dst->data,
-            src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off, hslot);
+            src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off, hslot, pooled_only);
     } else {
         k_lru_assemble<false><<<grid, block, 0, stream>>>((const int32_t *) state->data, n_slot,
             (const char *) src->data, (const char *) pool->data, (char *) dst->data,
-            src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off, hslot);
+            src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off, hslot, pooled_only);
     }
+}
+
+// p100-series: copy-engine assembly (GGML_CUDA_LRU_DMA=1). The zero-copy assembly kernel reads host memory on the SMs, so it
+// cannot overlap the matmuls (FZD); here the experts a prefill misses are moved by DMA (cudaMemcpy2DAsync per run of
+// consecutive experts) on copy_stream, and only the pooled experts are gathered by the kernel on the main stream.
+static bool ggml_cuda_lru_dma_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LRU_DMA"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+static void ggml_cuda_lru_mirror_mark_dirty(ggml_backend_cuda_context & ctx, const ggml_tensor * state) {
+    auto * m = (ggml_cuda_lru_mirror *) ctx.lru_mirror;
+    if (m != nullptr) {
+        if (auto * e = m->find(state)) {
+            e->dirty = true;
+        }
+    }
+}
+
+// the host copy of a state: missing or dirty -> one sync of the main stream, then every dirty mirror is re-read
+static const std::vector<int32_t> & ggml_cuda_lru_mirror_get(ggml_backend_cuda_context & ctx, const ggml_tensor * state) {
+    if (ctx.lru_mirror == nullptr) {
+        ctx.lru_mirror = new ggml_cuda_lru_mirror;
+    }
+    auto * m = (ggml_cuda_lru_mirror *) ctx.lru_mirror;
+    auto * me = m->find(state);
+    if (me == nullptr) {
+        m->entries.push_back({ state, std::vector<int32_t>(ggml_nelements(state)), true });
+        me = &m->entries.back();
+    }
+    if (me->dirty) {
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        for (auto & e : m->entries) {
+            if (e.dirty) {
+                CUDA_CHECK(cudaMemcpy(e.h.data(), e.state->data, ggml_nbytes(e.state), cudaMemcpyDeviceToHost));
+                e.dirty = false;
+            }
+        }
+    }
+    return me->h;
+}
+
+static void ggml_cuda_lru_assemble_dma(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cudaStream_t copy_stream) {
+    const ggml_tensor * state = dst->src[0];
+    const ggml_tensor * pool  = dst->src[1];
+    ggml_tensor * src;
+    memcpy(&src, dst->op_params, sizeof(src));
+
+    const int n_expert = (int) dst->ne[2];
+    const int n_slot   = (int) pool->ne[2];
+    const bool exclusive = ggml_nelements(state) >= 2 * (int64_t) n_expert + 2 * (int64_t) n_slot + 3;
+
+    int dev = 0;
+    size_t seg_bytes, n_rows, src_row_stride, src_off;
+    if (pool->nb[1] != src->nb[1]) {
+        cudaGetDevice(&dev);
+        seg_bytes = pool->nb[1]; n_rows = pool->ne[1]; src_row_stride = src->nb[1]; src_off = (size_t) dev * pool->nb[1];
+        GGML_ASSERT(src->nb[2] == (size_t) src->ne[1] * src->nb[1]);   // rows continue across experts
+    } else {
+        if (pool->ne[1] != src->ne[1]) {
+            cudaGetDevice(&dev);
+        }
+        seg_bytes = pool->nb[2]; n_rows = 1; src_row_stride = 0; src_off = (size_t) dev * pool->ne[1] * pool->nb[1];
+    }
+
+    const std::vector<int32_t> & m = ggml_cuda_lru_mirror_get(ctx, state);
+    const int32_t * owner = m.data();
+    const int32_t * hslot = exclusive ? m.data() + n_expert + 2 * n_slot + 3 : nullptr;
+    auto pooled = [&](int e) { return owner[e] >= 0 && owner[e] < n_slot; };
+    auto hidx   = [&](int e) { return hslot ? (int64_t) hslot[e] : (int64_t) e; };
+
+    for (int e = 0; e < n_expert; ) {
+        if (pooled(e)) {
+            e++;
+            continue;
+        }
+        const int64_t h0 = hidx(e);
+        int k = 1;
+        while (e + k < n_expert && !pooled(e + k) && hidx(e + k) == h0 + k) {
+            k++;
+        }
+        const char * s0 = (const char *) src->data + h0 * src->nb[2] + src_off;
+        char * d0 = (char *) dst->data + (size_t) e * dst->nb[2];
+        if (n_rows == 1) {
+            CUDA_CHECK(cudaMemcpy2DAsync(d0, dst->nb[2], s0, src->nb[2], seg_bytes, k, cudaMemcpyHostToDevice, copy_stream));
+        } else {
+            CUDA_CHECK(cudaMemcpy2DAsync(d0, seg_bytes, s0, src_row_stride, seg_bytes, (size_t) k * n_rows,
+                                         cudaMemcpyHostToDevice, copy_stream));
+        }
+        e += k;
+    }
+    ggml_cuda_lru_assemble(ctx, dst, ctx.stream(), 32, /*pooled_only =*/ 1);
 }
 
 typedef void (*ggml_cuda_op_mul_mat_t)(
@@ -2437,6 +2548,7 @@ static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int n_tokens = (int) ids->ne[1];
     int32_t * fill_list = (int32_t *) dst->data + (size_t) n_used * n_tokens;
     const int exclusive = ggml_nelements(state) >= 2 * (int64_t) n_expert + 2 * (int64_t) n_slot + 3;
+    ggml_cuda_lru_mirror_mark_dirty(ctx, state);
 
     k_lru_decide<<<1, WARP_SIZE, 0, ctx.stream()>>>(
         (const int32_t *) ids->data, (int32_t *) dst->data,
@@ -2527,7 +2639,11 @@ static void ggml_cuda_lru_assemble_async(ggml_backend_cuda_context & ctx, ggml_t
     }
     CUDA_CHECK(cudaEventRecord(ctx.lru_fork_event, ctx.stream()));
     CUDA_CHECK(cudaStreamWaitEvent(ctx.lru_stream, ctx.lru_fork_event, 0));
-    ggml_cuda_lru_assemble(ctx, dst, ctx.lru_stream, ggml_cuda_lru_async_gx());
+    if (ggml_cuda_lru_dma_enabled()) {
+        ggml_cuda_lru_assemble_dma(ctx, dst, ctx.lru_stream);   // missing experts by DMA on the side stream, pooled gather on main
+    } else {
+        ggml_cuda_lru_assemble(ctx, dst, ctx.lru_stream, ggml_cuda_lru_async_gx());
+    }
     CUDA_CHECK(cudaEventRecord(ctx.lru_events[slot], ctx.lru_stream));
     ctx.lru_pending[slot] = dst;
     ctx.n_lru_pending++;
@@ -2864,7 +2980,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_lru_fill(ctx, dst);
             break;
         case GGML_OP_LRU_ASSEMBLE:
-            ggml_cuda_lru_assemble(ctx, dst);
+            if (ggml_cuda_lru_dma_enabled()) {
+                ggml_cuda_lru_assemble_dma(ctx, dst, ctx.stream());
+            } else {
+                ggml_cuda_lru_assemble(ctx, dst);
+            }
             break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(dst)) {
