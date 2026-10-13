@@ -15,6 +15,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <mutex>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -187,6 +188,44 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// LLAMA_MOE_TRACE=<file> (2026-10-13, expert-cache Phase 0): when no other eval callback is set, append every MoE routing
+// decision to <file>: for each "ffn_moe_topk-<il>" (I32 [k, n_tokens]) and "ffn_moe_weights_norm-<il>" / "ffn_moe_weights-<il>"
+// (F32) tensor one record: char[4] "MOET", int32 il, int32 kind (0 = expert ids, 1 = weights), int32 ne0, int32 ne1, then the data.
+// Observing these tensors makes the scheduler split and sync at each one: slower, but the routing is unchanged.
+namespace {
+struct llama_moe_trace {
+    FILE * f = nullptr;
+    std::mutex mtx;
+    std::vector<uint8_t> buf;
+};
+static int llama_moe_trace_kind(const char * name) {
+    if (strncmp(name, "ffn_moe_topk-", 13) == 0) return 0;
+    if (strncmp(name, "ffn_moe_weights_norm-", 21) == 0) return 1;
+    return -1;
+}
+static bool llama_moe_trace_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    const int kind = llama_moe_trace_kind(t->name);
+    if (ask) {
+        return kind >= 0;
+    }
+    if (kind < 0) {
+        return true;
+    }
+    auto * tr = (llama_moe_trace *) ud;
+    const char * dash = strrchr(t->name, '-');
+    const int32_t hdr[4] = { dash ? (int32_t) atoi(dash + 1) : -1, kind, (int32_t) t->ne[0], (int32_t) t->ne[1] };
+    const size_t nb = ggml_nbytes(t);
+    std::lock_guard<std::mutex> lock(tr->mtx);
+    tr->buf.resize(nb);
+    ggml_backend_tensor_get(t, tr->buf.data(), 0, nb);
+    fwrite("MOET", 1, 4, tr->f);
+    fwrite(hdr, sizeof(int32_t), 4, tr->f);
+    fwrite(tr->buf.data(), 1, nb, tr->f);
+    fflush(tr->f);
+    return true;
+}
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -248,6 +287,20 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    if (cparams.cb_eval == nullptr) {
+        if (const char * path = getenv("LLAMA_MOE_TRACE")) {
+            static llama_moe_trace trace;   // one trace per process; every context appends to it
+            if (trace.f == nullptr) {
+                trace.f = fopen(path, "ab");
+            }
+            if (trace.f != nullptr) {
+                cparams.cb_eval           = llama_moe_trace_cb;
+                cparams.cb_eval_user_data = &trace;
+                LLAMA_LOG_WARN("%s: LLAMA_MOE_TRACE: appending MoE routing to %s\n", __func__, path);
+            }
+        }
+    }
 
     cparams.ctx_other = nullptr;
 
