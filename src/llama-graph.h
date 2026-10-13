@@ -5,7 +5,9 @@
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
+#include <array>
 #include <cstdint>
+#include <map>
 #include <cstdlib>
 #include <vector>
 #include <memory>
@@ -1066,6 +1068,10 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llama_moe_lru * lru = nullptr;
+
+    // LRU_ASSEMBLE nodes created one pooled layer ahead (build_moe_ffn of the previous layer), so the backend can assemble
+    // them on a side stream while that layer and the next attention compute: layer -> {gate, up, down}
+    mutable std::map<int, std::array<ggml_tensor *, 3>> lru_asm_ahead;
 
     llm_graph_result * res;
 
