@@ -2370,7 +2370,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * slot = ggml_view_2d(ctx0, out, n_expert_used, n_tokens,
                                           n_expert_used * sizeof(int32_t), 0);
         ggml_build_forward_expand(gf, slot);
-        ggml_tensor * flist = ggml_view_1d(ctx0, out, 2 * lru->n_slots() + 1,
+        ggml_tensor * flist = ggml_view_1d(ctx0, out, 3 * lru->n_slots() + 1,
                                            (int64_t) n_expert_used * n_tokens * sizeof(int32_t));
         ggml_tensor * upd[llama_moe_lru::N_KIND];
         for (int fk = 0; fk < 3; fk++) {
@@ -2393,7 +2393,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             lru_asm_ahead.erase(ahead);
         } else {
             for (int fk = 0; fk < 3; fk++) {
-                asmb[fk] = ggml_lru_assemble(ctx0, lru->state_get(il), lru->exps_get(il, fk), lru->pool_get(il, fk));
+                asmb[fk] = ggml_lru_assemble(ctx0, lru->state_get(il), lru->exps_get(il, fk), lru->pool_get(il, fk), hparams.n_expert);
             }
         }
         // the next pooled layer's experts do not depend on anything computed here: put their assembly into the graph now,
@@ -2407,7 +2407,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (nx < (int) hparams.n_layer() && lru_asm_ahead.find(nx) == lru_asm_ahead.end()) {
                 std::array<ggml_tensor *, 3> nxt;
                 for (int fk = 0; fk < 3; fk++) {
-                    nxt[fk] = ggml_lru_assemble(ctx0, lru->state_get(nx), lru->exps_get(nx, fk), lru->pool_get(nx, fk));
+                    nxt[fk] = ggml_lru_assemble(ctx0, lru->state_get(nx), lru->exps_get(nx, fk), lru->pool_get(nx, fk), hparams.n_expert);
                     ggml_build_forward_expand(gf, nxt[fk]);
                 }
                 lru_asm_ahead[nx] = nxt;
