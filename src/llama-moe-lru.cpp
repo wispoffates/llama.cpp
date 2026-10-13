@@ -32,6 +32,19 @@ bool llama_moe_lru::init_model_overrides(llama_model_loader & ml, const std::vec
         }
     }
     if (!pinned_buft) {
+        // -sm tensor: the model's device list holds the meta device, which has no host buffer type -> ask the registry
+        for (size_t i = 0; i < ggml_backend_dev_count() && !pinned_buft; i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_buffer_type_t host = ggml_backend_dev_host_buffer_type(dev);
+            if (host && host != ggml_backend_cpu_buffer_type()) {
+                pinned_buft = host;
+            }
+        }
+    }
+    if (!pinned_buft) {
         return false; // no GPU backend with a pinned host buffer in this build
     }
 
