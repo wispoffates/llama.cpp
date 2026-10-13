@@ -1427,6 +1427,42 @@ static __global__ void k_lru_decide(
 }
 
 
+// copy n_rows row slices of seg_bytes each (rstride apart in src, packed in dst) when the slices are not 16-byte aligned, e.g.
+// the per-device half of a Q2_0 ffn_down row (640 values = 180 B -> 90 B per device). Byte-wide reads of pinned host memory
+// become 32-byte PCIe requests (~1/4 of the bandwidth); instead every thread reads aligned 16-byte words covering the slices
+// (words with no needed byte are skipped) and scatters the needed bytes into device memory. The words stay inside the source
+// tensor's allocation: its base is 16-byte aligned and ggml pads tensor sizes.
+static __device__ __forceinline__ void lru_copy_rows_unaligned(
+        char * __restrict__ dst, const char * __restrict__ src, size_t n_rows, size_t seg, size_t rstride,
+        size_t tid, size_t nthr) {
+    if (rstride == seg) {                       // packed rows: one contiguous run
+        seg = n_rows * seg; rstride = seg; n_rows = 1;
+    }
+    const uintptr_t a0   = (uintptr_t) src & ~(uintptr_t) 15;
+    const int64_t   head = (int64_t) ((uintptr_t) src - a0);
+    const int64_t   len  = (int64_t) ((n_rows - 1) * rstride + seg);
+    const int64_t   n_w  = (head + len + 15) / 16;
+    for (int64_t w = tid; w < n_w; w += nthr) {
+        const int64_t p = 16 * w - head;        // offset of the word's first byte relative to src
+        int64_t q0 = p < 0 ? 0 : p;
+        int64_t row = q0 / (int64_t) rstride;
+        int64_t col = q0 - row * (int64_t) rstride;
+        if (col >= (int64_t) seg && col + (16 - (q0 - p)) <= (int64_t) rstride) {
+            continue;                           // the word lies in the gap between two slices
+        }
+        const uint4 v = *(const uint4 *) (a0 + 16 * w);
+        const uint8_t * b = (const uint8_t *) &v;
+        for (int i = (int) (q0 - p); i < 16; i++) {
+            const int64_t q = p + i;
+            if (q >= len) break;
+            if (col < (int64_t) seg) {
+                dst[row * seg + col] = (char) b[i];
+            }
+            if (++col == (int64_t) rstride) { col = 0; row++; }
+        }
+    }
+}
+
 // one fill descriptor: the expert slice of one pool. Row mode: n_rows = 1, seg_bytes = the slice. Column split (ne[0]): every
 // local row is a seg_bytes slice at src_off of a source row (src_row_stride apart). vec: all strides/offsets 16-byte aligned.
 struct lru_fill_desc {
@@ -1453,11 +1489,8 @@ static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_
                 ((uint4 *) (dst_e + row * d.seg_bytes))[c] = ((const uint4 *) (src_e + row * d.src_row_stride))[c];
             }
         } else {
-            const size_t total = d.n_rows * d.seg_bytes;
-            for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
-                const size_t row = i / d.seg_bytes, b = i % d.seg_bytes;
-                dst_e[row * d.seg_bytes + b] = src_e[row * d.src_row_stride + b];
-            }
+            lru_copy_rows_unaligned(dst_e, src_e, d.n_rows, d.seg_bytes, d.n_rows > 1 ? d.src_row_stride : d.seg_bytes,
+                                    blockIdx.x * (size_t) blockDim.x + threadIdx.x, (size_t) gridDim.x * blockDim.x);
         }
     }
 }
@@ -1484,11 +1517,8 @@ static __global__ void k_lru_assemble(
             ((uint4 *) (dst_e + row * seg_bytes))[c] = ((const uint4 *) (src_e + row * rstride))[c];
         }
     } else {
-        const size_t total = n_rows * seg_bytes;
-        for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
-            const size_t row = i / seg_bytes, b = i % seg_bytes;
-            dst_e[row * seg_bytes + b] = src_e[row * rstride + b];
-        }
+        lru_copy_rows_unaligned(dst_e, src_e, n_rows, seg_bytes, n_rows > 1 ? rstride : seg_bytes,
+                                blockIdx.x * (size_t) blockDim.x + threadIdx.x, (size_t) gridDim.x * blockDim.x);
     }
 }
 
