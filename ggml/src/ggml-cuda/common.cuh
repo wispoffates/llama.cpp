@@ -1504,6 +1504,16 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // p100-series: LRU_ASSEMBLE runs on a side stream (prefill copy/compute overlap); the side stream first waits for the main
+    // stream's position (the allocator may reuse memory of earlier nodes), a consumer waits for the assembly's event. Pending
+    // assemblies are drained into the main stream at the end of every graph evaluation.
+    static constexpr int LRU_MAX_PENDING = 16;
+    cudaStream_t lru_stream = nullptr;
+    cudaEvent_t  lru_fork_event = nullptr;
+    cudaEvent_t  lru_events[LRU_MAX_PENDING] = {};
+    const ggml_tensor * lru_pending[LRU_MAX_PENDING] = {};   // nullptr = slot free
+    int n_lru_pending = 0;
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
