@@ -2688,6 +2688,10 @@ extern "C" {
     //                                of a host slot waits until it holds the expert it wants
     //   done     [n_dev][n_layer]    fill launches finished per device and layer (+kinds per launch); the host overwrites a
     //                                slot only after every device finished the fill of the step that freed it
+    //   mode     [n_dev][cap]        hybrid: per device and entry, 1 = this device wrote the victim back itself (swap, chosen
+    //                                when the ring backlog >= swap_backlog), 0 = left to the host; the host copies from the
+    //                                model if any device left it (identical bytes), else only publishes the content
+    // The LRU state carries a per-device log counter (after the host-slot map) so every device knows the entry index.
     struct ggml_lru_ctrl {
         volatile uint32_t head;   // written by the GPU
         volatile uint32_t tail;   // written by the host
@@ -2695,6 +2699,8 @@ extern "C" {
         int32_t  * entries;
         int32_t  * content;
         uint32_t * done;
+        int32_t  * mode;
+        uint32_t swap_backlog;
     };
 
     GGML_API struct ggml_tensor * ggml_lru_decide_ext(
