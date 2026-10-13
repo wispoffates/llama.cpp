@@ -6040,7 +6040,7 @@ struct ggml_tensor * ggml_lru_decide(
     GGML_ASSERT(state->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_nelements(state) >= (int64_t) n_expert + 2 * n_slot + 3);
 
-    const int64_t ne[1] = { ggml_nelements(ids) + 2 * (int64_t) n_slot + 1 };
+    const int64_t ne[1] = { ggml_nelements(ids) + 3 * (int64_t) n_slot + 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 1, ne);
 
     ggml_set_op_params_i32(result, 0, n_expert);
@@ -6065,6 +6065,14 @@ struct ggml_tensor * ggml_lru_fill(
     // [slot ids (n_ids) | fill list (2*n_slot + 1)]); the backend sizes the fill grid by it
     const int64_t n_ids = fill_list->view_src ? fill_list->view_src->ne[0] - fill_list->ne[0] : 0;
     ggml_set_op_params_i32(result, 2, (int32_t) n_ids);
+    // op param 3: exclusive cache (the decide's state carries the expert -> host slot map): the fill swaps
+    const struct ggml_tensor * dec = fill_list->view_src;
+    int32_t swap = 0;
+    if (dec != NULL && dec->op == GGML_OP_LRU_DECIDE) {
+        const int64_t n_expert = ggml_get_op_params_i32(dec, 0), n_slot = ggml_get_op_params_i32(dec, 1);
+        swap = ggml_nelements(dec->src[1]) >= 2 * n_expert + 2 * n_slot + 3;
+    }
+    ggml_set_op_params_i32(result, 3, swap);
     result->op     = GGML_OP_LRU_FILL;
     result->src[0] = fill_list;
     result->src[1] = pool;
@@ -6076,12 +6084,13 @@ struct ggml_tensor * ggml_lru_assemble(
         struct ggml_context * ctx,
         struct ggml_tensor  * state,
         struct ggml_tensor  * src,
-        struct ggml_tensor  * pool) {
+        struct ggml_tensor  * pool,
+        int64_t               n_expert) {
     GGML_ASSERT(state->type == GGML_TYPE_I32);
     GGML_ASSERT(src->type == pool->type && src->ne[0] == pool->ne[0] && src->ne[1] == pool->ne[1]);
-    GGML_ASSERT(ggml_nelements(state) >= src->ne[2] + 2 * pool->ne[2] + 3);
+    GGML_ASSERT(ggml_nelements(state) >= n_expert + 2 * pool->ne[2] + 3);
 
-    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, pool->type, pool->ne[0], pool->ne[1], src->ne[2]);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, pool->type, pool->ne[0], pool->ne[1], n_expert);
 
     ggml_set_op_params(result, &src, sizeof(src));
     result->op     = GGML_OP_LRU_ASSEMBLE;
