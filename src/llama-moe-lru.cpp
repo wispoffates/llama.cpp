@@ -117,10 +117,17 @@ void llama_moe_lru::refill_loop() {
                 std::this_thread::yield();
             }
         }
-        const per_layer & L = layers[li];
-        for (int k = 0; k < N_KIND; k++) {
-            const size_t es = L.mexps[k]->nb[2];
-            memcpy((char *) L.hpool[k]->data + (size_t) hs * es, (const char *) L.mexps[k]->data + (size_t) v * es, es);
+        // hybrid: devices that swapped already wrote their slice of the victim; copy from the model if any device left it to us
+        bool any_left = false;
+        for (uint32_t d = 0; d < c->n_dev; d++) {
+            any_left |= ((volatile int32_t *) c->mode)[(size_t) d * c->cap + tail % c->cap] == 0;
+        }
+        if (any_left) {
+            const per_layer & L = layers[li];
+            for (int k = 0; k < N_KIND; k++) {
+                const size_t es = L.mexps[k]->nb[2];
+                memcpy((char *) L.hpool[k]->data + (size_t) hs * es, (const char *) L.mexps[k]->data + (size_t) v * es, es);
+            }
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         ((volatile int32_t *) c->content)[(size_t) li * c->n_host + hs] = v;
@@ -268,8 +275,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             L.pool[k] = t;
         }
         // +tick +cum_ids +cum_fills (+ exclusive: expert -> host slot)
+        // (+ refill: this device's log counter)
         L.state = ggml_new_tensor_1d(pctx.get(), GGML_TYPE_I32,
-                                     n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? n_expert : 0));
+                                     n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? n_expert + 1 : 0));
         ggml_format_name(L.state, "blk.%d.moe_lru_state", il);
 
         ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(pctx.get(), L.buft);
@@ -280,7 +288,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         pool_ctxs.emplace_back(std::move(pctx));
 
         // owner = -1, slot owner = -1, last_use = 0, tick = 1, counters = 0
-        const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? n_expert : 0);
+        const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? n_expert + 1 : 0);
         std::vector<int32_t> h(n_state, -1);
         for (int64_t i = n_expert + n_slot; i < n_expert + 2 * n_slot; i++) h[i] = 0;
         h[n_expert + 2 * n_slot] = 1;      // tick
@@ -296,6 +304,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             for (int64_t s = 0; s < n_slot; s++) {
                 slot_of[s] = (int32_t) s;
             }
+            h[2 * n_expert + 2 * n_slot + 3] = 0;   // refill log counter
 
             ggml_context_ptr hctx(ggml_init({ N_KIND * ggml_tensor_overhead(), nullptr, true }));
             for (int k = 0; k < N_KIND; k++) {
@@ -332,7 +341,8 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         } else {
             const uint32_t cap = 16384;
             const size_t sz = sizeof(ggml_lru_ctrl) + 64 + (size_t) cap * 4 * sizeof(int32_t) +
-                              (size_t) n_layers * n_host * sizeof(int32_t) + (size_t) 16 * n_layers * sizeof(uint32_t);
+                              (size_t) n_layers * n_host * sizeof(int32_t) + (size_t) 16 * n_layers * sizeof(uint32_t) +
+                              (size_t) 16 * cap * sizeof(int32_t);
             ggml_backend_buffer_t cb = ggml_backend_buft_alloc_buffer(host_buft, sz);
             if (!cb) {
                 throw std::runtime_error("llama_moe_lru: refill control block alloc failed");
@@ -345,7 +355,13 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             c->cap = cap; c->n_layer = (uint32_t) n_layers; c->n_host = (uint32_t) n_host; c->n_dev = n_dev;
             c->entries = (int32_t *) p;  p += (size_t) cap * 4 * sizeof(int32_t);
             c->content = (int32_t *) p;  p += (size_t) n_layers * n_host * sizeof(int32_t);
-            c->done    = (uint32_t *) p;
+            c->done    = (uint32_t *) p;  p += (size_t) 16 * n_layers * sizeof(uint32_t);
+            c->mode    = (int32_t *) p;
+            {
+                // hybrid: swap instead of refill while this many entries wait for the host (0 = always swap, huge = never)
+                const char * eb = getenv("LLAMA_MOE_LRU_REFILL_BACKLOG");
+                c->swap_backlog = eb ? (uint32_t) atoi(eb) : 16u;
+            }
             for (int li = 0; li < n_layers; li++) {
                 for (int64_t hs = 0; hs < n_host; hs++) {
                     c->content[(size_t) li * n_host + hs] = (int32_t) (n_slot + hs);   // host slot hs starts with expert n_slot + hs
@@ -353,7 +369,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             }
             refill_ctrl = c;
             refill_thread = std::thread([this] { refill_loop(); });
-            LLAMA_LOG_INFO("llama_moe_lru: disk refill on (%u devices, ring %u)\n", n_dev, cap);
+            LLAMA_LOG_INFO("llama_moe_lru: disk refill on (%u devices, ring %u, swap when backlog >= %u)\n", n_dev, cap, c->swap_backlog);
         }
     }
 
