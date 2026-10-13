@@ -149,6 +149,8 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     {
         const char * env = getenv("LLAMA_MOE_LRU_ASSEMBLE");
         use_assemble = env == nullptr || atoi(env) != 0;
+        const char * envp = getenv("LLAMA_MOE_LRU_PREFETCH");
+        use_prefetch = envp == nullptr || atoi(envp) != 0;
     }
     this->n_slot = n_slot;
     this->n_expert = n_expert;
