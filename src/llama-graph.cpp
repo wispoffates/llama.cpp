@@ -2409,8 +2409,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // large batch: the pools hold the recently used experts, so build the full expert tensors on the GPU from the
         // pools plus the missing experts from pinned host memory, instead of the scheduler uploading every expert
         ggml_tensor * asmb[llama_moe_lru::N_KIND];
-        for (int fk = 0; fk < 3; fk++) {
-            asmb[fk] = ggml_lru_assemble(ctx0, lru->state_get(il), lru->exps_get(il, fk), lru->pool_get(il, fk));
+        auto ahead = lru_asm_ahead.find(il);
+        if (ahead != lru_asm_ahead.end()) {
+            for (int fk = 0; fk < 3; fk++) {
+                asmb[fk] = ahead->second[fk];
+            }
+            lru_asm_ahead.erase(ahead);
+        } else {
+            for (int fk = 0; fk < 3; fk++) {
+                asmb[fk] = ggml_lru_assemble(ctx0, lru->state_get(il), lru->exps_get(il, fk), lru->pool_get(il, fk));
+            }
+        }
+        // the next pooled layer's experts do not depend on anything computed here: put their assembly into the graph now,
+        // before this layer's expert matmuls, so the backend can run it on a side stream during this layer's MoE and the
+        // next layer's attention (one extra layer of assembled experts stays live)
+        if (lru->prefetch()) {
+            int nx = il + 1;
+            while (nx < (int) hparams.n_layer() && !lru->pooled(nx)) {
+                nx++;
+            }
+            if (nx < (int) hparams.n_layer() && lru_asm_ahead.find(nx) == lru_asm_ahead.end()) {
+                std::array<ggml_tensor *, 3> nxt;
+                for (int fk = 0; fk < 3; fk++) {
+                    nxt[fk] = ggml_lru_assemble(ctx0, lru->state_get(nx), lru->exps_get(nx, fk), lru->pool_get(nx, fk));
+                    ggml_build_forward_expand(gf, nxt[fk]);
+                }
+                lru_asm_ahead[nx] = nxt;
+            }
         }
         up_exps   = asmb[llama_moe_lru::KIND_UP];
         gate_exps = asmb[llama_moe_lru::KIND_GATE];
