@@ -723,6 +723,17 @@ struct ggml_cuda_lru_mirror {
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     delete (ggml_cuda_lru_mirror *) lru_mirror;
+    if (lru_wb_stream != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamSynchronize(lru_wb_stream));
+        CUDA_CHECK(cudaStreamDestroy(lru_wb_stream));
+        CUDA_CHECK(cudaEventDestroy(lru_wb_event));
+        CUDA_CHECK(cudaEventDestroy(lru_fill_event));
+    }
+    if (lru_staging != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(lru_staging));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         if (mmvq_q8_1_ptr[i] != nullptr) {
             ggml_cuda_set_device(i);
@@ -1579,9 +1590,19 @@ static __global__ void k_lru_assemble(
     }
 }
 
+// exclusive LRU: a stream about to read host slots waits until the pending victim write-back has landed
+static void ggml_cuda_lru_wb_wait(ggml_backend_cuda_context & ctx, cudaStream_t stream) {
+    if (ctx.lru_wb_pending) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.lru_wb_event, 0));
+    }
+}
+
 static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cudaStream_t stream = nullptr, int gx = 32, int pooled_only = 0) {
     if (stream == nullptr) {
         stream = ctx.stream();
+    }
+    if (!pooled_only) {
+        ggml_cuda_lru_wb_wait(ctx, stream);
     }
     const ggml_tensor * state = dst->src[0];
     const ggml_tensor * pool  = dst->src[1];
@@ -1686,6 +1707,7 @@ static void ggml_cuda_lru_assemble_dma(ggml_backend_cuda_context & ctx, ggml_ten
     }
 
     const std::vector<int32_t> & m = ggml_cuda_lru_mirror_get(ctx, state);
+    ggml_cuda_lru_wb_wait(ctx, copy_stream);
     const int32_t * owner = m.data();
     const int32_t * hslot = exclusive ? m.data() + n_expert + 2 * n_slot + 3 : nullptr;
     auto pooled = [&](int e) { return owner[e] >= 0 && owner[e] < n_slot; };
@@ -2472,6 +2494,52 @@ static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {
     return d;
 }
 
+// exclusive LRU, staged write-back: save each fill's victim (pool slot, this device's slice) to staging[k][j] (device memory),
+// before the fill overwrites the slot ...
+static __global__ void k_lru_save_victims(const int32_t * __restrict__ fill_list, int n_slot, const lru_fill_descs descs,
+                                          char * __restrict__ staging, const size_t koff0, const size_t koff1, const size_t koff2) {
+    const lru_fill_desc & d = descs.d[blockIdx.z];
+    const size_t koff = blockIdx.z == 0 ? koff0 : blockIdx.z == 1 ? koff1 : koff2;
+    const int n_fill = fill_list[3 * n_slot];
+    for (int j = blockIdx.y; j < n_fill; j += gridDim.y) {
+        const int32_t s = fill_list[3 * j + 1];
+        const uint4 * ps = (const uint4 *) (d.pool + (size_t) s * d.estride);
+        uint4 * pd = (uint4 *) (staging + koff + (size_t) j * d.estride);
+        for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < d.estride / 16; i += (size_t) gridDim.x * blockDim.x) {
+            pd[i] = ps[i];
+        }
+    }
+}
+
+// ... and write them to their host slots on a side stream while the matmuls run (each device writes its own slice bytes)
+static __global__ void k_lru_write_back(const int32_t * __restrict__ fill_list, int n_slot, const lru_fill_descs descs,
+                                        const char * __restrict__ staging, const size_t koff0, const size_t koff1, const size_t koff2) {
+    const lru_fill_desc & d = descs.d[blockIdx.z];
+    const size_t koff = blockIdx.z == 0 ? koff0 : blockIdx.z == 1 ? koff1 : koff2;
+    const int n_fill = fill_list[3 * n_slot];
+    for (int j = blockIdx.y; j < n_fill; j += gridDim.y) {
+        const int32_t h = fill_list[3 * j + 2];
+        const char * st = staging + koff + (size_t) j * d.estride;
+        char * hd = d.src + (size_t) h * d.src_estride + d.src_off;
+        const size_t rs = d.n_rows > 1 ? d.src_row_stride : d.seg_bytes;
+        if (d.vec) {
+            const size_t seg16 = d.seg_bytes / 16, total = d.n_rows * seg16;
+            for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+                const size_t row = i / seg16, c = i % seg16;
+                ((uint4 *) (hd + row * rs))[c] = ((const uint4 *) (st + row * d.seg_bytes))[c];
+            }
+        } else {
+            const size_t total = d.n_rows * d.seg_bytes;
+            for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
+                const size_t row = i / d.seg_bytes, b = i % d.seg_bytes;
+                hd[row * rs + b] = st[row * d.seg_bytes + b];
+            }
+        }
+    }
+}
+
+static constexpr int LRU_STAGING_FILLS = 32;   // fills per call the staging buffer holds; more -> in-place swap
+
 // fills nodes[0..n) share one fill list (the gate/up/down fills of a layer): one launch
 static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n) {
     const ggml_tensor * fill_list = nodes[0]->src[0];
@@ -2483,7 +2551,53 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
         descs.d[k] = ggml_cuda_lru_fill_desc(nodes[k]);
     }
     const dim3 grid(64, rows, n), block(256);
-    k_lru_fill<<<grid, block, 0, ctx.stream()>>>((const int32_t *) fill_list->data, n_slot, descs);
+    const int32_t * fl = (const int32_t *) fill_list->data;
+
+    // exclusive: staged write-back (GGML_CUDA_LRU_STAGED=0: in-place swap inside the fill)
+    static const bool staged_on = [] { const char * e = getenv("GGML_CUDA_LRU_STAGED"); return e == nullptr || atoi(e) != 0; }();
+    bool staged = staged_on && descs.d[0].swap && rows <= LRU_STAGING_FILLS;
+    for (int k = 0; k < n && staged; k++) {
+        staged = descs.d[k].estride % 16 == 0;
+    }
+    if (!staged) {
+        ggml_cuda_lru_wb_wait(ctx, ctx.stream());
+        k_lru_fill<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, descs);
+        return;
+    }
+    size_t koff[3] = { 0, 0, 0 }, need = 0;
+    for (int k = 0; k < n; k++) {
+        koff[k] = need;
+        need += (size_t) LRU_STAGING_FILLS * descs.d[k].estride;
+    }
+    if (ctx.lru_wb_stream == nullptr) {
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx.lru_wb_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_wb_event, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_fill_event, cudaEventDisableTiming));
+    }
+    if (need > ctx.lru_staging_size) {
+        if (ctx.lru_staging != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.lru_wb_stream));
+            CUDA_CHECK(cudaFree(ctx.lru_staging));
+        }
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaMalloc(&ctx.lru_staging, need));
+        ctx.lru_staging_size = need;
+    }
+    // the staging buffer and the host slots of the previous write-back must be free
+    ggml_cuda_lru_wb_wait(ctx, ctx.stream());
+    k_lru_save_victims<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, descs, (char *) ctx.lru_staging, koff[0], koff[1], koff[2]);
+    lru_fill_descs plain = descs;
+    for (int k = 0; k < n; k++) {
+        plain.d[k].swap = 0;
+    }
+    k_lru_fill<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, plain);
+    CUDA_CHECK(cudaEventRecord(ctx.lru_fill_event, ctx.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.lru_wb_stream, ctx.lru_fill_event, 0));
+    const dim3 grid_wb(8, rows, n);
+    k_lru_write_back<<<grid_wb, block, 0, ctx.lru_wb_stream>>>(fl, n_slot, descs, (const char *) ctx.lru_staging, koff[0], koff[1], koff[2]);
+    CUDA_CHECK(cudaEventRecord(ctx.lru_wb_event, ctx.lru_wb_stream));
+    ctx.lru_wb_pending = true;
 }
 
 static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -3232,6 +3346,10 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_lru_drain(*cuda_ctx);
+    if (cuda_ctx->lru_wb_pending) {
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->lru_wb_event, 0));
+        cuda_ctx->lru_wb_pending = false;
+    }
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
