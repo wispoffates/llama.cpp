@@ -1505,6 +1505,14 @@ struct ggml_backend_cuda_context {
     int n_lru_pending = 0;
     // host mirrors of LRU states for the copy-engine assembly (ggml_cuda_lru_mirror in ggml-cuda.cu)
     void * lru_mirror = nullptr;
+    // exclusive LRU: a fill saves its victims to a VRAM staging buffer, a side-stream kernel writes them back to the host slots
+    // while the matmuls run; the next fill (and any host-slot reader) waits for lru_wb_event
+    void *       lru_staging = nullptr;
+    size_t       lru_staging_size = 0;
+    cudaStream_t lru_wb_stream = nullptr;
+    cudaEvent_t  lru_wb_event = nullptr;
+    cudaEvent_t  lru_fill_event = nullptr;
+    bool         lru_wb_pending = false;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
