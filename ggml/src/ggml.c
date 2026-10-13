@@ -6089,6 +6089,38 @@ struct ggml_tensor * ggml_lru_assemble(
     return result;
 }
 
+// op params: decide [0] n_expert [1] n_slot [2..3] ctrl [4] layer; fill [0..1] src [2] n_ids [3] swap [4..5] ctrl [6] layer;
+// assemble [0..1] src [2..3] ctrl [4] layer
+struct ggml_tensor * ggml_lru_decide_ext(
+        struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+        int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer) {
+    struct ggml_tensor * r = ggml_lru_decide(ctx, ids, state, n_expert, n_slot);
+    memcpy((char *) r->op_params + 8, &ctrl, sizeof(ctrl));
+    ggml_set_op_params_i32(r, 4, layer);
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_fill_ext(
+        struct ggml_context * ctx, struct ggml_tensor * fill_list, struct ggml_tensor * src, struct ggml_tensor * pool,
+        struct ggml_lru_ctrl * ctrl, int32_t layer) {
+    struct ggml_tensor * r = ggml_lru_fill(ctx, fill_list, src, pool);
+    if (ctrl != NULL) {
+        ggml_set_op_params_i32(r, 3, 0);   // refill: no write-back
+    }
+    memcpy((char *) r->op_params + 16, &ctrl, sizeof(ctrl));
+    ggml_set_op_params_i32(r, 6, layer);
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_assemble_ext(
+        struct ggml_context * ctx, struct ggml_tensor * state, struct ggml_tensor * src, struct ggml_tensor * pool,
+        int64_t n_expert, struct ggml_lru_ctrl * ctrl, int32_t layer) {
+    struct ggml_tensor * r = ggml_lru_assemble(ctx, state, src, pool, n_expert);
+    memcpy((char *) r->op_params + 8, &ctrl, sizeof(ctrl));
+    ggml_set_op_params_i32(r, 4, layer);
+    return r;
+}
+
 // ggml_unary
 
 static struct ggml_tensor * ggml_unary_impl(
