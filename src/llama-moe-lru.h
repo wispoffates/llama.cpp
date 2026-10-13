@@ -25,6 +25,9 @@ struct llama_moe_lru {
     static bool init_model_overrides(struct llama_model_loader & ml, const std::vector<llama_device> & devices,
                                      std::vector<llama_model_tensor_buft_override> & storage, int n_slot);
 
+    // LLAMA_MOE_LRU_EXCLUSIVE=1: each expert lives either in a VRAM pool slot or in a host slot of the context (misses swap)
+    static bool exclusive_requested();
+
     // true if the device can run the LRU ops; capability probe instead of
     // device-type filtering, so meta devices pass through (tensor split)
     static bool backend_supports(ggml_backend_dev_t dev);
@@ -53,12 +56,14 @@ private:
     struct per_layer {
         ggml_backend_buffer_type_t buft = nullptr; // this layer's device buft
         ggml_tensor * pool[N_KIND] = {};   // [ne0, ne1, n_slot] in VRAM
-        ggml_tensor * exps[N_KIND] = {};  // the expert weights in pinned host memory
+        ggml_tensor * exps[N_KIND] = {};  // the kernels' source: expert weights in pinned host memory (exclusive: = hpool)
+        ggml_tensor * hpool[N_KIND] = {}; // exclusive: [ne0, ne1, n_expert - n_slot] pinned host slots
         ggml_tensor * state = nullptr;     // i32 [n_expert + 2*n_slot + 3]
                                            // (owner | slot_of | last_use | tick | cum_ids | cum_fills)
     };
 
     int n_layers = 0, n_slot = 0;
+    bool exclusive = false;
     bool use_assemble = true;
     bool use_prefetch = true;
     int64_t n_expert = 0;
