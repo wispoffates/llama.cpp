@@ -6064,6 +6064,10 @@ struct ggml_tensor * ggml_lru_fill(
     struct ggml_tensor * result = ggml_view_tensor(ctx, pool);
 
     ggml_set_op_params(result, &src, sizeof(src));
+    // op param 2: the decide's id count = an upper bound on the fills (fill_list is a view of the decide output
+    // [slot ids (n_ids) | fill list (2*n_slot + 1)]); the backend sizes the fill grid by it
+    const int64_t n_ids = fill_list->view_src ? fill_list->view_src->ne[0] - fill_list->ne[0] : 0;
+    ggml_set_op_params_i32(result, 2, (int32_t) n_ids);
     result->op     = GGML_OP_LRU_FILL;
     result->src[0] = fill_list;
     result->src[1] = pool;
