@@ -785,6 +785,15 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (lru_stream != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamSynchronize(lru_stream));
+        CUDA_CHECK(cudaStreamDestroy(lru_stream));
+        CUDA_CHECK(cudaEventDestroy(lru_fork_event));
+        for (int i = 0; i < LRU_MAX_PENDING; ++i) {
+            CUDA_CHECK(cudaEventDestroy(lru_events[i]));
+        }
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -1592,7 +1601,10 @@ static __global__ void k_lru_assemble(
     }
 }
 
-static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cudaStream_t stream = nullptr, int gx = 32) {
+    if (stream == nullptr) {
+        stream = ctx.stream();
+    }
     const ggml_tensor * state = dst->src[0];
     const ggml_tensor * pool  = dst->src[1];
 
@@ -1618,13 +1630,13 @@ static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor 
     }
     const bool vec = seg_bytes % 16 == 0 && src_row_stride % 16 == 0 && src_off % 16 == 0 && src->nb[2] % 16 == 0 &&
                      pool->nb[2] % 16 == 0 && (uintptr_t) src->data % 16 == 0;
-    const dim3 grid(32, n_expert), block(256);
+    const dim3 grid(gx, n_expert), block(256);
     if (vec) {
-        k_lru_assemble<true><<<grid, block, 0, ctx.stream()>>>((const int32_t *) state->data, n_slot,
+        k_lru_assemble<true><<<grid, block, 0, stream>>>((const int32_t *) state->data, n_slot,
             (const char *) src->data, (const char *) pool->data, (char *) dst->data,
             src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off);
     } else {
-        k_lru_assemble<false><<<grid, block, 0, ctx.stream()>>>((const int32_t *) state->data, n_slot,
+        k_lru_assemble<false><<<grid, block, 0, stream>>>((const int32_t *) state->data, n_slot,
             (const char *) src->data, (const char *) pool->data, (char *) dst->data,
             src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off);
     }
@@ -2405,6 +2417,81 @@ static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_cuda_lru_fill_n(ctx, &dst, 1);
 }
 
+// p100-series: prefill copy/compute overlap for LRU_ASSEMBLE (GGML_CUDA_LRU_ASYNC=0: on the main stream). The side stream gets
+// a narrow grid (GGML_CUDA_LRU_ASYNC_GX, default 4 blocks per expert): zero-copy reads need only a few warps in flight to fill
+// PCIe, and every SM the assembly takes is one the overlapped compute does not get.
+static bool ggml_cuda_lru_async_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LRU_ASYNC"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+static int ggml_cuda_lru_async_gx() {
+    static const int gx = [] { const char * e = getenv("GGML_CUDA_LRU_ASYNC_GX"); return e ? std::max(1, atoi(e)) : 4; }();
+    return gx;
+}
+
+static void ggml_cuda_lru_assemble_async(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &cap));
+    int slot = -1;
+    for (int k = 0; k < ggml_backend_cuda_context::LRU_MAX_PENDING && cap == cudaStreamCaptureStatusNone; ++k) {
+        if (ctx.lru_pending[k] == nullptr) {
+            slot = k;
+            break;
+        }
+    }
+    if (slot < 0) {                      // capturing a CUDA graph, or too many in flight: in order on the main stream
+        ggml_cuda_lru_assemble(ctx, dst);
+        return;
+    }
+    if (ctx.lru_stream == nullptr) {
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&ctx.lru_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_fork_event, cudaEventDisableTiming));
+        for (int k = 0; k < ggml_backend_cuda_context::LRU_MAX_PENDING; ++k) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_events[k], cudaEventDisableTiming));
+        }
+    }
+    CUDA_CHECK(cudaEventRecord(ctx.lru_fork_event, ctx.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.lru_stream, ctx.lru_fork_event, 0));
+    ggml_cuda_lru_assemble(ctx, dst, ctx.lru_stream, ggml_cuda_lru_async_gx());
+    CUDA_CHECK(cudaEventRecord(ctx.lru_events[slot], ctx.lru_stream));
+    ctx.lru_pending[slot] = dst;
+    ctx.n_lru_pending++;
+}
+
+// before computing node i (and the nodes a fusion may take with it): wait for any pending assembly they read
+static void ggml_cuda_lru_wait_srcs(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const int last = std::min(cgraph->n_nodes, i + 8);
+    for (int n = i; n < last && ctx.n_lru_pending > 0; ++n) {
+        const ggml_tensor * node = cgraph->nodes[n];
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = node->src[j];
+            if (src == nullptr) {
+                continue;
+            }
+            for (int k = 0; k < ggml_backend_cuda_context::LRU_MAX_PENDING; ++k) {
+                const ggml_tensor * p = ctx.lru_pending[k];
+                if (p != nullptr && (src == p || src->view_src == p)) {
+                    CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ctx.lru_events[k], 0));
+                    ctx.lru_pending[k] = nullptr;
+                    ctx.n_lru_pending--;
+                }
+            }
+        }
+    }
+}
+
+static void ggml_cuda_lru_drain(ggml_backend_cuda_context & ctx) {
+    for (int k = 0; k < ggml_backend_cuda_context::LRU_MAX_PENDING && ctx.n_lru_pending > 0; ++k) {
+        if (ctx.lru_pending[k] != nullptr) {
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(ctx.device, 0), ctx.lru_events[k], 0));
+            ctx.lru_pending[k] = nullptr;
+            ctx.n_lru_pending--;
+        }
+    }
+}
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -3064,6 +3151,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_lru_drain(*cuda_ctx);
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
     GGML_UNUSED(backend);
@@ -5315,6 +5403,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                 }
 
+                if (cuda_ctx->n_lru_pending > 0) {
+                    ggml_cuda_lru_wait_srcs(*cuda_ctx, cgraph, i);
+                }
+                if (node->op == GGML_OP_LRU_ASSEMBLE && ggml_cuda_lru_async_enabled()) {
+                    ggml_cuda_lru_assemble_async(*cuda_ctx, node);
+                    continue;
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip < 0) {   // p100-series: the fusion handled node i only (and deferred a later node)
@@ -5367,6 +5463,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+            // pending LRU assemblies are NOT drained here: the meta backend computes one device graph in several calls (one
+            // per AllReduce step), and a prefetched assembly is consumed a few calls later (its reader waits for it)
         }
 
 #ifdef USE_CUDA_GRAPH
