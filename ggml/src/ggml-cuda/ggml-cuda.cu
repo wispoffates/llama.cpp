@@ -1823,7 +1823,7 @@ static void ggml_cuda_lru_assemble_dma(ggml_backend_cuda_context & ctx, ggml_ten
         st_ns += ns; st_copies += n_copies; st_bytes += n_bytes;
         const int64_t c = ++st_calls;
         if (c % 2000 == 0) {
-            GGML_LOG_INFO("lru dma stats: %lld assemblies, %lld copies (%.1f per assembly), %.2f GB, issue time %.2f s (%.1f us per copy)\n",
+            fprintf(stderr, "lru dma stats: %lld assemblies, %lld copies (%.1f per assembly), %.2f GB, issue time %.2f s (%.1f us per copy)\n",
                 (long long) c, (long long) st_copies.load(), (double) st_copies.load() / c, st_bytes.load() / 1e9, st_ns.load() / 1e9,
                 st_ns.load() / 1e3 / std::max<int64_t>(1, st_copies.load()));
         }
