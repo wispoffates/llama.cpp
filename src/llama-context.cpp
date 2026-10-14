@@ -671,6 +671,9 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (ple_warm.joinable()) {
+        ple_warm.join();
+    }
     if (lru) {
         lru->log_final_stats();
     }
@@ -1947,6 +1950,63 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// LPW/LP4/SC: in a long Flash-Next prefill the CPU gathered each ubatch's n-gram embedding rows from the mmapped 28 GB table
+// at the start of the graph (ggml_get_rows on a host buffer, ~n_heads random 90-byte rows per token), faulting pages in while
+// both GPUs waited (~1.25 s per 4096-token ubatch; the per-ubatch MADV_WILLNEED came too late). The rows depend only on the
+// token ids, so for a multi-ubatch batch a background thread computes them for every token after the first ubatch (the
+// n-gram window inside the batch; predecessors before it read as EOS -- only a prefetch, a wrong row stays cold) and touches
+// their pages ahead of the compute. Same hashing as llm_graph_input_qwen4exp_ple::set_input.
+void llama_context::ple_prewarm(const llama_batch_ext & batch) {
+    static const bool on = [] { const char * e = getenv("LLAMA_PLE_PREWARM"); return e == nullptr || atoi(e) != 0; }();
+    const ggml_tensor * ple = model.per_layer_tok_embd;
+    if (!on || ple == nullptr || ple->data == nullptr || !model.can_prefetch.count(ple) || batch.tokens.size() <= cparams.n_ubatch) {
+        return;
+    }
+    if (ple_warm.joinable()) {
+        ple_warm.join();
+    }
+    const auto & hp = model.hparams;
+    std::vector<llama_token> toks;
+    toks.reserve(batch.tokens.size());
+    for (const auto & t : batch.tokens) {
+        toks.push_back(t.id);
+    }
+    const size_t first = cparams.n_ubatch;
+    ple_warm = std::thread([toks = std::move(toks), ple, &hp, first]() {
+        const int64_t n_gram = hp.ple_ngram_size, per_gram = hp.ple_heads_per_ngram;
+        const int64_t eos = hp.ple_eos_token_id;
+        const char * base = (const char *) ple->data;
+        const size_t nb1 = ple->nb[1];
+        std::vector<int64_t> ctx(n_gram);
+        volatile char sink = 0;
+        for (size_t i = first; i < toks.size(); ++i) {
+            ctx[0] = toks[i] >= 0 ? toks[i] : eos;
+            bool cut = false;
+            for (int64_t s = 1; s < n_gram; ++s) {
+                const int64_t j = (int64_t) i - s;
+                const llama_token t = (cut || j < 0) ? LLAMA_TOKEN_NULL : toks[j];
+                cut = cut || t < 0 || t == eos;
+                ctx[s] = cut ? eos : t;
+            }
+            for (int64_t n = 2; n <= n_gram; ++n) {
+                uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+                for (int64_t j = 1; j < n; ++j) {
+                    mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+                }
+                const int64_t b0 = (n - 2) * per_gram;
+                for (int64_t g = 0; g < per_gram; ++g) {
+                    const int64_t h = b0 + g;
+                    const int64_t row = (int64_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
+                    if (row >= 0 && row < ple->ne[1]) {
+                        sink = sink ^ base[(size_t) row * nb1];   // fault the page in
+                    }
+                }
+            }
+        }
+        (void) sink;
+    });
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1957,6 +2017,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    ple_prewarm(batch_inp);
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
