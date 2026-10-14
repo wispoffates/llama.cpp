@@ -757,15 +757,21 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                 }
             }
 
-            // p100-series: a zero weight (masked key) adds nothing -- skip, so 0 * V(NaN) cannot leak (warp-uniform: one key per warp)
+            // p100-series: a key whose weights are 0 for all of this warp's columns (masked, e.g. another sequence's cells in a unified
+            // KV cache) adds nothing -- skip its FMAs so 0 * V(NaN) cannot leak. Warp-uniform (one key per warp); the FMA loop keeps its
+            // original shape (R21C: reordering it changed fast-math rounding and the outputs).
+            bool KQ_any = false;
 #pragma unroll
             for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                if ((__half_as_ushort(__low2half(KQ_k[jc_VKQ_0])) & 0x7FFF) == 0) {
-                    continue;
-                }
+                KQ_any = KQ_any || (__half_as_ushort(__low2half(KQ_k[jc_VKQ_0])) & 0x7FFF) != 0;
+            }
+            if (KQ_any) {
 #pragma unroll
                 for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                    VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+#pragma unroll
+                    for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                    }
                 }
             }
         }
@@ -788,16 +794,20 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                     &KQ_k[jc_VKQ_0], KQ + jc_KQ*(nbatch_fa*KQ_cs) + (k0 + k1 + threadIdx.y % np)*KQ_cs);
             }
 
-            // p100-series: skip zero weights (masked keys), see the fp16 path
+            // p100-series: skip keys with zero weight for all of this warp's columns, see the fp16 path
+            bool KQ_any = false;
 #pragma unroll
             for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
-                if (KQ_k[jc_VKQ_0] == 0.0f) {
-                    continue;
-                }
+                KQ_any = KQ_any || KQ_k[jc_VKQ_0] != 0.0f;
+            }
+            if (KQ_any) {
 #pragma unroll
                 for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                    VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x += V_k[i0/warp_size].x*KQ_k[jc_VKQ_0];
-                    VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y += V_k[i0/warp_size].y*KQ_k[jc_VKQ_0];
+#pragma unroll
+                    for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].x += V_k[i0/warp_size].x*KQ_k[jc_VKQ_0];
+                        VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size].y += V_k[i0/warp_size].y*KQ_k[jc_VKQ_0];
+                    }
                 }
             }
         }
