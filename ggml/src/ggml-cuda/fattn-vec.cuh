@@ -278,7 +278,9 @@ static __global__ void flash_attn_ext_vec(
                 }
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                    // p100-series: NaN-safe masking (masked keys must not leak non-finite cached K, see fattn_masked_add)
+                    const float m = __half2float(maskh[j*ne11 + i_KQ]);
+                    sum = m == -INFINITY ? -INFINITY : sum + slope*m;
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -365,6 +367,9 @@ static __global__ void flash_attn_ext_vec(
                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
+                    // p100-series: a non-finite cached V counts as 0 (0 * NaN of a masked key spoiled the row)
+                    tmp[i_VKQ_1].x = isfinite(tmp[i_VKQ_1].x) ? tmp[i_VKQ_1].x : 0.0f;
+                    tmp[i_VKQ_1].y = isfinite(tmp[i_VKQ_1].y) ? tmp[i_VKQ_1].y : 0.0f;
 #pragma unroll
                     for (int j = 0; j < ncols; ++j) {
                         VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1].x += tmp[i_VKQ_1].x*KQ_k[j];
