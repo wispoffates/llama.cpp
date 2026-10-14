@@ -38,6 +38,14 @@ struct llama_moe_lru {
     struct ggml_lru_ctrl * ctrl() const { return refill_ctrl; }
     int pool_index(int il) const { return pooled(il) ? layer_to_pool[il] : -1; }
 
+    // lookahead: router tensors of a pooled layer (predict its experts from the previous layer's input)
+    ggml_tensor * router_get(int il, int which) const { GGML_ASSERT(pooled(il)); return layers[layer_to_pool[il]].router[which]; }
+    // the next pooled layer after il, or -1
+    int next_pooled(int il) const {
+        for (int nx = il + 1; nx < (int) layer_to_pool.size(); nx++) { if (pooled(nx)) return nx; }
+        return -1;
+    }
+
     // true if the device can run the LRU ops; capability probe instead of
     // device-type filtering, so meta devices pass through (tensor split)
     static bool backend_supports(ggml_backend_dev_t dev);
@@ -69,6 +77,7 @@ private:
         ggml_tensor * exps[N_KIND] = {};  // the kernels' source: expert weights in pinned host memory (exclusive: = hpool)
         ggml_tensor * hpool[N_KIND] = {}; // exclusive: [ne0, ne1, n_expert - n_slot] pinned host slots
         ggml_tensor * mexps[N_KIND] = {}; // refill: the model's (mapped) expert tensors, the refill source
+        ggml_tensor * router[3] = {};     // ffn_gate_inp, ffn_gate_inp_b, ffn_exp_probs_b
         ggml_tensor * state = nullptr;     // i32 [n_expert + 2*n_slot + 3]
                                            // (owner | slot_of | last_use | tick | cum_ids | cum_fills)
     };
