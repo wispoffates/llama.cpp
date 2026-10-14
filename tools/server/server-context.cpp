@@ -4224,6 +4224,15 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // p100-series: request the whole remaining prompt's lazily read rows now (n-gram context from n_past - 2)
+                        {
+                            const llama_tokens & all = slot.task->tokens.get_tokens();
+                            const int32_t from = std::max(0, n_past - 2);
+                            if ((int32_t) all.size() > n_past) {
+                                llama_prefetch_tokens(ctx_tgt, all.data() + from, (int32_t) all.size() - from, n_past - from);
+                            }
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
