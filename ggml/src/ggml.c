@@ -6076,6 +6076,8 @@ struct ggml_tensor * ggml_lru_fill(
         swap = ggml_nelements(dec->src[1]) >= 2 * n_expert + 2 * n_slot + 3;
     }
     ggml_set_op_params_i32(result, 3, swap);
+    // op param 7: exclusive (host pool laid out per device: [device][host slot][slice]); set even when a refill clears swap
+    ggml_set_op_params_i32(result, 7, swap);
     result->op     = GGML_OP_LRU_FILL;
     result->src[0] = fill_list;
     result->src[1] = pool;
@@ -6105,6 +6107,13 @@ struct ggml_tensor * ggml_lru_assemble(
 
 // op params: decide [0] n_expert [1] n_slot [2..3] ctrl [4] layer; fill [0..1] src [2] n_ids [3] swap [4..5] ctrl [6] layer;
 // assemble [0..1] src [2..3] ctrl [4] layer
+struct ggml_tensor * ggml_lru_remap(
+        struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state, int32_t n_expert, int32_t n_slot) {
+    struct ggml_tensor * r = ggml_lru_decide(ctx, ids, state, n_expert, n_slot);
+    ggml_set_op_params_i32(r, 5, 1);   // remap only
+    return r;
+}
+
 struct ggml_tensor * ggml_lru_decide_ext(
         struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
         int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer) {
