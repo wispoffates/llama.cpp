@@ -16,6 +16,7 @@
 #include <array>
 #include <map>
 #include <vector>
+#include <thread>
 
 struct llama_model;
 class llama_batch_allocr;
@@ -394,6 +395,11 @@ private:
     };
 
     copy_experts_info copy_experts;
+
+    // qwen4exp lazy n-gram embedding table (per_layer_token_embd, mmapped, -lzm on): a multi-ubatch prompt's rows are
+    // pre-faulted by a background thread while the GPUs compute the earlier ubatches (LLAMA_PLE_PREWARM=0: off)
+    std::thread ple_warm;
+    void ple_prewarm(const llama_batch_ext & batch);
 
     // graph reallocations during inference where the backend assignments did not change, split by whether the
     // graph size is the same as the previously scheduled one (unexpected) or different
