@@ -1552,14 +1552,23 @@ static __global__ void k_lru_decide(
         const int32_t * __restrict__ ids, int32_t * slot_ids,   // no __restrict__: lanes read what lane 0 wrote
         int32_t * state, int32_t * fill_list,
         int n_used, int n_tokens, int n_expert, int n_slot, int ids_stride, int exclusive,
-        ggml_lru_ctrl * ctrl, int layer, int log_dev, int log_dev_index) {
+        ggml_lru_ctrl * ctrl, int layer, int log_dev, int log_dev_index, int remap) {
     const int lane = threadIdx.x;
     int32_t * owner    = state;                     // expert -> slot
     int32_t * slot_of  = state + n_expert;          // slot -> expert
     int32_t * last_use = state + n_expert + n_slot; // tick of the last use per slot
     int32_t * hslot    = state + n_expert + 2 * n_slot + 3; // exclusive: expert -> host slot, -1 while in a pool
+    int32_t * hexpert  = state + 2 * n_expert + 2 * n_slot + 4; // exclusive: host slot -> expert
     const int32_t t0   = state[n_expert + 2 * n_slot];
     const int n_total = n_used * n_tokens;
+
+    if (remap) {   // exclusive, large batch: ids in the assembled [pool slots | host slots] layout, state untouched
+        for (int i = lane; i < n_total; i += WARP_SIZE) {
+            const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
+            slot_ids[i] = (e < 0 || e >= n_expert) ? e : (owner[e] >= 0 ? owner[e] : n_slot + hslot[e]);
+        }
+        return;
+    }
 
     for (int i = lane; i < n_total; i += WARP_SIZE) {
         const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
@@ -1601,7 +1610,7 @@ static __global__ void k_lru_decide(
             if (exclusive) {
                 h = hslot[e];
                 hslot[e] = -1;
-                if (prev >= 0) hslot[prev] = h;
+                if (prev >= 0) { hslot[prev] = h; hexpert[h] = prev; }
                 // disk refill: tell the host which slot the victim gets. Hybrid: when the host is behind (ring backlog >=
                 // swap_backlog) this device writes the victim back itself (swap) instead of leaving it to the host
                 if (ctrl != nullptr && prev >= 0) {
@@ -1800,6 +1809,36 @@ static __global__ void k_lru_assemble(
     }
 }
 
+// exclusive cache, large batch: the assembled tensor is [pool slots | host slots] (the ids are remapped to match), so entry j
+// is pool slot j (j < n_slot) or host slot j - n_slot of this device's contiguous host region; every copy is one contiguous
+// slice. Disk refill: a host slot is read once it holds the expert the state says it holds.
+template <bool vec>
+static __global__ void k_lru_assemble_sliced(
+        const char * __restrict__ pool, const char * __restrict__ hbase, char * __restrict__ dst, size_t es, int n_slot, int j0,
+        const int32_t * __restrict__ hexpert, const ggml_lru_ctrl * ctrl, int layer) {
+    const int j = j0 + blockIdx.y;
+    const char * src_e;
+    if (j < n_slot) {
+        src_e = pool + (size_t) j * es;
+    } else {
+        const int hs = j - n_slot;
+        if (ctrl != nullptr) {
+            lru_wait_content(ctrl, layer, hs, hexpert[hs]);
+        }
+        src_e = hbase + (size_t) hs * es;
+    }
+    char * dst_e = dst + (size_t) j * es;
+    if (vec) {
+        for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < es / 16; i += (size_t) gridDim.x * blockDim.x) {
+            ((uint4 *) dst_e)[i] = ((const uint4 *) src_e)[i];
+        }
+    } else {
+        for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < es; i += (size_t) gridDim.x * blockDim.x) {
+            dst_e[i] = src_e[i];
+        }
+    }
+}
+
 // exclusive LRU: a stream about to read host slots waits until the pending victim write-back has landed
 static void ggml_cuda_lru_wb_wait(ggml_backend_cuda_context & ctx, cudaStream_t stream) {
     if (ctx.lru_wb_pending) {
@@ -1819,6 +1858,32 @@ static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor 
 
     ggml_tensor * src;
     memcpy(&src, dst->op_params, sizeof(src));
+
+    {   // exclusive: [pool slots | host slots] from the per-device host layout
+        const int n_expert_x = (int) dst->ne[2], n_slot_x = (int) pool->ne[2];
+        if (ggml_nelements(state) >= 2 * (int64_t) n_expert_x + 2 * (int64_t) n_slot_x + 3) {
+            ggml_lru_ctrl * xctrl;
+            memcpy(&xctrl, (const char *) dst->op_params + 8, sizeof(xctrl));
+            const int xlayer = ggml_get_op_params_i32(dst, 4);
+            const size_t es = pool->nb[2];
+            int dev = 0;
+            if (src->nb[2] != es) {
+                cudaGetDevice(&dev);
+            }
+            const char * hbase = (const char *) src->data + (size_t) dev * (size_t) src->ne[2] * es;
+            const int32_t * hexpert = (const int32_t *) state->data + 2 * n_expert_x + 2 * n_slot_x + 4;
+            const int j0 = 0, nj = pooled_only ? n_slot_x : n_expert_x;
+            const dim3 grid(gx, nj), block(256);
+            if (es % 16 == 0) {
+                k_lru_assemble_sliced<true><<<grid, block, 0, stream>>>((const char *) pool->data, hbase, (char *) dst->data, es,
+                    n_slot_x, j0, hexpert, xctrl, xlayer);
+            } else {
+                k_lru_assemble_sliced<false><<<grid, block, 0, stream>>>((const char *) pool->data, hbase, (char *) dst->data, es,
+                    n_slot_x, j0, hexpert, xctrl, xlayer);
+            }
+            return;
+        }
+    }
 
     GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(pool));
     GGML_ASSERT(dst->nb[1] == pool->nb[1] && dst->nb[2] == pool->nb[2] && dst->ne[1] == pool->ne[1]);
@@ -1924,6 +1989,29 @@ static void ggml_cuda_lru_assemble_dma(ggml_backend_cuda_context & ctx, ggml_ten
     ggml_lru_ctrl * dctrl;
     memcpy(&dctrl, (const char *) dst->op_params + 8, sizeof(dctrl));
     const int dlayer = ggml_get_op_params_i32(dst, 4);
+
+    if (exclusive) {
+        // [pool slots | host slots]: the host part is this device's contiguous host region -> ONE copy-engine transfer; the
+        // pool part one device-to-device copy (DS: the scattered path issued ~127 copies per assembly at ~250 us each)
+        const size_t es = pool->nb[2];
+        const int64_t n_host = src->ne[2];
+        int xdev = 0;
+        if (src->nb[2] != es) {
+            cudaGetDevice(&xdev);
+        }
+        if (dctrl != nullptr) {   // disk refill: every host slot must hold the expert the state says it holds
+            const int32_t * hexp = m.data() + 2 * n_expert + 2 * n_slot + 4;
+            for (int64_t hs = 0; hs < n_host; hs++) {
+                const volatile int32_t * c = dctrl->content + (size_t) dlayer * dctrl->n_host + hs;
+                while (*c != hexp[hs]) {
+                }
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + (size_t) n_slot * es,
+            (const char *) src->data + (size_t) xdev * (size_t) n_host * es, (size_t) n_host * es, cudaMemcpyHostToDevice, copy_stream));
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, pool->data, (size_t) n_slot * es, cudaMemcpyDeviceToDevice, ctx.stream()));
+        return;
+    }
     const int32_t * owner = m.data();
     const int32_t * hslot = exclusive ? m.data() + n_expert + 2 * n_slot + 3 : nullptr;
     auto pooled = [&](int e) { return owner[e] >= 0 && owner[e] < n_slot; };
@@ -2762,7 +2850,10 @@ static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int n_tokens = (int) ids->ne[1];
     int32_t * fill_list = (int32_t *) dst->data + (size_t) n_used * n_tokens;
     const int exclusive = ggml_nelements(state) >= 2 * (int64_t) n_expert + 2 * (int64_t) n_slot + 3;
-    ggml_cuda_lru_mirror_mark_dirty(ctx, state);
+    const int remap = ggml_get_op_params_i32(dst, 5);
+    if (!remap) {
+        ggml_cuda_lru_mirror_mark_dirty(ctx, state);
+    }
     ggml_lru_ctrl * ctrl;
     memcpy(&ctrl, (const char *) dst->op_params + 8, sizeof(ctrl));
     const int layer = ggml_get_op_params_i32(dst, 4);
@@ -2772,7 +2863,7 @@ static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * 
     k_lru_decide<<<1, WARP_SIZE, 0, ctx.stream()>>>(
         (const int32_t *) ids->data, (int32_t *) dst->data,
         (int32_t *) state->data, fill_list,
-        n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, ctrl, layer, dev == 0, dev);
+        n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, remap ? nullptr : ctrl, layer, dev == 0, dev, remap);
 }
 
 static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {
@@ -2789,6 +2880,18 @@ static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {
     d.swap = ggml_get_op_params_i32(dst, 3);
     d.src_estride = src->nb[2]; d.estride = pool->nb[2];
     int dev = 0;
+    if (ggml_get_op_params_i32(dst, 7)) {
+        // exclusive: the host pool holds each device's slices contiguously ([device][host slot][slice]), slice = this
+        // device's pool slot bytes; the number of devices = full expert bytes / slice
+        const size_t es = pool->nb[2];
+        if (src->nb[2] != es) {
+            cudaGetDevice(&dev);
+        }
+        d.src_estride = es; d.seg_bytes = es; d.n_rows = 1; d.src_row_stride = 0;
+        d.src_off = (size_t) dev * (size_t) src->ne[2] * es;
+        d.vec = es % 16 == 0 && (uintptr_t) src->data % 16 == 0;
+        return d;
+    }
     if (pool->nb[1] != src->nb[1]) {          // columnar: local rows are column slices of the source rows (ne[0] split)
         cudaGetDevice(&dev);
         d.seg_bytes = pool->nb[1]; d.n_rows = pool->ne[1]; d.src_row_stride = src->nb[1]; d.src_off = (size_t) dev * pool->nb[1];
