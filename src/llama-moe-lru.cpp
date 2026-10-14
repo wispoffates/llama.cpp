@@ -255,6 +255,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             model.layers[il].ffn_up_exps,
             model.layers[il].ffn_down_exps,
         };
+        L.router[0] = model.layers[il].ffn_gate_inp;
+        L.router[1] = model.layers[il].ffn_gate_inp_b;
+        L.router[2] = model.layers[il].ffn_exp_probs_b;
         for (int k = 0; k < N_KIND; k++) {
             if (!exps[k] || !exps[k]->data) {
                 throw std::runtime_error("llama_moe_lru: expert tensor missing or unmapped");
