@@ -8,6 +8,10 @@
 #include <cstdint>
 #include <atomic>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <memory>
 
 struct llama_model;
 struct llama_device;
@@ -90,6 +94,14 @@ private:
     std::thread refill_thread;
     std::atomic<bool> refill_stop{false};
     void refill_loop();
+    // out-of-order completion: refill copies run on workers, swap-only entries are published as soon as they are ready
+    struct refill_task { int32_t li, v, hs; uint32_t idx; };
+    std::vector<std::thread> refill_workers;
+    std::mutex refill_mtx;
+    std::condition_variable refill_cv;
+    std::deque<refill_task> refill_queue;
+    std::unique_ptr<std::atomic<uint8_t>[]> refill_processed;   // per ring index: finished (tail may pass it)
+    void refill_worker();
     bool use_assemble = true;
     bool use_prefetch = false;
     int64_t n_expert = 0;
