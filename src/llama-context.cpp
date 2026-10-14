@@ -1956,8 +1956,13 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 // token ids, so for a multi-ubatch batch a background thread computes them for every token after the first ubatch (the
 // n-gram window inside the batch; predecessors before it read as EOS -- only a prefetch, a wrong row stays cold) and touches
 // their pages ahead of the compute. Same hashing as llm_graph_input_qwen4exp_ple::set_input.
+// SFA/PWS (10-14): touching the rows one by one is queue depth 1 -- a cold 36K prompt (~570K rows, one 4 KB page each, the range
+// is MADV_RANDOM) still left ~30 s of host-side GPU idle. LLAMA_PLE_PREWARM=1 (default) now issues MADV_WILLNEED per ubatch-sized
+// chunk (sorted + coalesced by llama_prefetch_rows), which submits the reads without waiting: many in flight, ascending offsets.
+// 2 = the old touch loop, 0 = off.
 void llama_context::ple_prewarm(const llama_batch_ext & batch) {
-    static const bool on = [] { const char * e = getenv("LLAMA_PLE_PREWARM"); return e == nullptr || atoi(e) != 0; }();
+    static const int mode = [] { const char * e = getenv("LLAMA_PLE_PREWARM"); return e == nullptr ? 1 : atoi(e); }();
+    const bool on = mode != 0;
     const ggml_tensor * ple = model.per_layer_tok_embd;
     if (!on || ple == nullptr || ple->data == nullptr || !model.can_prefetch.count(ple) || batch.tokens.size() <= cparams.n_ubatch) {
         return;
@@ -1972,14 +1977,21 @@ void llama_context::ple_prewarm(const llama_batch_ext & batch) {
         toks.push_back(t.id);
     }
     const size_t first = cparams.n_ubatch;
-    ple_warm = std::thread([toks = std::move(toks), ple, &hp, first]() {
+    const size_t chunk = cparams.n_ubatch;
+    const bool touch = mode == 2;
+    ple_warm = std::thread([toks = std::move(toks), ple, &hp, first, chunk, touch]() {
         const int64_t n_gram = hp.ple_ngram_size, per_gram = hp.ple_heads_per_ngram;
         const int64_t eos = hp.ple_eos_token_id;
         const char * base = (const char *) ple->data;
         const size_t nb1 = ple->nb[1];
         std::vector<int64_t> ctx(n_gram);
+        std::vector<int32_t> rows;
         volatile char sink = 0;
         for (size_t i = first; i < toks.size(); ++i) {
+            if (!touch && !rows.empty() && (i - first) % chunk == 0) {
+                llama_prefetch_rows(ple, rows.data(), rows.size());
+                rows.clear();
+            }
             ctx[0] = toks[i] >= 0 ? toks[i] : eos;
             bool cut = false;
             for (int64_t s = 1; s < n_gram; ++s) {
@@ -1998,10 +2010,17 @@ void llama_context::ple_prewarm(const llama_batch_ext & batch) {
                     const int64_t h = b0 + g;
                     const int64_t row = (int64_t) (mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h]);
                     if (row >= 0 && row < ple->ne[1]) {
-                        sink = sink ^ base[(size_t) row * nb1];   // fault the page in
+                        if (touch) {
+                            sink = sink ^ base[(size_t) row * nb1];   // fault the page in
+                        } else {
+                            rows.push_back((int32_t) row);
+                        }
                     }
                 }
             }
+        }
+        if (!rows.empty()) {
+            llama_prefetch_rows(ple, rows.data(), rows.size());
         }
         (void) sink;
     });
