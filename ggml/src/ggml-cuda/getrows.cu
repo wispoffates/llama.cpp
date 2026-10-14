@@ -101,6 +101,30 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// p100-series: rows of at most a few elements (qwen4exp QSA: top_score = 1 float, sel_idx = 4 int32 per row, 2M rows per ubatch):
+// one thread per row. The block-per-row kernels left 255 of 256 threads idle there (~47 ms per call, ~10 s of a 36K prefill).
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_short(
+        const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int ne00, const uint32_t nrows, const uint3 ne10_fdv, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    const uint32_t r = blockIdx.x*blockDim.x + threadIdx.x;
+    if (r >= nrows) {
+        return;
+    }
+    const uint2 a = fast_div_modulo(r, ne10_fdv);      // a.x = z, a.y = i10
+    const uint2 b = fast_div_modulo(a.x, ne12_fdv);    // b.x = i11, b.y = i12
+    const int i10 = a.y, i11 = b.x, i12 = b.y;
+    const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+    dst_t        * dst_row  = dst + i10*s1 + i11*s2 + i12*s3;
+    const src0_t * src0_row = (const src0_t *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+    for (int i00 = 0; i00 < ne00; ++i00) {
+        dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+    }
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -253,6 +277,14 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    static const bool short_on = [] { const char * e = getenv("GGML_CUDA_GET_ROWS_SHORT"); return !e || e[0] != '0'; }();
+    if (short_on && ne00 <= 8 && ne10*ne11*ne12 >= 1024 && ne10*ne11*ne12 < (int64_t) UINT32_MAX) {
+        const uint32_t nrows = (uint32_t) (ne10*ne11*ne12);
+        k_get_rows_short<src0_t, dst_t><<<(nrows + 255)/256, 256, 0, stream>>>(src0_d, src1_d, dst_d, (int) ne00, nrows,
+            init_fastdiv_values((uint32_t) ne10), ne12_fdv, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+        return;
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
