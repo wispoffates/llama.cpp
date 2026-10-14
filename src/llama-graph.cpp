@@ -2384,6 +2384,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // lookahead measurement (LLAMA_MOE_LOOKAHEAD_TRACE=1, with LLAMA_MOE_TRACE): predict the next pooled layer's experts by
+    // applying its router to this layer's MoE input; the node "ffn_moe_pred-<next layer>" is dumped by the trace hook
+    static const bool la_trace = [] { const char * e = getenv("LLAMA_MOE_LOOKAHEAD_TRACE"); return e && atoi(e) != 0; }();
+    if (la_trace && lru != nullptr && lru->pooled(il) && !cparams.warmup && n_tokens > 0) {
+        const int nx = lru->next_pooled(il);
+        if (nx >= 0 && lru->router_get(nx, 0) != nullptr) {
+            ggml_tensor * pl = ggml_mul_mat(ctx0, lru->router_get(nx, 0), cur);   // [n_expert, n_tokens]
+            if (lru->router_get(nx, 1)) {
+                pl = ggml_add(ctx0, pl, lru->router_get(nx, 1));
+            }
+            ggml_tensor * sel = pl;
+            if (lru->router_get(nx, 2)) {   // selection bias is added to the gated probabilities
+                ggml_tensor * pp = gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID ? ggml_sigmoid(ctx0, pl) : ggml_soft_max(ctx0, pl);
+                sel = ggml_add(ctx0, pp, lru->router_get(nx, 2));
+            }
+            ggml_tensor * pred = ggml_argsort_top_k(ctx0, sel, n_expert_used);
+            ggml_format_name(pred, "ffn_moe_pred-%d", nx);
+            ggml_build_forward_expand(gf, pred);
+        }
+    }
+
     if (lru != nullptr && lru->pooled(il) && !cparams.warmup &&
         n_tokens > 0 && (int64_t) n_tokens * n_expert_used <= lru->n_slots()) {
         GGML_ASSERT(gate_up_exps == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr &&
