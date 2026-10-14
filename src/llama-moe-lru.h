@@ -41,6 +41,7 @@ struct llama_moe_lru {
     // disk refill control block shared with the backend (nullptr unless refill is active)
     struct ggml_lru_ctrl * ctrl() const { return refill_ctrl; }
     int pool_index(int il) const { return pooled(il) ? layer_to_pool[il] : -1; }
+    bool is_exclusive() const { return exclusive; }
 
     // lookahead: router tensors of a pooled layer (predict its experts from the previous layer's input)
     ggml_tensor * router_get(int il, int which) const { GGML_ASSERT(pooled(il)); return layers[layer_to_pool[il]].router[which]; }
@@ -89,6 +90,9 @@ private:
 
     int n_layers = 0, n_slot = 0;
     bool exclusive = false;
+    int n_split = 1;   // devices an expert is sliced over (-sm tensor): the host pool keeps each device's slices contiguous
+    // copy expert e of layer L (kind k) from the mapped model into host slot hs, scattered into the per-device regions
+    void host_slot_store(const struct per_layer & L, int k, int32_t e, int64_t hs) const;
 
     // disk refill
     struct ggml_lru_ctrl * refill_ctrl = nullptr;
