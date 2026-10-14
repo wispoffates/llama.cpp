@@ -10,6 +10,7 @@
 #include <cstring>
 #include <algorithm>
 #include <unordered_map>
+#include <map>
 #include <stdexcept>
 #include <chrono>
 #include <atomic>
@@ -76,6 +77,45 @@ bool llama_moe_lru::init_model_overrides(llama_model_loader & ml, const std::vec
     ml.tensor_buft_overrides = transformed.data();
     LLAMA_LOG_INFO("llama_moe_lru: %d expert weight override(s) redirected to the pinned host buffer\n", n_pinned);
     return true;
+}
+
+// LLAMA_MOE_LRU_PROFILE=<file>: one line per model layer, "il e0 e1 e2 ..." with the layer's experts most used first
+// (tools: bench-tools/expertcache/make_lru_profile.py from a LLAMA_MOE_TRACE). The pool starts with each layer's top n_slot.
+static const std::map<int, std::vector<int32_t>> & llama_moe_lru_profile() {
+    static const std::map<int, std::vector<int32_t>> prof = [] {
+        std::map<int, std::vector<int32_t>> m;
+        const char * path = getenv("LLAMA_MOE_LRU_PROFILE");
+        if (path == nullptr || *path == 0) {
+            return m;
+        }
+        FILE * f = fopen(path, "r");
+        if (f == nullptr) {
+            LLAMA_LOG_WARN("llama_moe_lru: cannot open profile %s\n", path);
+            return m;
+        }
+        char line[1 << 16];
+        while (fgets(line, sizeof(line), f)) {
+            char * p = line;
+            char * end = nullptr;
+            const long il = strtol(p, &end, 10);
+            if (end == p) {
+                continue;
+            }
+            p = end;
+            std::vector<int32_t> v;
+            while (true) {
+                const long e = strtol(p, &end, 10);
+                if (end == p) break;
+                v.push_back((int32_t) e);
+                p = end;
+            }
+            m[(int) il] = std::move(v);
+        }
+        fclose(f);
+        LLAMA_LOG_INFO("llama_moe_lru: profile %s (%zu layers)\n", path, m.size());
+        return m;
+    }();
+    return prof;
 }
 
 bool llama_moe_lru::refill_requested() {
@@ -345,16 +385,57 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         h[n_expert + 2 * n_slot] = 1;      // tick
         h[n_expert + 2 * n_slot + 1] = 0;  // cum_ids
         h[n_expert + 2 * n_slot + 2] = 0;  // cum_fills
+        // initial placement: the profile's most-used experts (LLAMA_MOE_LRU_PROFILE) fill the pool, the most popular in the highest
+        // slots (LRU evicts the lowest slot on ties, so the least popular go first); without a profile the exclusive pool takes
+        // experts 0..n_slot-1 and the inclusive pool starts empty. Exclusive: every other expert gets a host slot.
+        std::vector<int32_t> chosen;
+        {
+            const auto & prof = llama_moe_lru_profile();
+            auto it = prof.find(il);
+            std::vector<bool> taken(n_expert, false);
+            if (it != prof.end()) {
+                for (int32_t e : it->second) {
+                    if ((int64_t) chosen.size() >= n_slot) break;
+                    if (e >= 0 && e < n_expert && !taken[e]) { chosen.push_back(e); taken[e] = true; }
+                }
+            }
+            if (this->exclusive) {   // the exclusive pool must be full: pad with the lowest unused experts
+                for (int32_t e = 0; e < n_expert && (int64_t) chosen.size() < n_slot; e++) {
+                    if (!taken[e]) { chosen.push_back(e); taken[e] = true; }
+                }
+            }
+        }
+        {
+            int32_t * owner = h.data(), * slot_of = h.data() + n_expert;
+            for (size_t r = 0; r < chosen.size(); r++) {
+                const int32_t s = (int32_t) (n_slot - 1 - (int64_t) r);
+                owner[chosen[r]] = s;
+                slot_of[s] = chosen[r];
+            }
+        }
+        if (!chosen.empty()) {
+            for (int k = 0; k < N_KIND; k++) {
+                const size_t es = exps[k]->nb[2];
+                std::vector<uint8_t> stage((size_t) n_slot * es, 0);
+                for (size_t r = 0; r < chosen.size(); r++) {
+                    memcpy(stage.data() + (size_t) (n_slot - 1 - (int64_t) r) * es, (const char *) exps[k]->data + (size_t) chosen[r] * es, es);
+                }
+                // full pool layout; the meta buffer splits it per device
+                ggml_backend_tensor_set(L.pool[k], stage.data(), 0, stage.size());
+            }
+        }
         if (this->exclusive) {
-            // experts 0..n_slot-1 start in the pool (slot = expert), the rest in host slots 0..n_host-1
-            int32_t * owner = h.data(), * slot_of = h.data() + n_expert, * hslot = h.data() + n_expert + 2 * n_slot + 3;
+            int32_t * owner = h.data(), * hslot = h.data() + n_expert + 2 * n_slot + 3;
+            L.host_expert.clear();
             for (int64_t e = 0; e < n_expert; e++) {
-                owner[e] = e < n_slot ? (int32_t) e : -1;
-                hslot[e] = e < n_slot ? -1 : (int32_t) (e - n_slot);
+                if (owner[e] >= 0) {
+                    hslot[e] = -1;
+                } else {
+                    hslot[e] = (int32_t) L.host_expert.size();
+                    L.host_expert.push_back((int32_t) e);
+                }
             }
-            for (int64_t s = 0; s < n_slot; s++) {
-                slot_of[s] = (int32_t) s;
-            }
+            GGML_ASSERT((int64_t) L.host_expert.size() == n_host);
             h[2 * n_expert + 2 * n_slot + 3] = 0;   // refill log counter
 
             ggml_context_ptr hctx(ggml_init({ N_KIND * ggml_tensor_overhead(), nullptr, true }));
@@ -370,9 +451,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             pool_ctxs.emplace_back(std::move(hctx));
             for (int k = 0; k < N_KIND; k++) {
                 const size_t es = exps[k]->nb[2];
-                // the pool's slots hold the model's first n_slot experts (full layout; the meta buffer splits it per device)
-                ggml_backend_tensor_set(L.pool[k], exps[k]->data, 0, ggml_nbytes(L.pool[k]));
-                memcpy(L.hpool[k]->data, (const char *) exps[k]->data + (size_t) n_slot * es, (size_t) n_host * es);
+                for (int64_t hs = 0; hs < n_host; hs++) {
+                    memcpy((char *) L.hpool[k]->data + (size_t) hs * es, (const char *) exps[k]->data + (size_t) L.host_expert[hs] * es, es);
+                }
                 L.mexps[k] = exps[k];
                 L.exps[k] = L.hpool[k];   // the kernels' source: host slots instead of expert rows
             }
@@ -415,7 +496,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             }
             for (int li = 0; li < n_layers; li++) {
                 for (int64_t hs = 0; hs < n_host; hs++) {
-                    c->content[(size_t) li * n_host + hs] = (int32_t) (n_slot + hs);   // host slot hs starts with expert n_slot + hs
+                    c->content[(size_t) li * n_host + hs] = layers[li].host_expert[hs];
                 }
             }
             refill_ctrl = c;
