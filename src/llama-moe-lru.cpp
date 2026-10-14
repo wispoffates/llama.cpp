@@ -118,6 +118,29 @@ static const std::map<int, std::vector<int32_t>> & llama_moe_lru_profile() {
     return prof;
 }
 
+// exclusive host pool layout: for kind k, device d's slices of all host slots are contiguous ([d][host slot][slice]) so a
+// prefill assembly moves them in one transfer and the fills read contiguous slices. Slices follow the meta split of the
+// experts: gate/up by rows (ne[1]), down by columns (ne[0], each row's d-th segment).
+void llama_moe_lru::host_slot_store(const per_layer & L, int k, int32_t e, int64_t hs) const {
+    const ggml_tensor * m = L.mexps[k];
+    const int64_t n_host = L.hpool[k]->ne[2];
+    const size_t es = m->nb[2];
+    const size_t slice = es / n_split;
+    const char * srce = (const char *) m->data + (size_t) e * es;
+    char * base = (char *) L.hpool[k]->data;
+    for (int d = 0; d < n_split; d++) {
+        char * dstp = base + ((size_t) d * n_host + hs) * slice;
+        if (n_split == 1 || k != KIND_DOWN) {   // rows: device d holds rows [d*r, (d+1)*r) -- contiguous
+            memcpy(dstp, srce + (size_t) d * slice, slice);
+        } else {                                // columns: each row's d-th segment
+            const size_t seg = m->nb[1] / n_split;
+            for (int64_t r = 0; r < m->ne[1]; r++) {
+                memcpy(dstp + (size_t) r * seg, srce + (size_t) r * m->nb[1] + (size_t) d * seg, seg);
+            }
+        }
+    }
+}
+
 bool llama_moe_lru::refill_requested() {
     const char * e = getenv("LLAMA_MOE_LRU_REFILL");
     return e != nullptr && atoi(e) != 0;
@@ -159,8 +182,7 @@ void llama_moe_lru::refill_worker() {
         }
         const per_layer & L = layers[t.li];
         for (int k = 0; k < N_KIND; k++) {
-            const size_t es = L.mexps[k]->nb[2];
-            memcpy((char *) L.hpool[k]->data + (size_t) t.hs * es, (const char *) L.mexps[k]->data + (size_t) t.v * es, es);
+            host_slot_store(L, k, t.v, t.hs);
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         ((volatile int32_t *) c->content)[(size_t) t.li * c->n_host + t.hs] = t.v;
@@ -324,6 +346,13 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     // host pool of (n_expert - n_slot) slots owned by this context; a miss swaps the incoming expert with the pool's victim
     this->exclusive = exclusive_requested() && n_slot < n_expert;
     const int64_t n_host = this->exclusive ? n_expert - n_slot : 0;
+    if (this->exclusive && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        int n_gpu = 0;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            n_gpu += ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
+        }
+        this->n_split = std::max(1, n_gpu);
+    }
 
     // model layer -> pool index; the pooled set may be any subset (-ot)
     layer_to_pool.assign(n_layer_tot, -1);
@@ -368,7 +397,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         // +tick +cum_ids +cum_fills (+ exclusive: expert -> host slot)
         // (+ refill: this device's log counter)
         L.state = ggml_new_tensor_1d(pctx.get(), GGML_TYPE_I32,
-                                     n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? n_expert + 1 : 0));
+                                     n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? 2 * n_expert + 1 : 0));
         ggml_format_name(L.state, "blk.%d.moe_lru_state", il);
 
         ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(pctx.get(), L.buft);
@@ -379,7 +408,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         pool_ctxs.emplace_back(std::move(pctx));
 
         // owner = -1, slot owner = -1, last_use = 0, tick = 1, counters = 0
-        const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? n_expert + 1 : 0);
+        const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? 2 * n_expert + 1 : 0);
         std::vector<int32_t> h(n_state, -1);
         for (int64_t i = n_expert + n_slot; i < n_expert + 2 * n_slot; i++) h[i] = 0;
         h[n_expert + 2 * n_slot] = 1;      // tick
@@ -437,6 +466,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             }
             GGML_ASSERT((int64_t) L.host_expert.size() == n_host);
             h[2 * n_expert + 2 * n_slot + 3] = 0;   // refill log counter
+            for (int64_t hs = 0; hs < n_host; hs++) {
+                h[2 * n_expert + 2 * n_slot + 4 + hs] = L.host_expert[hs];   // host slot -> expert
+            }
 
             ggml_context_ptr hctx(ggml_init({ N_KIND * ggml_tensor_overhead(), nullptr, true }));
             for (int k = 0; k < N_KIND; k++) {
@@ -450,11 +482,14 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             bufs.emplace_back(hb);
             pool_ctxs.emplace_back(std::move(hctx));
             for (int k = 0; k < N_KIND; k++) {
-                const size_t es = exps[k]->nb[2];
-                for (int64_t hs = 0; hs < n_host; hs++) {
-                    memcpy((char *) L.hpool[k]->data + (size_t) hs * es, (const char *) exps[k]->data + (size_t) L.host_expert[hs] * es, es);
-                }
                 L.mexps[k] = exps[k];
+                if (n_split > 1) {
+                    GGML_ASSERT(exps[k]->nb[2] % n_split == 0);
+                    GGML_ASSERT(k != KIND_DOWN ? exps[k]->ne[1] % n_split == 0 : exps[k]->nb[1] % n_split == 0);
+                }
+                for (int64_t hs = 0; hs < n_host; hs++) {
+                    host_slot_store(L, k, L.host_expert[hs], hs);
+                }
                 L.exps[k] = L.hpool[k];   // the kernels' source: host slots instead of expert rows
             }
         }
