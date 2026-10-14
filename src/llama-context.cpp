@@ -207,6 +207,7 @@ struct llama_moe_trace {
 static int llama_moe_trace_kind(const char * name) {
     if (strncmp(name, "ffn_moe_topk-", 13) == 0) return 0;
     if (strncmp(name, "ffn_moe_weights_norm-", 21) == 0) return 1;
+    if (strncmp(name, "ffn_moe_pred-", 13) == 0) return 2;   // lookahead: predicted ids for layer <il>
     return -1;
 }
 static bool llama_moe_trace_cb(struct ggml_tensor * t, bool ask, void * ud) {
