@@ -356,9 +356,17 @@ static __global__ void flash_attn_ext_vec(
             }
 #else
             float KQ_k[ncols];
+            bool  KQ_any = false;
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 KQ_k[j] = KQ[j*nthreads + k];
+                KQ_any = KQ_any || KQ_k[j] != 0.0f;
+            }
+            // p100-series: a key whose softmax weights are all exactly 0 (masked: exp(-inf) = 0) adds nothing -- skip its V row, so
+            // a non-finite cached V of a masked key cannot leak in as 0 * NaN. One compare per key instead of a per-element filter
+            // (R21: the isfinite filter cost gemma4 decode 2.6 %); a visible non-finite V still propagates.
+            if (!KQ_any) {
+                continue;
             }
 #pragma unroll
             for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
@@ -367,9 +375,6 @@ static __global__ void flash_attn_ext_vec(
                     2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                 for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
-                    // p100-series: a non-finite cached V counts as 0 (0 * NaN of a masked key spoiled the row)
-                    tmp[i_VKQ_1].x = isfinite(tmp[i_VKQ_1].x) ? tmp[i_VKQ_1].x : 0.0f;
-                    tmp[i_VKQ_1].y = isfinite(tmp[i_VKQ_1].y) ? tmp[i_VKQ_1].y : 0.0f;
 #pragma unroll
                     for (int j = 0; j < ncols; ++j) {
                         VKQ[j][i_VKQ_0/nthreads_V + i_VKQ_1].x += tmp[i_VKQ_1].x*KQ_k[j];
