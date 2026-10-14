@@ -581,6 +581,11 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
+
+    // p100-series: hint the tokens of a prompt about to be decoded (tokens [0, n_skip) are context only, e.g. the cached prefix)
+    // so lazily read per-token tables (qwen4exp n-gram embeddings, -lzm on) are requested from disk ahead of the compute.
+    // Asynchronous; a newer call supersedes an unfinished one. No-op for models without such tables.
+    LLAMA_API void llama_prefetch_tokens(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens, int32_t n_skip);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
