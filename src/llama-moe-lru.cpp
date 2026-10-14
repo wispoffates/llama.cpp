@@ -91,49 +91,97 @@ bool llama_moe_lru::exclusive_requested() {
 llama_moe_lru::~llama_moe_lru() {
     if (refill_thread.joinable()) {
         refill_stop = true;
+        refill_cv.notify_all();
         refill_thread.join();
+        for (auto & w : refill_workers) {
+            w.join();
+        }
     }
 }
 
-// one entry at a time, in log order: wait until every device finished the fill of the step that freed the slot (the slot
-// still held the incoming expert until then), copy the victim from the mapped model weights, then publish the content
+// entries complete out of order: one is ready when every device finished the fill of the step that freed its slot (the
+// slot still held the incoming expert until then). A swap-only entry (every device wrote the victim back) is published at once,
+// a refill entry goes to a worker that copies the victim from the mapped model and then publishes. The tail passes finished
+// entries only. Two pending entries never share a slot: a slot is reassigned only after its occupant was loaded back into a
+// pool, which waited for the occupant's publication.
+void llama_moe_lru::refill_worker() {
+    ggml_lru_ctrl * c = refill_ctrl;
+    while (true) {
+        refill_task t;
+        {
+            std::unique_lock<std::mutex> lk(refill_mtx);
+            refill_cv.wait(lk, [this] { return refill_stop.load() || !refill_queue.empty(); });
+            if (refill_queue.empty()) {
+                return;   // stop requested
+            }
+            t = refill_queue.front();
+            refill_queue.pop_front();
+        }
+        const per_layer & L = layers[t.li];
+        for (int k = 0; k < N_KIND; k++) {
+            const size_t es = L.mexps[k]->nb[2];
+            memcpy((char *) L.hpool[k]->data + (size_t) t.hs * es, (const char *) L.mexps[k]->data + (size_t) t.v * es, es);
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        ((volatile int32_t *) c->content)[(size_t) t.li * c->n_host + t.hs] = t.v;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        refill_processed[t.idx % c->cap].store(1, std::memory_order_release);
+    }
+}
+
 void llama_moe_lru::refill_loop() {
     ggml_lru_ctrl * c = refill_ctrl;
-    uint32_t tail = c->tail;
+    uint32_t tail = c->tail, scan = tail;
+    struct waiting { int32_t li, v, hs, step; uint32_t idx; };
+    std::vector<waiting> wait_list;
     while (!refill_stop.load(std::memory_order_relaxed)) {
+        bool progress = false;
         const uint32_t head = c->head;
-        if (head == tail) {
-            std::this_thread::sleep_for(std::chrono::microseconds(20));
-            continue;
+        for (; scan != head; scan++) {   // new entries (device 0 writes the entry before advancing head)
+            const int32_t * en = c->entries + 4 * (size_t) (scan % c->cap);
+            wait_list.push_back({ en[0], en[1], en[2], en[3], scan });
+            progress = true;
         }
-        const int32_t * en = c->entries + 4 * (size_t) (tail % c->cap);
-        const int32_t li = en[0], v = en[1], hs = en[2], step = en[3];
-        for (uint32_t d = 0; d < c->n_dev; d++) {
-            const volatile uint32_t * dn = c->done + (size_t) d * c->n_layer + li;
-            while ((int64_t) *dn < 3 * (int64_t) step) {
-                if (refill_stop.load(std::memory_order_relaxed)) {
-                    return;
+        for (size_t i = 0; i < wait_list.size(); ) {
+            const waiting & w = wait_list[i];
+            bool ready = true;
+            for (uint32_t d = 0; d < c->n_dev && ready; d++) {
+                ready = (int64_t) ((volatile uint32_t *) c->done)[(size_t) d * c->n_layer + w.li] >= 3 * (int64_t) w.step;
+            }
+            if (!ready) {
+                i++;
+                continue;
+            }
+            // every device's decide for this step ran before its fill, so its mode for the entry is written
+            bool any_left = false;
+            for (uint32_t d = 0; d < c->n_dev; d++) {
+                any_left |= ((volatile int32_t *) c->mode)[(size_t) d * c->cap + w.idx % c->cap] == 0;
+            }
+            if (any_left) {
+                {
+                    std::lock_guard<std::mutex> lk(refill_mtx);
+                    refill_queue.push_back({ w.li, w.v, w.hs, w.idx });
                 }
-                std::this_thread::yield();
+                refill_cv.notify_one();
+            } else {
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                ((volatile int32_t *) c->content)[(size_t) w.li * c->n_host + w.hs] = w.v;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                refill_processed[w.idx % c->cap].store(1, std::memory_order_release);
             }
+            wait_list[i] = wait_list.back();
+            wait_list.pop_back();
+            progress = true;
         }
-        // hybrid: devices that swapped already wrote their slice of the victim; copy from the model if any device left it to us
-        bool any_left = false;
-        for (uint32_t d = 0; d < c->n_dev; d++) {
-            any_left |= ((volatile int32_t *) c->mode)[(size_t) d * c->cap + tail % c->cap] == 0;
+        while (tail != scan && refill_processed[tail % c->cap].load(std::memory_order_acquire)) {
+            refill_processed[tail % c->cap].store(0, std::memory_order_relaxed);
+            tail++;
+            c->tail = tail;
+            progress = true;
         }
-        if (any_left) {
-            const per_layer & L = layers[li];
-            for (int k = 0; k < N_KIND; k++) {
-                const size_t es = L.mexps[k]->nb[2];
-                memcpy((char *) L.hpool[k]->data + (size_t) hs * es, (const char *) L.mexps[k]->data + (size_t) v * es, es);
-            }
+        if (!progress) {
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
         }
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        ((volatile int32_t *) c->content)[(size_t) li * c->n_host + hs] = v;
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        tail++;
-        c->tail = tail;
     }
 }
 
@@ -371,6 +419,15 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
                 }
             }
             refill_ctrl = c;
+            refill_processed.reset(new std::atomic<uint8_t>[cap]);
+            for (uint32_t i = 0; i < cap; i++) {
+                refill_processed[i].store(0);
+            }
+            const char * et = getenv("LLAMA_MOE_LRU_REFILL_THREADS");
+            const int n_workers = std::max(1, et ? atoi(et) : 4);
+            for (int i = 0; i < n_workers; i++) {
+                refill_workers.emplace_back([this] { refill_worker(); });
+            }
             refill_thread = std::thread([this] { refill_loop(); });
             LLAMA_LOG_INFO("llama_moe_lru: disk refill on (%u devices, ring %u, swap when backlog >= %u)\n", n_dev, cap, c->swap_backlog);
         }
