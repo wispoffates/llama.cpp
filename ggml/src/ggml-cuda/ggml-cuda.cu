@@ -2747,11 +2747,12 @@ static void ggml_cuda_lru_assemble_async(ggml_backend_cuda_context & ctx, ggml_t
     ctx.n_lru_pending++;
 }
 
-// before computing node i (and the nodes a fusion may take with it): wait for any pending assembly they read. The window is
-// wide on purpose: a fused MoE launch can consume many nodes at once (FZ run 2 with a window of 8: 3/18 short-prompt texts
-// differed -- a matmul past the window read a half-assembled expert tensor)
+// before computing node i (and the nodes a fusion may take with it, at most a few): wait for any pending assembly they read.
+// The window must stay small: the wait lands at the first node whose window reaches the reader, and a wide window (64)
+// moved it to the start of the next layer, halving the overlap (LPF: 32.6 s of GPU idle in a 36K prefill). FZD showed the
+// FZ run 2 mismatch was the slot count, not a race.
 static void ggml_cuda_lru_wait_srcs(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
-    const int last = std::min(cgraph->n_nodes, i + 64);
+    const int last = std::min(cgraph->n_nodes, i + 8);
     for (int n = i; n < last && ctx.n_lru_pending > 0; ++n) {
         const ggml_tensor * node = cgraph->nodes[n];
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
