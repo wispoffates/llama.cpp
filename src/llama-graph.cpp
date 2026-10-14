@@ -2507,6 +2507,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps   = asmb[llama_moe_lru::KIND_UP];
         gate_exps = asmb[llama_moe_lru::KIND_GATE];
         down_exps = asmb[llama_moe_lru::KIND_DOWN];
+        if (lru->is_exclusive()) {
+            // the exclusive assembly is laid out [pool slots | host slots]: remap the expert ids to match
+            ggml_tensor * rm = ggml_lru_remap(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots());
+            selected_experts = ggml_view_2d(ctx0, rm, n_expert_used, n_tokens, n_expert_used * sizeof(int32_t), 0);
+        }
     }
 
     // compute the expert input before the slot lookup, so that the scheduler prefetches it for the CPU part (the router can read a different tensor)
