@@ -2700,6 +2700,11 @@ extern "C" {
         volatile uint32_t lcount[16];
     };
 
+    // exclusive cache: map router expert ids to the assembled [pool slots | host slots] layout (slot if pooled, else
+    // n_slot + host slot); no state change. Same output layout as ggml_lru_decide (take a view of the first n_ids values).
+    GGML_API struct ggml_tensor * ggml_lru_remap(
+            struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state, int32_t n_expert, int32_t n_slot);
+
     GGML_API struct ggml_tensor * ggml_lru_decide_ext(
             struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
             int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer);
