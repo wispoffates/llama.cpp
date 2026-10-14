@@ -82,6 +82,7 @@ private:
         ggml_tensor * hpool[N_KIND] = {}; // exclusive: [ne0, ne1, n_expert - n_slot] pinned host slots
         ggml_tensor * mexps[N_KIND] = {}; // refill: the model's (mapped) expert tensors, the refill source
         ggml_tensor * router[3] = {};     // ffn_gate_inp, ffn_gate_inp_b, ffn_exp_probs_b
+        std::vector<int32_t> host_expert; // exclusive: host slot -> expert at start
         ggml_tensor * state = nullptr;     // i32 [n_expert + 2*n_slot + 3]
                                            // (owner | slot_of | last_use | tick | cum_ids | cum_fills)
     };
