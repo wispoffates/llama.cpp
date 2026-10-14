@@ -82,6 +82,17 @@ template <> struct tile_mm_traits<GGML_TYPE_Q2_0> {
     static constexpr bool aligned = true;
     static constexpr bool flat    = true;
 };
+// one-block Q2_0 units for rows with an odd block count (K % 128 == 64), e.g. the per-device ffn_down slice of a -sm tensor split
+// (Flash-Next K 640 -> 320 = 5 blocks, 90-byte rows, only 2-aligned): staged from the aligned-down address like the IQ2 types. LP4:
+// these down projections fell back to MMQ's emulated DP4A (16 s of a 36K-token prefill).
+static constexpr ggml_type TMM_Q2_0_B1 = (ggml_type) (GGML_TYPE_COUNT + 1);
+template <> struct tile_mm_traits<TMM_Q2_0_B1> {
+    static constexpr int  UV      = QK2_0;  // one block, 18 bytes: 5 words from the aligned-down address
+    static constexpr int  RW      = 5;
+    static constexpr int  UB      = sizeof(block_q2_0);
+    static constexpr bool aligned = false;
+    static constexpr bool flat    = true;
+};
 template <> struct tile_mm_traits<GGML_TYPE_IQ2_S> {
     static constexpr int  UV      = QK_K;   // one superblock, 82 bytes: 21 words from the aligned-down address
     static constexpr int  RW      = 21;
@@ -154,7 +165,7 @@ static __device__ __forceinline__ half2 tile_mm_decode(const unsigned char * rb,
         const float    d  = __half2float(*(const __half *) b)*1024.0f;
         const uint32_t qw = *(const unsigned short *) (b + 2 + 2*(lane & 15));
         return __floats2half2_rn(d*(int) (signed char) (qw & 0xFF), d*(int) (signed char) (qw >> 8));
-    } else if constexpr (type == GGML_TYPE_Q2_0) {
+    } else if constexpr (type == GGML_TYPE_Q2_0 || type == TMM_Q2_0_B1) {
         // step st = block st of the unit; values 2j, 2j+1 = bits 4*(j%2) .. +3 of qs[j/2]; code c -> (c - 1)*d
         const unsigned char * b = rb + st*sizeof(block_q2_0);
         const float    d = __half2float(*(const __half *) b)*1024.0f;
@@ -489,6 +500,10 @@ static void tile_mm_launch_tn(const int tn, const tile_mm_params & prm, const in
 
 template <bool ID>
 static void tile_mm_dispatch(const ggml_type type, const int tn, const tile_mm_params & prm, const int splits_or_tiles, cudaStream_t stream) {
+    if (type == GGML_TYPE_Q2_0 && prm.K % (2*QK2_0) != 0) {   // odd block count per row: one-block units
+        tile_mm_launch_tn<TMM_Q2_0_B1, ID>(tn, prm, splits_or_tiles, stream);
+        return;
+    }
     switch (type) {
         case GGML_TYPE_Q6_K: tile_mm_launch_tn<GGML_TYPE_Q6_K, ID>(tn, prm, splits_or_tiles, stream); break;
         case GGML_TYPE_Q5_K: tile_mm_launch_tn<GGML_TYPE_Q5_K, ID>(tn, prm, splits_or_tiles, stream); break;
@@ -570,10 +585,18 @@ static bool tmm_weights_ok(const ggml_tensor * src0) {
             // units of two blocks: K % 64 keeps every row 4-aligned
             return q40_on && K % (2*QK4_0) == 0 && src0->nb[1] == (size_t) (K/QK4_0)*sizeof(block_q4_0) &&
                    ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
-        case GGML_TYPE_Q2_0:
-            // units of two blocks (36 bytes): K % 128 keeps every row 4-aligned
-            return lb_on && K % (2*QK2_0) == 0 && src0->nb[1] == (size_t) (K/QK2_0)*sizeof(block_q2_0) &&
-                   ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
+        case GGML_TYPE_Q2_0: {
+            // units of two blocks (36 bytes) when K % 128 == 0 (rows 4-aligned); otherwise one-block units staged from the aligned-down
+            // address, which read up to 2 bytes past a block but never past a 4-aligned matrix (or expert) when M*nbk is even
+            if (!lb_on || K % QK2_0 != 0 || src0->nb[1] != (size_t) (K/QK2_0)*sizeof(block_q2_0) || src0->nb[2] % 4 != 0) {
+                return false;
+            }
+            if (K % (2*QK2_0) == 0) {
+                return ((uintptr_t) src0->data % 4) == 0;
+            }
+            static const bool b1_on = tmm_env_on("GGML_CUDA_TILE_Q2_0_B1");
+            return b1_on && ((uintptr_t) src0->data % 4) == 0 && (M*(K/QK2_0)) % 2 == 0;
+        }
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ2_XXS: {
             // 2-aligned blocks staged from the aligned-down address: never past the matrix when M*nbk is even (as q6_K)
@@ -589,11 +612,11 @@ static bool tmm_weights_ok(const ggml_tensor * src0) {
     }
 }
 
-static int tmm_uv(const ggml_type type) {
+static int tmm_uv(const ggml_type type, const int64_t K) {
     switch (type) {
         case GGML_TYPE_Q8_0: return tile_mm_traits<GGML_TYPE_Q8_0>::UV;
         case GGML_TYPE_Q4_0: return tile_mm_traits<GGML_TYPE_Q4_0>::UV;
-        case GGML_TYPE_Q2_0: return tile_mm_traits<GGML_TYPE_Q2_0>::UV;
+        case GGML_TYPE_Q2_0: return K % (2*QK2_0) == 0 ? tile_mm_traits<GGML_TYPE_Q2_0>::UV : tile_mm_traits<TMM_Q2_0_B1>::UV;
         default:             return QK_K;    // q6_K, q5_K, q4_K, IQ2_S, IQ2_XXS, IQ1_M
     }
 }
@@ -623,7 +646,7 @@ bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     }
     const int tn   = N <= 16 ? 1 : N <= 32 ? 2 : N <= 48 ? 3 : N <= 64 ? 4 : 5;
     const int nwin = (int) ((K + TMM_WIN - 1)/TMM_WIN);
-    const int nu   = (int) (K/tmm_uv(type));
+    const int nu   = (int) (K/tmm_uv(type, K));
     const int tiles = (int) (((M + TMM_BM - 1)/TMM_BM)*((N + 16*tn - 1)/(16*tn)));
     const int nsm  = ggml_cuda_info().devices[ctx.device].nsm;
     // split-K: fill ~8 blocks per SM, at least 512 values per split
