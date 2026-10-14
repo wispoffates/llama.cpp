@@ -126,10 +126,13 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
-    GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
-    const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
-                        n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
-                                             flash_attn_mask_to_sparse_indices<8, false>;
+    // p100-series: 2 and 4 for the tile kernel's small query tiles (MTP verify)
+    GGML_ASSERT(ncols1 == 1 || ncols1 == 2 || ncols1 == 4 || ncols1 == 8);
+    const bool oob = n_queries % ncols1 != 0;
+    const auto kernel = ncols1 == 1 ? flash_attn_mask_to_sparse_indices<1, false> :
+                        ncols1 == 2 ? (oob ? flash_attn_mask_to_sparse_indices<2, true> : flash_attn_mask_to_sparse_indices<2, false>) :
+                        ncols1 == 4 ? (oob ? flash_attn_mask_to_sparse_indices<4, true> : flash_attn_mask_to_sparse_indices<4, false>) :
+                                      (oob ? flash_attn_mask_to_sparse_indices<8, true> : flash_attn_mask_to_sparse_indices<8, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
