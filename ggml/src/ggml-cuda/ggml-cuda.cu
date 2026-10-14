@@ -79,6 +79,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -1827,6 +1828,11 @@ static void ggml_cuda_lru_assemble_dma(ggml_backend_cuda_context & ctx, ggml_ten
     auto pooled = [&](int e) { return owner[e] >= 0 && owner[e] < n_slot; };
     auto hidx   = [&](int e) { return hslot ? (int64_t) hslot[e] : (int64_t) e; };
 
+    // GGML_CUDA_LRU_DMA_STATS=1: host time spent issuing the copies (submission cost on the dispatching thread)
+    static const bool dma_stats = [] { const char * e = getenv("GGML_CUDA_LRU_DMA_STATS"); return e != nullptr && atoi(e) != 0; }();
+    static std::atomic<int64_t> st_ns{0}, st_calls{0}, st_copies{0}, st_bytes{0};
+    const auto st_t0 = std::chrono::steady_clock::now();
+    int64_t n_copies = 0, n_bytes = 0;
     for (int e = 0; e < n_expert; ) {
         if (pooled(e)) {
             e++;
@@ -1853,6 +1859,18 @@ static void ggml_cuda_lru_assemble_dma(ggml_backend_cuda_context & ctx, ggml_ten
                                          cudaMemcpyHostToDevice, copy_stream));
         }
         e += k;
+        n_copies++;
+        n_bytes += (int64_t) k * (n_rows == 1 ? (int64_t) seg_bytes : (int64_t) (seg_bytes * n_rows));
+    }
+    if (dma_stats) {
+        const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - st_t0).count();
+        st_ns += ns; st_copies += n_copies; st_bytes += n_bytes;
+        const int64_t c = ++st_calls;
+        if (c % 2000 == 0) {
+            GGML_LOG_INFO("lru dma stats: %lld assemblies, %lld copies (%.1f per assembly), %.2f GB, issue time %.2f s (%.1f us per copy)\n",
+                (long long) c, (long long) st_copies.load(), (double) st_copies.load() / c, st_bytes.load() / 1e9, st_ns.load() / 1e9,
+                st_ns.load() / 1e3 / std::max<int64_t>(1, st_copies.load()));
+        }
     }
     ggml_cuda_lru_assemble(ctx, dst, ctx.stream(), 32, /*pooled_only =*/ 1);
 }
