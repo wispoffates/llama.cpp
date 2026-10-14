@@ -1,6 +1,8 @@
 #include "ar-rank.cuh"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 #include <vector>
 
@@ -20,7 +22,14 @@
 // with a plain volatile read (Pascal).
 
 static constexpr int    AR_RANK_SLOTS        = 2;
-static constexpr int    AR_RANK_MAX_BLOCKS   = 8;
+static constexpr int    AR_RANK_MAX_BLOCKS   = 8;    // blocks for a small reduction (decode: latency-bound)
+static constexpr int    AR_RANK_ALLOC_BLOCKS = 128;  // arrival flags allocated per slot (large reductions use more blocks)
+// a reduction above 1 MiB (prefill activations with GGML_META_AR_MAX_BYTES raised) is bandwidth-bound: up to
+// GGML_CUDA_AR_BLOCKS_LARGE blocks (default 64) stripe the P2P writes and the sum
+static int ar_blocks_large() {
+    static const int v = [] { const char * e = getenv("GGML_CUDA_AR_BLOCKS_LARGE"); return e ? std::max(1, std::min(AR_RANK_ALLOC_BLOCKS, atoi(e))) : 64; }();
+    return v;
+}
 static constexpr int    AR_RANK_THREADS      = 256;
 static constexpr size_t AR_RANK_STRIDE       = 64; // bytes between arrival ints (one cache line each)
 
@@ -76,7 +85,7 @@ struct ggml_cuda_ar_rank_ctx {
     int      devices[2];
     size_t   max_bytes;
     char   * inbox[2];    // device i: AR_RANK_SLOTS * max_bytes, written by the peer
-    char   * arrival[2];  // device i: AR_RANK_SLOTS * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE, written by the peer
+    char   * arrival[2];  // device i: AR_RANK_SLOTS * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE, written by the peer
     uint32_t calls[2];    // per rank; both ranks issue the same sequence of reductions
     unsigned long long * prof[2] = {nullptr, nullptr};  // GGML_CUDA_AR_PROF: device ring per rank
     uint2 * ll[2] = {nullptr, nullptr};                 // device i: AR_RANK_SLOTS * AR_LL_MAX_ELEMS LL words, written by the peer
@@ -366,7 +375,7 @@ ggml_cuda_ar_rank_ctx * ggml_cuda_ar_rank_init(int dev0, int dev1, size_t max_by
     c->devices[0] = dev0;
     c->devices[1] = dev1;
     c->max_bytes  = max_bytes;
-    const size_t arrival_bytes = (size_t) AR_RANK_SLOTS * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE;
+    const size_t arrival_bytes = (size_t) AR_RANK_SLOTS * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE;
     bool ok = true;
     for (int i = 0; i < 2 && ok; ++i) {
         ggml_cuda_set_device(c->devices[i]);
@@ -453,12 +462,13 @@ void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t 
     const int      slot  = token % AR_RANK_SLOTS;
     const int      n     = (int) ggml_nelements(t);
     const int      n4    = n / 4;
-    const int      nb    = std::max(1, std::min(AR_RANK_MAX_BLOCKS, (n4 + AR_RANK_THREADS - 1) / AR_RANK_THREADS));
+    const int      maxb  = (size_t) n * sizeof(float) > ((size_t) 1 << 20) ? ar_blocks_large() : AR_RANK_MAX_BLOCKS;
+    const int      nb    = std::max(1, std::min(maxb, (n4 + AR_RANK_THREADS - 1) / AR_RANK_THREADS));
 
     float * wire_out   = (float *) (c->inbox[peer] + (size_t) slot * c->max_bytes);
     float * wire_in    = (float *) (c->inbox[rank] + (size_t) slot * c->max_bytes);
-    int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
-    int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
+    int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
+    int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
 
     const bool ll = ar_ll_enabled() && n <= ar_ll_max();
     if (c->prof[rank] != nullptr) {
@@ -496,12 +506,12 @@ void ggml_cuda_ar_rank_reduce_norm(ggml_cuda_ar_rank_ctx * c, int rank, cudaStre
     const int      slot  = token % AR_RANK_SLOTS;
     const int      ncols = (int) t->ne[0];
     const int      nrows = (int) ggml_nrows(t);
-    const int      nb    = std::min(AR_RANK_MAX_BLOCKS, nrows);
+    const int      nb    = std::min((size_t) ggml_nbytes(t) > ((size_t) 1 << 20) ? ar_blocks_large() : AR_RANK_MAX_BLOCKS, nrows);
 
     float * wire_out   = (float *) (c->inbox[peer] + (size_t) slot * c->max_bytes);
     float * wire_in    = (float *) (c->inbox[rank] + (size_t) slot * c->max_bytes);
-    int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
-    int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_MAX_BLOCKS * AR_RANK_STRIDE);
+    int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
+    int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
 
     const bool ll = ar_ll_enabled() && (int64_t) ncols * nrows <= ar_ll_max();
     const bool v4 = ar_ll_v4() && ncols % 2 == 0;
