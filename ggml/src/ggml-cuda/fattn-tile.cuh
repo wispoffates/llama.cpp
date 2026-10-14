@@ -374,7 +374,21 @@ static constexpr __device__ int ggml_cuda_fattn_tile_get_nbatch_K(const int DKQ,
 }
 
 // TODO: deduplicate with mma-f16
-template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+// p100-series: NaN-safe masking. A masked key must not influence the output even when its cached K/V are non-finite (another
+// sequence's NaN rows in a unified KV cache: QK(NaN) + (-inf) = NaN and 0 * V(NaN) = NaN spoiled every slot until those cells were
+// overwritten). Masked scores are forced to -inf with a select, V values are loaded as 0 when non-finite. Identical for finite data.
+static __device__ __forceinline__ float fattn_masked_add(const float kq, const float slope, const half m) {
+    const float mf = __half2float(m);
+    return mf == -INFINITY ? -INFINITY : kq + slope*mf;
+}
+static __device__ __forceinline__ half2 fattn_finite_h2(const half2 v) {
+    uint32_t u = *(const uint32_t *) &v;
+    if ((u & 0x00007C00u) == 0x00007C00u) { u &= 0xFFFF0000u; }   // low half inf/NaN -> +0
+    if ((u & 0x7C000000u) == 0x7C000000u) { u &= 0x0000FFFFu; }   // high half inf/NaN -> +0
+    return *(const half2 *) &u;
+}
+
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, bool finite = false>
 static __device__ __forceinline__ void flash_attn_tile_load_tile(
         const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
@@ -405,9 +419,19 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
 
                     const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
-                    ggml_cuda_memcpy_1<cpy_nb>(
-                        tile_KV + i*(J/2 + J_padding) + j,
-                        !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
+                    if constexpr (finite) {
+                        __align__(16) half2 tmp[cpy_ne];
+                        ggml_cuda_memcpy_1<cpy_nb>(tmp, !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
+#pragma unroll
+                        for (int l = 0; l < cpy_ne; ++l) {
+                            tmp[l] = fattn_finite_h2(tmp[l]);
+                        }
+                        ggml_cuda_memcpy_1<cpy_nb>(tile_KV + i*(J/2 + J_padding) + j, tmp);
+                    } else {
+                        ggml_cuda_memcpy_1<cpy_nb>(
+                            tile_KV + i*(J/2 + J_padding) + j,
+                            !oob_check || i < i_sup ? KV + i*stride_KV + j : zero);
+                    }
                 }
             }
         }
@@ -424,7 +448,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
     ggml_cuda_unroll<7>{}(load);
 }
 
-template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check, bool finite = false>
 static __device__ __forceinline__ void flash_attn_tile_load_tile(
         const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
@@ -462,7 +486,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     __align__(16) float2 tmp_f2[cpy_ne/2];
 #pragma unroll
                     for (int l = 0; l < cpy_ne/2; ++l) {
-                        tmp_f2[l] = __half22float2(tmp_h2[l]);
+                        tmp_f2[l] = __half22float2(finite ? fattn_finite_h2(tmp_h2[l]) : tmp_h2[l]);
                     }
                     ggml_cuda_memcpy_1<sizeof(tmp_f2)>(tile_KV + i*(J + J_padding) + 2*j, tmp_f2);
                 }
@@ -636,8 +660,10 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
+                if (ncols2 > 1 || mask) {
+                    KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] = fattn_masked_add(KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0], slope,
+                        mask[j*stride_mask + k_VKQ_0 + i_KQ]);
+                }
 
                 KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
             }
@@ -718,7 +744,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     static_assert(nbatch_V % np == 0, "bad nbatch_V");
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
-        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check, /*finite =*/ true>
             (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
         __syncthreads();
 
