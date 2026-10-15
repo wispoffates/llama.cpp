@@ -638,18 +638,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     cur = build_lora_mm(model.output, cur, model.output_s);
 
-    // reduced draft vocabulary: scatter the draft logits into the target vocabulary (-inf elsewhere), as dflash does
-    if (model.d2t) {
-        const int64_t n_draft_vocab = cur->ne[0];
-        const int64_t n_outputs     = cur->ne[1];
-        const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
-        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == n_draft_vocab);
-        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
-        cur = ggml_set_rows(ctx0, logits,
-                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
-                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
-        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
-    }
+    // a reduced-vocabulary head (d2t) outputs only its rows; llama_context scatters them to target ids while extracting logits
+    // (a graph-side set_rows over the vocab-split logits trips the tensor-split meta backend: set_rows on SPLIT_AXIS_1)
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 }
