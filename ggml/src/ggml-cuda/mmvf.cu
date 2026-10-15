@@ -418,10 +418,11 @@ static void mul_mat_vec_f_switch_fusion(
 // p100-series: one column, short rows (K <= 1024). The block-per-row kernel above gives each row its own block of K/2 threads,
 // so a K = 320 row is one pass of 160 threads and the launch is dominated by per-block overhead (qwen4exp hyper-connection
 // up-projections, BF16 320 -> 10240: 75 us = ~87 GB/s on P100). Here one warp owns a row and a block holds 8 rows.
-template <typename T, int rows_per_block>
+// 2..8 columns (MTP / speculative verify batches): each weight pair is loaded once and used for every column.
+template <typename T, int rows_per_block, int ncols_dst = 1>
 static __global__ void mul_mat_vec_f_shortk(
         const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols2, const int nrows,
-        const int stride_row, const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int stride_row, const int stride_col_y2, const int stride_col_dst, const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
     const int lane        = threadIdx.x;
     const int row         = blockIdx.x*rows_per_block + threadIdx.y;
@@ -439,7 +440,7 @@ static __global__ void mul_mat_vec_f_shortk(
     dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
 
     const float2 * y2 = (const float2 *) y;
-    float sumf = 0.0f;
+    float sumf[ncols_dst] = {0.0f};
     for (int col2 = lane; col2 < ncols2; col2 += WARP_SIZE) {
         float2 tmpx;
         if constexpr (std::is_same_v<T, float>) {
@@ -450,24 +451,34 @@ static __global__ void mul_mat_vec_f_shortk(
             const nv_bfloat162 t = ((const nv_bfloat162 *) x)[col2];
             tmpx = make_float2(ggml_cuda_cast<float>(t.x), ggml_cuda_cast<float>(t.y));
         }
-        const float2 tmpy = __ldg(y2 + col2);
-        sumf += tmpx.x*tmpy.x;
-        sumf += tmpx.y*tmpy.y;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float2 tmpy = __ldg(y2 + j*stride_col_y2 + col2);
+            sumf[j] += tmpx.x*tmpy.x;
+            sumf[j] += tmpx.y*tmpy.y;
+        }
     }
     ggml_cuda_pdl_lc();
-    sumf = warp_reduce_sum<WARP_SIZE>(sumf);
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<WARP_SIZE>(sumf[j]);
+    }
     if (lane == 0) {
-        dst[row] = sumf;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            dst[j*stride_col_dst + row] = sumf[j];
+        }
     }
 }
 
 // p100-series: one column, long rows of 16-bit weights (K >= 4096) and few rows (qwen4exp hyper-connection down-projections,
 // BF16 10240 -> 320: 320 blocks of 256 threads with 4-byte loads keep too little in flight, ~330 GB/s). Same block-per-row shape,
 // 16-byte loads (8 weights per thread per step).
-template <typename T>
+// 2..8 columns: the 16-byte weight load is reused for every column.
+template <typename T, int ncols_dst = 1>
 static __global__ void __launch_bounds__(256) mul_mat_vec_f_longk(
         const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols8, const int stride_row,
-        const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const int stride_col_y4, const int stride_col_dst, const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
     static_assert(sizeof(T) == 2, "16-bit weights");
     const int row         = blockIdx.x;
@@ -484,10 +495,9 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_f_longk(
 
     const uint4  * x8 = (const uint4 *) x;
     const float4 * y4 = (const float4 *) y;
-    float sumf = 0.0f;
+    float sumf[ncols_dst] = {0.0f};
     for (int i = tid; i < ncols8; i += 256) {
         const uint4  w  = __ldg(x8 + i);
-        const float4 ya = __ldg(y4 + 2*i), yb = __ldg(y4 + 2*i + 1);
         float2 f[4];
         const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
 #pragma unroll
@@ -498,27 +508,44 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_f_longk(
                 f[q] = make_float2(__uint_as_float(ww[q] << 16), __uint_as_float(ww[q] & 0xffff0000u));   // bf16 -> f32 exact
             }
         }
-        sumf += f[0].x*ya.x; sumf += f[0].y*ya.y; sumf += f[1].x*ya.z; sumf += f[1].y*ya.w;
-        sumf += f[2].x*yb.x; sumf += f[2].y*yb.y; sumf += f[3].x*yb.z; sumf += f[3].y*yb.w;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float4 ya = __ldg(y4 + j*stride_col_y4 + 2*i), yb = __ldg(y4 + j*stride_col_y4 + 2*i + 1);
+            float & sf = sumf[j];
+            sf += f[0].x*ya.x; sf += f[0].y*ya.y; sf += f[1].x*ya.z; sf += f[1].y*ya.w;
+            sf += f[2].x*yb.x; sf += f[2].y*yb.y; sf += f[3].x*yb.z; sf += f[3].y*yb.w;
+        }
     }
     ggml_cuda_pdl_lc();
-    __shared__ float red[8];
-    sumf = warp_reduce_sum<WARP_SIZE>(sumf);
-    if ((tid & 31) == 0) {
-        red[tid >> 5] = sumf;
+    __shared__ float red[ncols_dst][8];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        const float v = warp_reduce_sum<WARP_SIZE>(sumf[j]);
+        if ((tid & 31) == 0) {
+            red[j][tid >> 5] = v;
+        }
     }
     __syncthreads();
     if (tid < 32) {
-        sumf = tid < 8 ? red[tid] : 0.0f;
-        sumf = warp_reduce_sum<WARP_SIZE>(sumf);
-        if (tid == 0) {
-            dst[row] = sumf;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            float v = tid < 8 ? red[j][tid] : 0.0f;
+            v = warp_reduce_sum<WARP_SIZE>(v);
+            if (tid == 0) {
+                dst[j*stride_col_dst + row] = v;
+            }
         }
     }
 }
 
 static bool ggml_cuda_mmvf_shortk_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
+// GGML_CUDA_MMVF_SHORTK_NC=0: 2..8-column batches use the generic kernel again (the 1-column paths stay on)
+static bool ggml_cuda_mmvf_shortk_nc_enabled() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK_NC"); return e == nullptr || atoi(e) != 0; }();
     return on;
 }
 
@@ -559,27 +586,29 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
-    if constexpr (ncols_dst == 1 && !is_multi_token_id && std::is_same_v<type_acc, float>) {
-        if (ids == nullptr && !has_fusion && warp_size == 32 && ncols <= 1024 && nrows >= 1024 && ggml_cuda_mmvf_shortk_enabled()) {
+    if constexpr (ncols_dst <= 8 && !is_multi_token_id && std::is_same_v<type_acc, float>) {
+        const bool nc_ok = ncols_dst == 1 || (ggml_cuda_mmvf_shortk_nc_enabled() && stride_col_y % 2 == 0);
+        if (ids == nullptr && !has_fusion && warp_size == 32 && ncols <= 1024 && nrows >= 1024 && nc_ok && ggml_cuda_mmvf_shortk_enabled()) {
             constexpr int rpb = 8;
             const dim3 block_nums_sk((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
             const dim3 block_dims_sk(WARP_SIZE, rpb, 1);
             const ggml_cuda_kernel_launch_params launch_params = {block_nums_sk, block_dims_sk, 0, stream};
-            ggml_cuda_kernel_launch(mul_mat_vec_f_shortk<T, rpb>, launch_params,
-                x, y, dst, (int) (ncols/2), (int) nrows, (int) stride_row, channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y,
+            ggml_cuda_kernel_launch(mul_mat_vec_f_shortk<T, rpb, ncols_dst>, launch_params,
+                x, y, dst, (int) (ncols/2), (int) nrows, (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst, channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y,
                 (int) stride_channel_dst, sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
             return;
         }
         if constexpr (sizeof(T) == 2) {
             const bool al16 = (uintptr_t) x % 16 == 0 && (uintptr_t) y % 16 == 0 && (stride_row*sizeof(T)) % 16 == 0 &&
                               (stride_channel_x*sizeof(T)) % 16 == 0 && (stride_sample_x*sizeof(T)) % 16 == 0 &&
-                              (stride_channel_y*sizeof(float)) % 16 == 0 && (stride_sample_y*sizeof(float)) % 16 == 0;
-            if (ids == nullptr && !has_fusion && warp_size == 32 && ncols >= 4096 && ncols % 8 == 0 && nrows <= 2048 && al16 &&
+                              (stride_channel_y*sizeof(float)) % 16 == 0 && (stride_sample_y*sizeof(float)) % 16 == 0 &&
+                              (ncols_dst == 1 || (stride_col_y*sizeof(float)) % 16 == 0);
+            if (ids == nullptr && !has_fusion && warp_size == 32 && ncols >= 4096 && ncols % 8 == 0 && nrows <= 2048 && al16 && nc_ok &&
                     ggml_cuda_mmvf_shortk_enabled()) {
                 const dim3 block_nums_lk(nrows, nchannels_dst, nsamples_or_ntokens);
                 const ggml_cuda_kernel_launch_params launch_params = {block_nums_lk, dim3(256, 1, 1), 0, stream};
-                ggml_cuda_kernel_launch(mul_mat_vec_f_longk<T>, launch_params,
-                    x, y, dst, (int) (ncols/8), (int) stride_row, channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y,
+                ggml_cuda_kernel_launch(mul_mat_vec_f_longk<T, ncols_dst>, launch_params,
+                    x, y, dst, (int) (ncols/8), (int) stride_row, (int) (stride_col_y/4), (int) stride_col_dst, channel_ratio_fd, (int) stride_channel_x, (int) stride_channel_y,
                     (int) stride_channel_dst, sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
                 return;
             }
