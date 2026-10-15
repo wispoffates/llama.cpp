@@ -2711,6 +2711,12 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_lru_remap(
             struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state, int32_t n_expert, int32_t n_slot);
 
+    // ggml_lru_decide_ext with route-tail skip: a missing expert that every entry of the batch ranks >= tail (0-based position in the
+    // descending top-k) is neither filled nor computed -- its entries read the same token's rank-0 slot and get keep = 0. The output
+    // gains n_ids int32 keep flags (1 = keep, 0 = skipped) after the fill list.
+    GGML_API struct ggml_tensor * ggml_lru_decide_tail(
+            struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+            int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer, int32_t tail);
     GGML_API struct ggml_tensor * ggml_lru_decide_ext(
             struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
             int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer);
