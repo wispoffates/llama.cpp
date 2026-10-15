@@ -1457,11 +1457,14 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 // one warp: hits are looked up in parallel, misses are handled in order (each eviction depends on the previous one) with the
 // least-recently-used slot found by a warp argmin (lowest slot on ties, as a sequential scan would pick). The state update is
 // deterministic. ids may be a strided view (nb[1] != n_used*4), so every read goes through the row stride
+static __device__ unsigned long long lru_tail_skipped = 0, lru_tail_filled = 0, lru_tail_calls = 0;   // GGML_CUDA_LRU_TAIL_STATS
+
 static __global__ void k_lru_decide(
         const int32_t * __restrict__ ids, int32_t * slot_ids,   // no __restrict__: lanes read what lane 0 wrote
         int32_t * state, int32_t * fill_list,
         int n_used, int n_tokens, int n_expert, int n_slot, int ids_stride, int exclusive,
-        ggml_lru_ctrl * ctrl, int layer, int log_dev, int log_dev_index, int remap) {
+        ggml_lru_ctrl * ctrl, int layer, int log_dev, int log_dev_index, int remap,
+        int tail, int32_t * keep, int tail_stats) {
     const int lane = threadIdx.x;
     int32_t * owner    = state;                     // expert -> slot
     int32_t * slot_of  = state + n_expert;          // slot -> expert
@@ -1481,6 +1484,7 @@ static __global__ void k_lru_decide(
 
     for (int i = lane; i < n_total; i += WARP_SIZE) {
         const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
+        if (keep) keep[i] = 1;
         if (e < 0 || e >= n_expert) continue;
         const int32_t s = owner[e];
         slot_ids[i] = s;
@@ -1489,6 +1493,7 @@ static __global__ void k_lru_decide(
     __syncwarp();
 
     int n_fill = 0;
+    int n_skip = 0;
     for (int i = 0; i < n_total; i++) {
         if (slot_ids[i] >= 0) continue;
         const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
@@ -1498,6 +1503,24 @@ static __global__ void k_lru_decide(
             if (lane == 0) slot_ids[i] = own;
             __syncwarp();
             continue;
+        }
+        if (tail > 0) {
+            // p100-series route-tail skip (Strata's rule): a missing expert that every entry of the batch ranks >= tail is neither
+            // filled nor computed; its entries read the token's rank-0 slot (resolved earlier in this loop) with keep = 0
+            bool tail_only = true;
+            for (int j = lane; j < n_total; j += WARP_SIZE) {
+                if (ids[(j / n_used) * ids_stride + j % n_used] == e && j % n_used < tail) tail_only = false;
+            }
+            tail_only = __all_sync(0xffffffff, tail_only);
+            if (tail_only) {
+                if (lane == 0) {
+                    slot_ids[i] = slot_ids[(i / n_used) * n_used];
+                    keep[i] = 0;
+                }
+                n_skip++;
+                __syncwarp();
+                continue;
+            }
         }
         int32_t bv = INT_MAX; int bs = n_slot;
         for (int s = lane; s < n_slot; s += WARP_SIZE) {
@@ -1562,6 +1585,12 @@ static __global__ void k_lru_decide(
         state[n_expert + 2 * n_slot + 1] += n_total;
         state[n_expert + 2 * n_slot + 2] += n_fill;
         fill_list[3 * n_slot] = n_fill;
+        if (tail_stats) {   // GGML_CUDA_LRU_TAIL_STATS=1: cumulative skipped / filled entries (device 0, layer 0 calls)
+            lru_tail_skipped += n_skip; lru_tail_filled += n_fill;
+            if (log_dev && (++lru_tail_calls % 4096) == 0) {
+                printf("LRU_TAIL calls=%llu skipped=%llu filled=%llu\n", lru_tail_calls, lru_tail_skipped, lru_tail_filled);
+            }
+        }
     }
 }
 
@@ -2760,13 +2789,17 @@ static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_lru_ctrl * ctrl;
     memcpy(&ctrl, (const char *) dst->op_params + 8, sizeof(ctrl));
     const int layer = ggml_get_op_params_i32(dst, 4);
+    const int tail  = remap ? 0 : ggml_get_op_params_i32(dst, 6);
+    int32_t * keep  = tail > 0 ? fill_list + 3 * (size_t) n_slot + 1 : nullptr;
+    static const int tail_stats = [] { const char * e = getenv("GGML_CUDA_LRU_TAIL_STATS"); return e && atoi(e) != 0; }();
     int dev = 0;
     cudaGetDevice(&dev);
 
     k_lru_decide<<<1, WARP_SIZE, 0, ctx.stream()>>>(
         (const int32_t *) ids->data, (int32_t *) dst->data,
         (int32_t *) state->data, fill_list,
-        n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, remap ? nullptr : ctrl, layer, dev == 0, dev, remap);
+        n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, remap ? nullptr : ctrl, layer, dev == 0, dev, remap,
+        tail, keep, tail > 0 && tail_stats);
 }
 
 static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {

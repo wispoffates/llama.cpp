@@ -2396,8 +2396,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(gate_up_exps == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr &&
                     down_exps_b == nullptr && gate_up_exps_b == nullptr &&
                     up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr);
-        ggml_tensor * out = ggml_lru_decide_ext(ctx0, selected_experts, lru->state_get(il),
+        // LLAMA_MOE_LRU_TAIL_SKIP=R (Strata's route-tail skip, 1-based rank): a missing expert that every token of the batch ranks R or
+        // lower is neither filled nor computed and its routing weight is dropped (no renormalisation). 0 / unset = off.
+        static const int tail_rank = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL_SKIP"); return e ? atoi(e) : 0; }();
+        const int tail = tail_rank > 1 && tail_rank <= n_expert_used ? tail_rank - 1 : 0;
+        ggml_tensor * out = tail > 0 ?
+            ggml_lru_decide_tail(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots(),
+                                 lru->ctrl(), lru->pool_index(il), tail) :
+            ggml_lru_decide_ext(ctx0, selected_experts, lru->state_get(il),
                                             (int32_t) hparams.n_expert, (int32_t) lru->n_slots(), lru->ctrl(), lru->pool_index(il));
+        if (tail > 0) {
+            ggml_tensor * keep = ggml_view_1d(ctx0, out, (int64_t) n_expert_used * n_tokens,
+                                              ((int64_t) n_expert_used * n_tokens + 3 * lru->n_slots() + 1) * sizeof(int32_t));
+            keep = ggml_reshape_3d(ctx0, ggml_cast(ctx0, keep, GGML_TYPE_F32), 1, n_expert_used, n_tokens);
+            weights = ggml_mul(ctx0, weights, keep);
+            cb(weights, "ffn_moe_weights_tail", il);
+        }
         ggml_tensor * slot = ggml_view_2d(ctx0, out, n_expert_used, n_tokens,
                                           n_expert_used * sizeof(int32_t), 0);
         ggml_build_forward_expand(gf, slot);
