@@ -554,6 +554,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     }
 }
 
+static __device__ unsigned int fa_probe_count = 0;   // TEST ONLY (skip probe)
+
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
     bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc>
@@ -746,11 +748,29 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
                 }
             }
 
+            // TEST ONLY (skip probe): for keys whose weights are 0 for all of the warp's columns, check whether the FMAs v5.20 does
+            // anyway change the accumulator bits; print the first cases. The FMAs are always applied (v5.20 numerics).
+            bool KQ_any = false;
+#pragma unroll
+            for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                KQ_any = KQ_any || (__half_as_ushort(__low2half(KQ_k[jc_VKQ_0])) & 0x7FFF) != 0;
+            }
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
 #pragma unroll
                 for (int jc_VKQ_0 = 0; jc_VKQ_0 < cpw; ++jc_VKQ_0) {
+                    const half2 old = VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size];
                     VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size] += V_k[i0/warp_size]*KQ_k[jc_VKQ_0];
+                    if (!KQ_any) {
+                        const half2 nw = VKQ[jc_VKQ_0*((DVp/2)/warp_size) + i0/warp_size];
+                        const uint32_t ob = *(const uint32_t *) &old, nb = *(const uint32_t *) &nw;
+                        if (ob != nb && atomicAdd(&fa_probe_count, 1u) < 24u) {
+                            printf("FAPROBE D=%d nc1=%d nc2=%d blk=(%d,%d,%d) thr=(%d,%d) k=%d jc=%d old=%08x V=%08x KQ=%08x new=%08x\n",
+                                DKQ, ncols1, ncols2, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+                                k_VKQ_0 + k0 + k1 + threadIdx.y % np, jc_VKQ_0, ob, *(const uint32_t *) &V_k[i0/warp_size],
+                                *(const uint32_t *) &KQ_k[jc_VKQ_0], nb);
+                        }
+                    }
                 }
             }
         }
