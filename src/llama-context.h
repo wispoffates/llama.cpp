@@ -303,6 +303,7 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+    std::vector<int64_t> d2t_host; // reduced-vocabulary draft head: draft row -> target token id (host copy of model.d2t)
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
