@@ -1460,7 +1460,23 @@ static __global__ void k_lru_decide(
             tail_only = __all_sync(0xffffffff, tail_only);
             if (tail_only) {
                 if (lane == 0) {
-                    slot_ids[i] = slot_ids[(i / n_used) * n_used];
+                    // the entry must read an owned slot (finite data; weight 0) that is NOT already in this token's row: duplicate ids
+                    // in a row break the multi-token MUL_MAT_ID ids helper (RTD: illegal address in tile_mm_id with the rank-0 slot).
+                    // Refreshing its recency keeps a later fill of this batch from evicting it into another duplicate.
+                    const int base = (i / n_used) * n_used;
+                    int c = -1;
+                    for (int m = 0; m < n_slot && c < 0; ++m) {
+                        const int cand = (slot_ids[base] + 1 + m) % n_slot;
+                        if (slot_of[cand] < 0) continue;
+                        bool used = false;
+                        for (int q = 0; q < n_used; ++q) {
+                            if (slot_ids[base + q] == cand) { used = true; break; }
+                        }
+                        if (!used) c = cand;
+                    }
+                    if (c < 0) c = slot_ids[base];   // unreachable with n_slot > n_used owned slots
+                    last_use[c] = t0;
+                    slot_ids[i] = c;
                     keep[i] = 0;
                 }
                 n_skip++;
