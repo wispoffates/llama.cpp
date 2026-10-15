@@ -2285,9 +2285,29 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
                 } else {
                     // a head over the first ne0 tokens only (LLAMA_MTP_DRAFT_VOCAB): the rest get -inf
+                    // p100-series: a reduced-vocabulary head (model.d2t, FR-Spec) scatters row i to target id d2t[i] instead
                     const int64_t nd = t_logits->ne[0];
                     GGML_ASSERT(nd < n_vocab && ggml_nelements(t_logits) >= nd*n_outputs);
-                    if (n_outputs == 1) {
+                    if (model.d2t && d2t_host.empty()) {
+                        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64 && model.d2t->ne[0] == nd);
+                        d2t_host.resize(nd);
+                        ggml_backend_tensor_get(model.d2t, d2t_host.data(), 0, nd*sizeof(int64_t));
+                        for (int64_t id : d2t_host) {
+                            GGML_ASSERT(id >= 0 && id < n_vocab);
+                        }
+                    }
+                    if (!d2t_host.empty()) {
+                        std::vector<float> tmp(nd*n_outputs);
+                        ggml_backend_sched_synchronize(sched.get());
+                        ggml_backend_tensor_get(t_logits, tmp.data(), 0, tmp.size()*sizeof(float));
+                        for (int64_t r = 0; r < n_outputs; ++r) {
+                            float * row = logits_out + r*n_vocab;
+                            std::fill(row, row + n_vocab, -INFINITY);
+                            for (int64_t i = 0; i < nd; ++i) {
+                                row[d2t_host[i]] = tmp[r*nd + i];
+                            }
+                        }
+                    } else if (n_outputs == 1) {
                         ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, nd*sizeof(float));
                         std::fill(logits_out + nd, logits_out + n_vocab, -INFINITY);
                     } else {
