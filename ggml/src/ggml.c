@@ -6161,6 +6161,24 @@ struct ggml_tensor * ggml_lru_decide_ext(
     return r;
 }
 
+struct ggml_tensor * ggml_lru_decide_tail(
+        struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+        int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer, int32_t tail) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32 && tail > 0);
+    GGML_ASSERT(ggml_nelements(state) >= (int64_t) n_expert + 2 * n_slot + 3);
+    const int64_t ne[1] = { 2 * ggml_nelements(ids) + 3 * (int64_t) n_slot + 1 };   // slots | fill list | keep flags
+    struct ggml_tensor * r = ggml_new_tensor(ctx, GGML_TYPE_I32, 1, ne);
+    ggml_set_op_params_i32(r, 0, n_expert);
+    ggml_set_op_params_i32(r, 1, n_slot);
+    memcpy((char *) r->op_params + 8, &ctrl, sizeof(ctrl));
+    ggml_set_op_params_i32(r, 4, layer);
+    ggml_set_op_params_i32(r, 6, tail);
+    r->op     = GGML_OP_LRU_DECIDE;
+    r->src[0] = ids;
+    r->src[1] = state;
+    return r;
+}
+
 struct ggml_tensor * ggml_lru_fill_ext(
         struct ggml_context * ctx, struct ggml_tensor * fill_list, struct ggml_tensor * src, struct ggml_tensor * pool,
         struct ggml_lru_ctrl * ctrl, int32_t layer) {
