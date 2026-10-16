@@ -1504,6 +1504,18 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // p100-series LRU fill overlap (GGML_CUDA_LRU_OVERLAP=1): the decode fill runs on a high-priority side stream; the expert
+    // matvec computes the resident entries first, waits for lru_ovl_fill_event, then the filled ones
+    cudaStream_t lru_ovl_stream = nullptr;
+    cudaEvent_t  lru_ovl_dec_event = nullptr;
+    cudaEvent_t  lru_ovl_fill_event = nullptr;
+    bool         lru_ovl_active = false;
+    const int32_t * lru_ovl_fill = nullptr;
+    int          lru_ovl_nslot = 0;
+    int          lru_ovl_npools = 0;
+    const char * lru_ovl_pool[3] = {};
+    size_t       lru_ovl_pool_bytes[3] = {};
+
     // p100-series: LRU_ASSEMBLE runs on a side stream (prefill copy/compute overlap); the side stream first waits for the main
     // stream's position (the allocator may reuse memory of earlier nodes), a consumer waits for the assembly's event. Pending
     // assemblies are drained into the main stream at the end of every graph evaluation.
@@ -1689,6 +1701,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // p100-series LRU fill overlap (GGML_CUDA_LRU_OVERLAP=1): an entry is pending when its pool slot is a fill target of the
+    // in-flight fill (fill list: [3*j+1] = slot, count at [3*n_slot]); mode 1 = skip pending entries, 2 = only pending entries
+    const int32_t * ovl_fill = nullptr;
+    int ovl_nslot = 0;
+    int ovl_mode = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {
@@ -1821,3 +1838,7 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// p100-series LRU fill overlap helpers (ggml-cuda.cu)
+void ggml_cuda_lru_ovl_join(ggml_backend_cuda_context & ctx);
+bool ggml_cuda_lru_ovl_reads_pool(const ggml_backend_cuda_context & ctx, const ggml_tensor * t);
