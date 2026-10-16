@@ -758,6 +758,20 @@ static __global__ void mul_mat_vec_q(
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
+    // p100-series LRU fill overlap: block-uniform (one expert slot per block on the ids path), before any __syncthreads
+    if (ncols_dst == 1 && ids && fusion.ovl_mode != 0) {
+        bool pend = false;
+        if (!shared_expert) {
+            const int nf = fusion.ovl_fill[3*fusion.ovl_nslot];
+            for (int f = 0; f < nf; ++f) {
+                pend |= fusion.ovl_fill[3*f + 1] == (int) channel_x;
+            }
+        }
+        if (pend != (fusion.ovl_mode == 2)) {
+            return;
+        }
+    }
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -1202,6 +1216,20 @@ static __global__ void mul_mat_vec_q_moe(
     ggml_cuda_pdl_sync();
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+
+    // p100-series LRU fill overlap: each warp owns one (token, slot) pair and never synchronises with the others
+    if (fusion.ovl_mode != 0) {
+        bool pend = false;
+        if (!shared_expert) {
+            const int nf = fusion.ovl_fill[3*fusion.ovl_nslot];
+            for (int f = 0; f < nf; ++f) {
+                pend |= fusion.ovl_fill[3*f + 1] == (int) channel_x;
+            }
+        }
+        if (pend != (fusion.ovl_mode == 2)) {
+            return;
+        }
+    }
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
@@ -1750,6 +1778,21 @@ void ggml_cuda_mul_mat_vec_q(
 
     cudaStream_t stream = ctx.stream();
 
+    // p100-series LRU fill overlap: a fused gate/up expert matvec on a pool with an in-flight fill computes the resident entries
+    // first, then waits for the fill and computes the filled entries (generic kernels only); any other reader waits first
+    bool ovl = false;
+    if (ctx.lru_ovl_active && ids &&
+            (ggml_cuda_lru_ovl_reads_pool(ctx, src0) || (fusion && fusion->gate && ggml_cuda_lru_ovl_reads_pool(ctx, fusion->gate)))) {
+        // generic kernels only: h1 / h1s take q4_0 / q8_0 banks, the gp100 id path its own types (mmvq-lb is opt-in)
+        ovl = !(fusion && fusion->shared_up) && dst->ne[2] <= MMVQ_MAX_BATCH_SIZE &&
+              src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q8_0 &&
+              !(ggml_cuda_hybrid_mmvq_id_enabled() &&
+                ggml_cuda_gp100_mmvq_id_supported(ggml_cuda_info().devices[ctx.device].cc, src0, src1, ids, dst, fusion));
+        if (!ovl) {
+            ggml_cuda_lru_ovl_join(ctx);
+        }
+    }
+
     if (ids) {
         // Pascal: fp16 one-thread-per-row path for short-K expert banks (mmvq-h1.cu h1s); must come first -- it may own a
         // deferred GLU (ctx.h1s_glu) that no other path computes
@@ -1931,11 +1974,25 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
-        ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
-        ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    auto launch = [&](const ggml_cuda_mm_fusion_args_device & f) {
+        mul_mat_vec_q_switch_type(
+            src0->data, src0->type, src1_q8_1.get(), ids_d, f, dst_d, ne00,
+            ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+            ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+            ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+    };
+    if (ovl && ctx.lru_ovl_active) {
+        ggml_cuda_mm_fusion_args_device f = fusion_local;
+        f.ovl_fill  = ctx.lru_ovl_fill;
+        f.ovl_nslot = ctx.lru_ovl_nslot;
+        f.ovl_mode  = 1;               // resident entries while the fill runs
+        launch(f);
+        ggml_cuda_lru_ovl_join(ctx);
+        f.ovl_mode  = 2;               // the filled entries
+        launch(f);
+        return;
+    }
+    launch(fusion_local);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
