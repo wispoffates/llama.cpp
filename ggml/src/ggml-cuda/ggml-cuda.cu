@@ -2865,6 +2865,59 @@ static __global__ void k_lru_write_back(const int32_t * __restrict__ fill_list, 
 static constexpr int LRU_STAGING_FILLS = 32;   // fills per call the staging buffer holds; more -> in-place swap
 
 // fills nodes[0..n) share one fill list (the gate/up/down fills of a layer): one launch
+// p100-series LRU fill overlap (GGML_CUDA_LRU_OVERLAP=1, opt-in): the decode fill (in-place swap) runs on a high-priority side
+// stream; the expert matvec on that pool computes its resident entries first, then waits for the fill (mmvq.cu); every other reader
+// of a filled pool, LRU_ASSEMBLE, the end of the graph and synchronize wait for the fill first. Off with GGML_CUDA_MMVQ_LB (that path
+// could take the matvec without the split).
+static bool ggml_cuda_lru_overlap_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_LRU_OVERLAP");
+        const char * lb = getenv("GGML_CUDA_MMVQ_LB");
+        return e != nullptr && atoi(e) != 0 && !(lb != nullptr && atoi(lb) != 0);
+    }();
+    return on;
+}
+
+void ggml_cuda_lru_ovl_join(ggml_backend_cuda_context & ctx) {
+    if (ctx.lru_ovl_active) {
+        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), ctx.lru_ovl_fill_event, 0));
+        ctx.lru_ovl_active = false;
+    }
+}
+
+bool ggml_cuda_lru_ovl_reads_pool(const ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    if (!ctx.lru_ovl_active || t == nullptr || t->data == nullptr) {
+        return false;
+    }
+    const char * d = (const char *) t->data;
+    for (int k = 0; k < ctx.lru_ovl_npools; ++k) {
+        if (d >= ctx.lru_ovl_pool[k] && d < ctx.lru_ovl_pool[k] + ctx.lru_ovl_pool_bytes[k]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// before node i (and the nodes a fusion may take with it): wait for an in-flight fill unless the only pool readers are expert
+// matvecs that split themselves (MUL_MAT_ID with <= MMVQ_MAX_BATCH_SIZE tokens)
+static void ggml_cuda_lru_ovl_guard(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const int last = std::min(cgraph->n_nodes, i + 4);
+    for (int n = i; n < last && ctx.lru_ovl_active; ++n) {
+        const ggml_tensor * node = cgraph->nodes[n];
+        if (node->op == GGML_OP_LRU_ASSEMBLE) {
+            ggml_cuda_lru_ovl_join(ctx);
+            return;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (ggml_cuda_lru_ovl_reads_pool(ctx, node->src[j]) &&
+                    !(node->op == GGML_OP_MUL_MAT_ID && node->ne[2] <= MMVQ_MAX_BATCH_SIZE)) {
+                ggml_cuda_lru_ovl_join(ctx);
+                return;
+            }
+        }
+    }
+}
+
 static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n) {
     const ggml_tensor * fill_list = nodes[0]->src[0];
     const int n_slot = (int) ((fill_list->ne[0] - 1) / 3);
@@ -2897,6 +2950,31 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
         staged = descs.d[k].estride % 16 == 0;
     }
     if (!staged) {
+        if (ggml_cuda_lru_overlap_enabled() && ctrl == nullptr) {
+            if (ctx.lru_ovl_stream == nullptr) {
+                ggml_cuda_set_device(ctx.device);
+                int lo = 0, hi = 0;
+                CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+                CUDA_CHECK(cudaStreamCreateWithPriority(&ctx.lru_ovl_stream, cudaStreamNonBlocking, hi));
+                CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_ovl_dec_event, cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_ovl_fill_event, cudaEventDisableTiming));
+            }
+            ggml_cuda_lru_ovl_join(ctx);   // one fill in flight at a time
+            CUDA_CHECK(cudaEventRecord(ctx.lru_ovl_dec_event, ctx.stream()));
+            CUDA_CHECK(cudaStreamWaitEvent(ctx.lru_ovl_stream, ctx.lru_ovl_dec_event, 0));
+            ggml_cuda_lru_wb_wait(ctx, ctx.lru_ovl_stream);
+            k_lru_fill<<<grid, block, 0, ctx.lru_ovl_stream>>>(fl, n_slot, descs, ctrl, layer, dev, ctx.lru_counter);
+            CUDA_CHECK(cudaEventRecord(ctx.lru_ovl_fill_event, ctx.lru_ovl_stream));
+            ctx.lru_ovl_active = true;
+            ctx.lru_ovl_fill   = fl;
+            ctx.lru_ovl_nslot  = n_slot;
+            ctx.lru_ovl_npools = n;
+            for (int k = 0; k < n; k++) {
+                ctx.lru_ovl_pool[k]       = descs.d[k].pool;
+                ctx.lru_ovl_pool_bytes[k] = (size_t) n_slot * descs.d[k].estride;
+            }
+            return;
+        }
         ggml_cuda_lru_wb_wait(ctx, ctx.stream());
         k_lru_fill<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, descs, ctrl, layer, dev, ctx.lru_counter);
         return;
@@ -3688,6 +3766,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_lru_drain(*cuda_ctx);
+    ggml_cuda_lru_ovl_join(*cuda_ctx);
     if (cuda_ctx->lru_wb_pending) {
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->lru_wb_event, 0));
         cuda_ctx->lru_wb_pending = false;
@@ -5946,6 +6025,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (cuda_ctx->n_lru_pending > 0) {
                     ggml_cuda_lru_wait_srcs(*cuda_ctx, cgraph, i);
                 }
+                if (cuda_ctx->lru_ovl_active) {
+                    ggml_cuda_lru_ovl_guard(*cuda_ctx, cgraph, i);
+                }
                 if (node->op == GGML_OP_LRU_ASSEMBLE && ggml_cuda_lru_async_enabled()) {
                     ggml_cuda_lru_assemble_async(*cuda_ctx, node);
                     continue;
@@ -6005,6 +6087,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             // pending LRU assemblies are NOT drained here: the meta backend computes one device graph in several calls (one
             // per AllReduce step), and a prefetched assembly is consumed a few calls later (its reader waits for it)
+            // an overlapped LRU fill is consumed by the expert matvec of the same layer = the same call; join here so no fill
+            // outlives its graph call (readers outside this backend never see a half-filled pool)
+            ggml_cuda_lru_ovl_join(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH
