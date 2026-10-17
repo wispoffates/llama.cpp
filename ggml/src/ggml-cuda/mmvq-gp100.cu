@@ -1444,24 +1444,32 @@ static bool gp100_cache_enabled() {
 }
 
 // fp16 activations of src1's first ncols columns (K each), from the cache when the previous matmul already made them
+// off_ys / off_s16 return where ys and s16 start: the fixed cache layout, or one sized for K * ncols when that exceeds the cache
 static char * gp100_prep(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, const int64_t K, const int ncols,
-                         ggml_cuda_pool_alloc<char> & tmp) {
+                         ggml_cuda_pool_alloc<char> & tmp, size_t & off_ys, size_t & off_s16) {
     cudaStream_t stream = ctx.stream();
     const int    nb32   = K / 32;
     char * base;
     bool   hit = false;
+    off_ys  = GP100_OFF_YS;
+    off_s16 = GP100_OFF_S16;
     if (gp100_cache_enabled() && K * ncols <= GP100_ACT_CACHE_MAX_K) {
         gp100_act_cache & c = gp100_cache(ctx);
         hit = c.src1 == src1 && c.data == src1->data && c.K == K && c.ncols == ncols && c.epoch == ctx.graph_epoch;
         c.src1 = src1; c.data = src1->data; c.K = K; c.ncols = ncols; c.epoch = ctx.graph_epoch;
         base = c.buf;
     } else {
-        base = tmp.alloc(GP100_ACT_BYTES);
+        // sized for THIS matmul (qr0n 0017): a fixed GP100_ACT_BYTES overflows once K * ncols > GP100_ACT_CACHE_MAX_K
+        // (dense 2..8-column Q4_K/Q5_K/IQ4_XS with K > 17408; no production model gets there, hardening)
+        const int64_t n = std::max<int64_t>(K * ncols, GP100_ACT_CACHE_MAX_K);
+        off_ys  = GGML_PAD(n * sizeof(half), 256);
+        off_s16 = off_ys + GGML_PAD(n / 32 * sizeof(float2), 256);
+        base    = tmp.alloc(off_s16 + n / 16 * sizeof(float));
     }
     if (!hit) {
         const int nblk = nb32 * ncols;
-        gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, (half *) base, (float2 *) (base + GP100_OFF_YS),
-                                                           (float *) (base + GP100_OFF_S16), nblk, nb32, src1->nb[1] / sizeof(float));
+        gp100_prep_act<<<(nblk + 3) / 4, 128, 0, stream>>>((const float *) src1->data, (half *) base, (float2 *) (base + off_ys),
+                                                           (float *) (base + off_s16), nblk, nb32, src1->nb[1] / sizeof(float));
     }
     return base;
 }
@@ -1474,10 +1482,11 @@ void ggml_cuda_gp100_mmvq(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const int     ncols = src1->ne[1];
 
     ggml_cuda_pool_alloc<char> tmp(ctx.pool());
-    char * base = gp100_prep(ctx, src1, K, ncols, tmp);
+    size_t off_ys, off_s16;
+    char * base = gp100_prep(ctx, src1, K, ncols, tmp, off_ys, off_s16);
     half   * y   = (half   *) base;
-    float2 * ys  = (float2 *) (base + GP100_OFF_YS);
-    float  * s16 = (float  *) (base + GP100_OFF_S16);
+    float2 * ys  = (float2 *) (base + off_ys);
+    float  * s16 = (float  *) (base + off_s16);
 
     const int nsb        = K / QK_K;
     const int stride_row = src0->nb[1] / ggml_type_size(src0->type);
@@ -1584,10 +1593,11 @@ void ggml_cuda_gp100_mmvq_id(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int     n_used  = ids->ne[0];
 
     ggml_cuda_pool_alloc<char> tmp(ctx.pool());
-    char * base = gp100_prep(ctx, src1, K, ncols_y, tmp);
+    size_t off_ys, off_s16;
+    char * base = gp100_prep(ctx, src1, K, ncols_y, tmp, off_ys, off_s16);
     const half   * y   = (const half   *) base;
-    const float2 * ys  = (const float2 *) (base + GP100_OFF_YS);
-    const float  * s16 = (const float  *) (base + GP100_OFF_S16);
+    const float2 * ys  = (const float2 *) (base + off_ys);
+    const float  * s16 = (const float  *) (base + off_s16);
 
     const int32_t * ids_d      = (const int32_t *) ids->data;
     float         * dst_d      = (float *) dst->data;
