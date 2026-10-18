@@ -136,7 +136,10 @@ __device__ void group_mask_warp_inplace(float (&vals)[experts_per_thread], const
 
     It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
 */
-template <int n_experts, bool has_bias>
+// has_groups is a template flag, not only the runtime config.n_groups test: compiled in for every instance, the group
+// mask raised register use 30-70 % (256 experts: 38 -> 56 regs; with bias a 64-byte stack frame) and cost qwen36 / gemma4
+// decode 2.4 / 1.2 % on sm_60 (gate R24) even though no grouped model runs.
+template <int n_experts, bool has_bias, bool has_groups>
 __launch_bounds__(TOPK_MOE_ROWS_PER_BLOCK * WARP_SIZE, 1)
 __global__ void topk_moe_cuda(const float *         logits,
                               float *               weights,
@@ -222,7 +225,7 @@ __global__ void topk_moe_cuda(const float *         logits,
 
 #if !defined(GGML_USE_HIP) || HIP_VERSION >= 60300000
     // without bias, masking wt is safe: the matcher ensures the kept groups hold all used experts
-    if (config.n_groups > 0) {
+    if constexpr (has_groups) {
         if constexpr (has_bias) {
             group_mask_warp_inplace<n_experts>(selection_wt, config.n_groups, config.n_group_used, threadIdx.x);
         } else {
@@ -337,7 +340,7 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 }
 
-template<bool has_bias>
+template<bool has_bias, bool has_groups>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
                                  float *                     weights,
@@ -363,71 +366,71 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
 
     switch (n_expert) {
         case 1:
-            ggml_cuda_kernel_launch(topk_moe_cuda<1, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<1, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 2:
-            ggml_cuda_kernel_launch(topk_moe_cuda<2, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<2, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 4:
-            ggml_cuda_kernel_launch(topk_moe_cuda<4, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<4, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 8:
-            ggml_cuda_kernel_launch(topk_moe_cuda<8, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<8, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 16:
-            ggml_cuda_kernel_launch(topk_moe_cuda<16, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<16, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 32:
-            ggml_cuda_kernel_launch(topk_moe_cuda<32, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<32, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 64:
-            ggml_cuda_kernel_launch(topk_moe_cuda<64, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<64, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 128:
-            ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 256:
-            ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 288: // StepFun 3.7
-            ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 320: // p100-series: expert-pruned qwen4exp (REAP / Sakura K-sets)
-            ggml_cuda_kernel_launch(topk_moe_cuda<320, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<320, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 352: // p100-series: expert-pruned qwen4exp (REAP / Sakura K-sets)
-            ggml_cuda_kernel_launch(topk_moe_cuda<352, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<352, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 384: // p100-series: expert-pruned qwen4exp (REAP / Sakura K-sets); also DeepSeek V4.1 (upstream #31288)
-            ggml_cuda_kernel_launch(topk_moe_cuda<384, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<384, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 416: // p100-series: expert-pruned qwen4exp (REAP / Sakura K-sets)
-            ggml_cuda_kernel_launch(topk_moe_cuda<416, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<416, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 448: // p100-series: expert-pruned qwen4exp (REAP / Sakura K-sets)
-            ggml_cuda_kernel_launch(topk_moe_cuda<448, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<448, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 512:
-            ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         case 576:
-            ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias>, launch_params,
+            ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias, has_groups>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
             break;
         default:
@@ -476,13 +479,15 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.n_groups          = args.n_groups;
     config.n_group_used      = args.n_group_used;
 
+#define TOPK_MOE_LAUNCH(B, G) launch_topk_moe_cuda<B, G>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, \
+                                                           clamp_val, scale_val, config)
+    const bool groups = config.n_groups > 0;
     if (bias) {
-        launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
-                             scale_val, config);
+        if (groups) { TOPK_MOE_LAUNCH(true,  true);  } else { TOPK_MOE_LAUNCH(true,  false); }
     } else {
-        launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
-                             scale_val, config);
+        if (groups) { TOPK_MOE_LAUNCH(false, true);  } else { TOPK_MOE_LAUNCH(false, false); }
     }
+#undef TOPK_MOE_LAUNCH
 }
 
 bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
