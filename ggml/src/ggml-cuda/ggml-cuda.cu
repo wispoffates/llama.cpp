@@ -2581,6 +2581,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
+    if (pascal_moe_glu && use_mul_mat_vec_q) {
+        static bool logged = false;   // proof in the server log that the opt-in path fires (stderr: INFO is filtered there)
+        if (!logged) {
+            logged = true;
+            fprintf(stderr, "p100-series: Pascal MoE gate/up/GLU fusion active (mode %d, first: %s, %lld tokens)\n",
+                    moe_glu, ggml_type_name(src0->type), (long long) dst->ne[2]);
+        }
+    }
     return use_mul_mat_vec_q;
 }
 
