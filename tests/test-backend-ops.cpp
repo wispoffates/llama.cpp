@@ -12196,6 +12196,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Flash-Next routed expert DOWN (Q2_0, 2560 rows, K = 640 / tensor-split 320) as plain MUL_MAT_ID at 1..8 tokens, plus short K and a
+    // partial row block (GGML_CUDA_MOE_SK=TPR:RPB[:1] takes the short-K MoE kernel on Pascal; default = mul_mat_vec_q_moe)
+    for (int64_t ntok : {1, 2, 3, 4, 8}) {
+        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{2560, 320}, {2560, 640}, {40, 320}, {72, 128}}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 16, 8, false, m, ntok, k));
+        }
+    }
+
     // q6_K matvec at the model's shapes and the speculative-verify widths. The m=16 cases elsewhere
     // take the small-rows path on Pascal and never reach the multi-column kernel. 4360 rows leaves a
     // partial block, 17408 is the down projection's K.
@@ -12964,6 +12972,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int bs : {1, 2, 3, 4, 8}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
+    }
+
+    // Flash-Next routed expert down per GPU under -sm tensor (Q2_0, 2560 rows, K = 320, 256 LRU slots, top-10), decode + verify widths
+    for (int bs : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 256, 10, false, 2560, bs, 320));
     }
 
     // qwen3-30b-a3b
