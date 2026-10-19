@@ -1369,6 +1369,127 @@ static void mul_mat_vec_q_switch_fusion(
 }
 
 template <ggml_type type>
+// p100-series: short-K variant of the multi-token MoE kernel (2026-10-19). Flash-Next's expert down projection under -sm tensor is
+// Q2_0 with K = 320 per GPU = 5 blocks of 64: in mul_mat_vec_q_moe a warp then has 10 of 32 lanes busy on 2 rows and pays a full
+// 32-lane reduction (MHP: 150.8 us/launch, ~60 GB/s on a 732 GB/s card). Here a warp is split into WARP/TPR lane groups of TPR
+// lanes; each group owns RPB/(WARP/TPR) rows (interleaved, so neighbouring groups read neighbouring rows), reduces over TPR lanes
+// only, and a block covers RPB rows -> 4-8x the rows per warp, fewer blocks, more loads in flight. No fusion / fill-overlap support:
+// the dispatcher only routes plain MUL_MAT_ID here (the down projection). Opt-in: GGML_CUDA_MOE_SK=TPR:RPB[:1] (:1 = also 1 token).
+template <ggml_type type, int TPR, int RPB>
+__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_moe_sk(
+        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, float * dst_ptr,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride) {
+    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+    const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int G   = warp_size / TPR;              // row groups per warp
+    constexpr int RPG = RPB / G;                      // rows per group
+    constexpr int lanes_per_blk   = qi / vdr;
+    constexpr int blocks_per_iter = TPR / lanes_per_blk;
+    static_assert(TPR <= warp_size && warp_size % TPR == 0 && RPB % G == 0 && RPG >= 1, "bad short-K MoE geometry");
+    static_assert(TPR % lanes_per_blk == 0, "TPR must hold whole blocks");
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const uint32_t token_idx = threadIdx.y;
+    if (token_idx >= ncols_dst) {
+        return;
+    }
+    const int      row0        = RPB*blockIdx.x;
+    const uint32_t channel_dst = blockIdx.y;
+
+    ggml_cuda_pdl_sync();
+    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
+
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
+    const int blocks_per_row_x = ncols_x / qk;
+    const int g   = threadIdx.x / TPR;
+    const int l   = threadIdx.x % TPR;
+    const int kqs = vdr * (l % lanes_per_blk);
+    const int64_t kbx_offset = (int64_t) channel_x*stride_channel_x;
+
+    float tmp[RPG] = {0.0f};
+    for (int kbx = l / lanes_per_blk; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+#pragma unroll
+        for (int i = 0; i < RPG; ++i) {
+            const int row = row0 + g + G*i;
+            if (RPB == 1 || row < (int) nrows_x) {   // group-uniform: partial last row block reads nothing past the bank
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + (int64_t) row*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+#pragma unroll
+    for (int i = 0; i < RPG; ++i) {
+        tmp[i] = warp_reduce_sum<TPR>(tmp[i]);
+    }
+    if (l == 0) {
+#pragma unroll
+        for (int i = 0; i < RPG; ++i) {
+            const int row = row0 + g + G*i;
+            if (row < (int) nrows_x) {
+                dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row] = tmp[i];
+            }
+        }
+    }
+}
+
+// GGML_CUDA_MOE_SK=TPR:RPB[:1] -> {TPR, RPB, also_one_token}; TPR in {8, 16}, RPB in {4, 8, 16}; anything else / unset = off
+struct moe_sk_cfg { int tpr = 0, rpb = 0; bool one = false; };
+static moe_sk_cfg ggml_cuda_moe_sk_cfg() {
+    static const moe_sk_cfg cfg = [] {
+        moe_sk_cfg c;
+        const char * e = getenv("GGML_CUDA_MOE_SK");
+        int t = 0, r = 0, o = 0;
+        if (e && sscanf(e, "%d:%d:%d", &t, &r, &o) >= 2 && (t == 8 || t == 16) && (r == 4 || r == 8 || r == 16)) {
+            c.tpr = t; c.rpb = r; c.one = o != 0;
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+template <ggml_type type>
+static bool mul_mat_vec_q_moe_sk_launch(
+        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
+        const uint32_t ncols_dst, const uint32_t ids_stride, const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+    if constexpr (type != GGML_TYPE_Q2_0) {
+        GGML_UNUSED_VARS(vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst,
+                         stride_channel_x, stride_channel_y, stride_channel_dst, ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+        return false;
+    } else {
+        const moe_sk_cfg c = ggml_cuda_moe_sk_cfg();
+        if (c.tpr == 0 || warp_size != 32) {
+            return false;
+        }
+        const dim3 block_nums((nrows_x + c.rpb - 1) / c.rpb, nchannels_dst);
+        const dim3 block_dims(warp_size, ncols_dst);
+        const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+#define MOE_SK(T, R) if (c.tpr == T && c.rpb == R) { ggml_cuda_kernel_launch(mul_mat_vec_q_moe_sk<type, T, R>, lp, vx, vy, ids, dst, \
+            ncols_x, nchannels_y, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, \
+            stride_channel_dst, ncols_dst, ids_stride); return true; }
+        MOE_SK(8, 4) MOE_SK(8, 8) MOE_SK(8, 16) MOE_SK(16, 4) MOE_SK(16, 8) MOE_SK(16, 16)
+#undef MOE_SK
+        return false;
+    }
+}
+
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
@@ -1490,6 +1611,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
         return idle * 8 <= iters_wide * 2;
     };
+
+    // p100-series: short-K MoE variant for plain (unfused) expert banks -- Flash-Next's Q2_0 down at K = 320 per GPU
+    if (has_ids && (ncols_dst > 1 || ggml_cuda_moe_sk_cfg().one) && !fusion.gate && !fusion.x_bias && !fusion.gate_bias &&
+            !fusion.x_scale && !fusion.gate_scale && !fusion.shared_up && fusion.ovl_mode == 0 &&
+            mul_mat_vec_q_moe_sk_launch<type>(vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
+                stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                ncols_dst, ids_stride, warp_size, nchannels_dst, stream)) {
+        return;
+    }
 
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
