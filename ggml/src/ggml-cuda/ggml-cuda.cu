@@ -2563,7 +2563,15 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     // fusion is not universally faster on Pascal, except through the hybrid sm_60 kernels (GGML_CUDA_HYBRID_GLU=0 turns that off)
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (cc <= GGML_CUDA_CC_PASCAL && !(cc == GGML_CUDA_CC_PASCAL && ggml_cuda_hybrid_glu_enabled() && ggml_cuda_hybrid_mmvq_enabled() &&
+    // p100-series (opt-in GGML_CUDA_PASCAL_MOE_GLU): low-bit MoE experts (Flash-Next gate/up = IQ2_S / IQ2_XXS / IQ1_M) through the
+    // generic kernels' has_fusion variants -- the multi-token MoE kernel computes gate and up in one loop (two independent weight
+    // streams for a latency-bound kernel) and applies the GLU before the store: 1 launch instead of gate + up + GLU
+    const int moe_glu = cc == GGML_CUDA_CC_PASCAL && tensor->op == GGML_OP_MUL_MAT_ID ? ggml_cuda_pascal_moe_glu_mode() : 0;
+    const bool low_bit_moe = src0->type == GGML_TYPE_IQ2_S || src0->type == GGML_TYPE_IQ2_XXS || src0->type == GGML_TYPE_IQ2_XS ||
+                             src0->type == GGML_TYPE_IQ1_M || src0->type == GGML_TYPE_IQ1_S;
+    const bool pascal_moe_glu = moe_glu > 0 && low_bit_moe && (dst->ne[2] > 1 || moe_glu >= 2);
+    if (cc <= GGML_CUDA_CC_PASCAL && !pascal_moe_glu &&
+                                     !(cc == GGML_CUDA_CC_PASCAL && ggml_cuda_hybrid_glu_enabled() && ggml_cuda_hybrid_mmvq_enabled() &&
                                        (src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K) &&
                                        (tensor->op == GGML_OP_MUL_MAT ? dst->ne[1] == 1 : dst->ne[2] == 1))) {
         return false;

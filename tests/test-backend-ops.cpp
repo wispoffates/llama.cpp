@@ -12187,6 +12187,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 3072, 2304, false, 1, 1, false, false, true, false, {1, 1}));
     }
 
+    // Flash-Next routed experts (512 x top-10; gate/up 2560 -> 640, the tensor-split half 320) as the fused gate/up/SWIGLU MoE matvec
+    // at 1 token and the speculative-verify widths (GGML_CUDA_PASCAL_MOE_GLU=1/2 takes the fused path on Pascal; default = unfused)
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M}) {
+        for (int64_t ntok : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, ntok, 320, 2560, true, 32, 10, false, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, ntok, 640, 2560, true, 16, 8, true, false, true, false, {1, 1}));
+        }
+    }
+
     // q6_K matvec at the model's shapes and the speculative-verify widths. The m=16 cases elsewhere
     // take the small-rows path on Pascal and never reach the multi-column kernel. 4360 rows leaves a
     // partial block, 17408 is the down projection's K.
