@@ -1424,7 +1424,10 @@ static __global__ void mul_mat_vec_q_moe_sk(
         for (int i = 0; i < RPG; ++i) {
             const int row = row0 + g + G*i;
             if (RPB == 1 || row < (int) nrows_x) {   // group-uniform: partial last row block reads nothing past the bank
-                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + (int64_t) row*stride_row_x + kbx, kqs);
+                // __fadd_rn: no FMA contraction of the dot product into the running sum. mul_mat_vec_q_moe rounds each block's
+                // product on its own lane and adds it in the shuffle tree; with the same butterfly order (TPR 8, K = 320) this makes
+                // the multi-token result BIT-IDENTICAL to it (DN2: a contracted '+=' gave KLD 0.0035 vs default, md5 0/18)
+                tmp[i] = __fadd_rn(tmp[i], vec_dot_q_cuda(vx, &y[kby], kbx_offset + (int64_t) row*stride_row_x + kbx, kqs));
             }
         }
     }
