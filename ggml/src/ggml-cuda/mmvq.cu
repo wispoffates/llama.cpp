@@ -1745,10 +1745,12 @@ bool ggml_cuda_hybrid_glu_enabled() {
     return enabled;
 }
 
-// p100-series: gate/up/SWIGLU fusion for low-bit MoE experts on Pascal (opt-in prototype, 2026-10-19). 1 = multi-token MUL_MAT_ID
-// only (speculative verify batches -> the dedicated MoE kernel's has_fusion variant), 2 = also single-token MUL_MAT_ID.
+// p100-series: gate/up/SWIGLU fusion for low-bit MoE experts on Pascal (2026-10-19). 1 = multi-token MUL_MAT_ID only (speculative
+// verify batches -> the dedicated MoE kernel's has_fusion variant), 2 = also single-token MUL_MAT_ID (DEFAULT), 0 = off.
+// Phase FU1: Flash-Next MTP frspec 256 slots decode 31.76 -> 33.89 t/s (+6.7 %, mode 2; mode 1 +5.2 %), bit-identical
+// (KLD 0 at -ub 1 and -ub 4, md5 18/18).
 int ggml_cuda_pascal_moe_glu_mode() {
-    static const int mode = [] { const char * e = getenv("GGML_CUDA_PASCAL_MOE_GLU"); return e ? atoi(e) : 0; }();
+    static const int mode = [] { const char * e = getenv("GGML_CUDA_PASCAL_MOE_GLU"); return e ? atoi(e) : 2; }();
     return mode;
 }
 
