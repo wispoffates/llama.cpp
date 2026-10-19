@@ -1449,14 +1449,21 @@ static __global__ void mul_mat_vec_q_moe_sk(
     }
 }
 
-// GGML_CUDA_MOE_SK=TPR:RPB[:1] -> {TPR, RPB, also_one_token}; TPR in {8, 16}, RPB in {4, 8, 16}; anything else / unset = off
+// GGML_CUDA_MOE_SK=TPR:RPB[:1] -> {TPR, RPB, also_one_token}; TPR in {8, 16}, RPB in {4, 8, 16}; "0" (or anything invalid) = off.
+// DEFAULT (unset) = 8:16 multi-token only -- DN1 sweep winner (per-GPU down 144.2 -> 70.0 us at 4 tokens), BIT-IDENTICAL to
+// mul_mat_vec_q_moe (DN3: KLD 0 at -ub 4) and -5.2 % wall time at -ub 4 on identical text. ":1" also takes single-token down calls:
+// faster again (-4.6 % at -ub 1) but it replaces the generic 1-column kernel's summation order (KLD 0.0027) -> opt-in.
 struct moe_sk_cfg { int tpr = 0, rpb = 0; bool one = false; };
 static moe_sk_cfg ggml_cuda_moe_sk_cfg() {
     static const moe_sk_cfg cfg = [] {
         moe_sk_cfg c;
         const char * e = getenv("GGML_CUDA_MOE_SK");
+        if (!e) {
+            c.tpr = 8; c.rpb = 16;
+            return c;
+        }
         int t = 0, r = 0, o = 0;
-        if (e && sscanf(e, "%d:%d:%d", &t, &r, &o) >= 2 && (t == 8 || t == 16) && (r == 4 || r == 8 || r == 16)) {
+        if (sscanf(e, "%d:%d:%d", &t, &r, &o) >= 2 && (t == 8 || t == 16) && (r == 4 || r == 8 || r == 16)) {
             c.tpr = t; c.rpb = r; c.one = o != 0;
         }
         return c;
