@@ -4201,8 +4201,10 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
-                        // p100-series: request the whole remaining prompt's lazily read rows now (n-gram context from n_past - 2)
-                        {
+                        // p100-series: request the whole remaining prompt's lazily read rows now (n-gram context from n_past - 2).
+                        // Text-only prompts: get_tokens() asserts !has_mtmd (any --mmproj server), and only lazy n-gram embeddings
+                        // (no mmproj model uses them) need the prefetch.
+                        if (!slot.task->tokens.has_mtmd) {
                             const llama_tokens & all = slot.task->tokens.get_tokens();
                             const int32_t from = std::max(0, n_past - 2);
                             if ((int32_t) all.size() > n_past) {
