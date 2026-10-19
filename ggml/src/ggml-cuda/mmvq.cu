@@ -1368,7 +1368,6 @@ static void mul_mat_vec_q_switch_fusion(
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
 }
 
-template <ggml_type type>
 // p100-series: short-K variant of the multi-token MoE kernel (2026-10-19). Flash-Next's expert down projection under -sm tensor is
 // Q2_0 with K = 320 per GPU = 5 blocks of 64: in mul_mat_vec_q_moe a warp then has 10 of 32 lanes busy on 2 rows and pays a full
 // 32-lane reduction (MHP: 150.8 us/launch, ~60 GB/s on a 732 GB/s card). Here a warp is split into WARP/TPR lane groups of TPR
@@ -1490,6 +1489,7 @@ static bool mul_mat_vec_q_moe_sk_launch(
     }
 }
 
+template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
