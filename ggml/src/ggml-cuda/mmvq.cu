@@ -1745,6 +1745,13 @@ bool ggml_cuda_hybrid_glu_enabled() {
     return enabled;
 }
 
+// p100-series: gate/up/SWIGLU fusion for low-bit MoE experts on Pascal (opt-in prototype, 2026-10-19). 1 = multi-token MUL_MAT_ID
+// only (speculative verify batches -> the dedicated MoE kernel's has_fusion variant), 2 = also single-token MUL_MAT_ID.
+int ggml_cuda_pascal_moe_glu_mode() {
+    static const int mode = [] { const char * e = getenv("GGML_CUDA_PASCAL_MOE_GLU"); return e ? atoi(e) : 0; }();
+    return mode;
+}
+
 bool ggml_cuda_hybrid_mmvq_enabled() {
     static const bool enabled = [] { const char * e = getenv("GGML_CUDA_HYBRID_MMVQ"); return !e || e[0] != '0'; }();
     return enabled;
