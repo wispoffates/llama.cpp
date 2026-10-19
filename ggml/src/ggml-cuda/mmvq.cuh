@@ -20,3 +20,5 @@ void ggml_cuda_op_mul_mat_vec_q(
 // Hybrid sm_60 matvec switches (mmvq.cu)
 bool ggml_cuda_hybrid_mmvq_enabled();
 bool ggml_cuda_hybrid_glu_enabled();
+
+int ggml_cuda_pascal_moe_glu_mode();
