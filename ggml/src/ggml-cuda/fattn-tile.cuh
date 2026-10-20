@@ -422,7 +422,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     const __align__(16) half2 zero[cpy_ne] = {{0.0f, 0.0f}};
                     if constexpr (finite) {
                         __align__(16) half2 tmp[cpy_ne];
-                        ggml_cuda_memcpy_1<cpy_nb>(tmp, !oob_check || i < i_sup ? KV + int64_t(sparse ? idx[i] : i)*stride_KV + j : zero);
+                        ggml_cuda_memcpy_1<cpy_nb>(tmp, !oob_check || i < i_sup ? (sparse ? KV + int64_t(idx[i])*stride_KV : KV + i*stride_KV) + j : zero);
 #pragma unroll
                         for (int l = 0; l < cpy_ne; ++l) {
                             tmp[l] = fattn_finite_h2(tmp[l]);
@@ -431,7 +431,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     } else {
                         ggml_cuda_memcpy_1<cpy_nb>(
                             tile_KV + i*(J/2 + J_padding) + j,
-                            !oob_check || i < i_sup ? KV + int64_t(sparse ? idx[i] : i)*stride_KV + j : zero);
+                            !oob_check || i < i_sup ? (sparse ? KV + int64_t(idx[i])*stride_KV : KV + i*stride_KV) + j : zero);
                     }
                 }
             }
@@ -483,7 +483,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
                     const half2 zero[cpy_ne/2] = {{0.0f, 0.0f}};
                     __align__(16) half2 tmp_h2[cpy_ne/2];
                     ggml_cuda_memcpy_1<sizeof(tmp_h2)>(
-                        tmp_h2, !oob_check || i < i_sup ? KV + int64_t(sparse ? idx[i] : i)*stride_KV + j : zero);
+                        tmp_h2, !oob_check || i < i_sup ? (sparse ? KV + int64_t(idx[i])*stride_KV : KV + i*stride_KV) + j : zero);
 
                     __align__(16) float2 tmp_f2[cpy_ne/2];
 #pragma unroll
