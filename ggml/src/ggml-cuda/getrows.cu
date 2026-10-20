@@ -279,7 +279,10 @@ static void get_rows_cuda_float(
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
     static const bool short_on = [] { const char * e = getenv("GGML_CUDA_GET_ROWS_SHORT"); return !e || e[0] != '0'; }();
-    if (short_on && ne00 <= 8 && ne10*ne11*ne12 >= 1024 && ne10*ne11*ne12 < (int64_t) UINT32_MAX) {
+    // >= 64K rows only: the QSA gathers (~2M rows per ubatch) need it; MoE routing-weight gathers (n_used x ubatch rows, <= ~16K)
+    // stay on the block-per-row kernels -- gates R25E/R26B/R26C: taking gemma4's 4096-row prefill gather cost its DECODE -2.1..-2.7 %
+    // (llama-bench -p 512 -n 128; flat with -p 0; GGML_CUDA_GET_ROWS_SHORT=0 restored it)
+    if (short_on && ne00 <= 8 && ne10*ne11*ne12 >= 65536 && ne10*ne11*ne12 < (int64_t) UINT32_MAX) {
         const uint32_t nrows = (uint32_t) (ne10*ne11*ne12);
         k_get_rows_short<src0_t, dst_t><<<(nrows + 255)/256, 256, 0, stream>>>(src0_d, src1_d, dst_d, (int) ne00, nrows,
             init_fastdiv_values((uint32_t) ne10), ne12_fdv, s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
