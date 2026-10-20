@@ -10205,6 +10205,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 8, 2, 1, 1, false));
+    // p100-series: the CUDA one-thread-per-row get_rows path (<= 8 elements, >= 65536 rows: qwen4exp QSA top_score / sel_idx) and
+    // just below its row threshold (block-per-row kernels, e.g. a MoE routing-weight gather of 8 x 1536 rows)
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 512, 1024, 80, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 4, 512, 1024, 80, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 8,  64, 2048, 33, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 512, 1024, 63, 1, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 128,    8, 1536, 1, false));
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                           GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S}) {
         test_cases.emplace_back(new test_get_rows_after_mul_mat(type));
