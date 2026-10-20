@@ -1058,7 +1058,7 @@ static __global__ void flash_attn_tile(
     if (ncols2 == 1 || sparse) {  // sparse: the live count is not a multiple of nbatch_fa
         // Branch with out-of-bounds checks.
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
-        while (k_VKQ_0 <= k_VKQ_max - nbatch_fa) {
+        while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             if (!masked_out(k_VKQ_0)) {
                 flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, sparse>
