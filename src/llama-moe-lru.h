@@ -60,7 +60,9 @@ struct llama_moe_lru {
     // il is the model layer number; the pooled set may be any subset (-ot)
     bool pooled(int il) const { return il >= 0 && il < (int) layer_to_pool.size() && layer_to_pool[il] >= 0; }
     int n_pooled() const { return n_layers; }
-    int n_slots() const { return n_slot; }
+    int n_slots() const { return n_slot; }   // the uniform default (--moe-lru-slots)
+    // this layer's slots: the default unless LLAMA_MOE_LRU_SLOTS=<file> gives the layer its own budget
+    int n_slots(int il) const { GGML_ASSERT(pooled(il)); return layers[layer_to_pool[il]].n_slot; }
 
     // large batches assemble the experts from the pools on the GPU (LLAMA_MOE_LRU_ASSEMBLE=0: scheduler upload of every expert)
     bool assemble() const { return use_assemble; }
@@ -78,6 +80,7 @@ struct llama_moe_lru {
 private:
     struct per_layer {
         ggml_backend_buffer_type_t buft = nullptr; // this layer's device buft
+        int n_slot = 0;                            // this layer's VRAM slots (per-layer budget or the default)
         ggml_tensor * pool[N_KIND] = {};   // [ne0, ne1, n_slot] in VRAM
         ggml_tensor * exps[N_KIND] = {};  // the kernels' source: expert weights in pinned host memory (exclusive: = hpool)
         ggml_tensor * hpool[N_KIND] = {}; // exclusive: [ne0, ne1, n_expert - n_slot] pinned host slots
