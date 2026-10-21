@@ -2345,7 +2345,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (lru != nullptr && lru->pooled(il) && !cparams.warmup &&
-        n_tokens > 0 && (int64_t) n_tokens * n_expert_used <= lru->n_slots(il)) {
+        n_tokens > 0 && (int64_t) n_tokens * n_expert_used <= lru->n_slots_min()) {
         GGML_ASSERT(gate_up_exps == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr &&
                     down_exps_b == nullptr && gate_up_exps_b == nullptr &&
                     up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr);
