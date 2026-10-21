@@ -390,6 +390,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     }
     const int slots_min = *std::min_element(layer_slots.begin(), layer_slots.end());
     const int slots_max = *std::max_element(layer_slots.begin(), layer_slots.end());
+    this->n_slot_min = slots_min;
     // exclusive: every expert lives in exactly one place -- the first n_slot of a layer in the VRAM pool, the rest in a pinned
     // host pool of (n_expert - n_slot) slots owned by this context; a miss swaps the incoming expert with the pool's victim
     this->exclusive = exclusive_requested() && slots_max < n_expert;
