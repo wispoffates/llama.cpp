@@ -2345,7 +2345,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (lru != nullptr && lru->pooled(il) && !cparams.warmup &&
-        n_tokens > 0 && (int64_t) n_tokens * n_expert_used <= lru->n_slots()) {
+        n_tokens > 0 && (int64_t) n_tokens * n_expert_used <= lru->n_slots(il)) {
         GGML_ASSERT(gate_up_exps == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr &&
                     down_exps_b == nullptr && gate_up_exps_b == nullptr &&
                     up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr);
@@ -2354,13 +2354,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         static const int tail_rank = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL_SKIP"); return e ? atoi(e) : 0; }();
         const int tail = tail_rank > 1 && tail_rank <= n_expert_used ? tail_rank - 1 : 0;
         ggml_tensor * out = tail > 0 ?
-            ggml_lru_decide_tail(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots(),
+            ggml_lru_decide_tail(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots(il),
                                  lru->ctrl(), lru->pool_index(il), tail) :
             ggml_lru_decide_ext(ctx0, selected_experts, lru->state_get(il),
-                                            (int32_t) hparams.n_expert, (int32_t) lru->n_slots(), lru->ctrl(), lru->pool_index(il));
+                                            (int32_t) hparams.n_expert, (int32_t) lru->n_slots(il), lru->ctrl(), lru->pool_index(il));
         if (tail > 0) {
             ggml_tensor * keep = ggml_view_1d(ctx0, out, (int64_t) n_expert_used * n_tokens,
-                                              ((int64_t) n_expert_used * n_tokens + 3 * lru->n_slots() + 1) * sizeof(int32_t));
+                                              ((int64_t) n_expert_used * n_tokens + 3 * lru->n_slots(il) + 1) * sizeof(int32_t));
             keep = ggml_reshape_3d(ctx0, ggml_cast(ctx0, keep, GGML_TYPE_F32), 1, n_expert_used, n_tokens);
             weights = ggml_mul(ctx0, weights, keep);
             cb(weights, "ffn_moe_weights_tail", il);
@@ -2368,7 +2368,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * slot = ggml_view_2d(ctx0, out, n_expert_used, n_tokens,
                                           n_expert_used * sizeof(int32_t), 0);
         ggml_build_forward_expand(gf, slot);
-        ggml_tensor * flist = ggml_view_1d(ctx0, out, 3 * lru->n_slots() + 1,
+        ggml_tensor * flist = ggml_view_1d(ctx0, out, 3 * lru->n_slots(il) + 1,
                                            (int64_t) n_expert_used * n_tokens * sizeof(int32_t));
         ggml_tensor * upd[llama_moe_lru::N_KIND];
         for (int fk = 0; fk < 3; fk++) {
@@ -2416,7 +2416,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps = asmb[llama_moe_lru::KIND_DOWN];
         if (lru->is_exclusive()) {
             // the exclusive assembly is laid out [pool slots | host slots]: remap the expert ids to match
-            ggml_tensor * rm = ggml_lru_remap(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots());
+            ggml_tensor * rm = ggml_lru_remap(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots(il));
             selected_experts = ggml_view_2d(ctx0, rm, n_expert_used, n_tokens, n_expert_used * sizeof(int32_t), 0);
         }
     }
