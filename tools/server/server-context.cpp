@@ -258,6 +258,12 @@ struct server_batch {
 struct server_slot {
     int id;
 
+    // n_tokens of the context checkpoint the memory was just restored from, while nothing has been
+    // decoded since (-1 otherwise): creating a checkpoint at that n_tokens would copy the same state
+    // again (~150 MiB for Qwen3.8 under -sm tensor, ~0.2 s), so create_checkpoint keeps the existing one.
+    // LLAMA_CKPT_SKIP_CURRENT=0 copies it again.
+    int64_t ckpt_current = -1;
+
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
@@ -643,6 +649,7 @@ struct server_slot {
     }
 
     void release() {
+        ckpt_current = -1;
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -1925,6 +1932,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.ckpt_current = -1;
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2700,6 +2708,23 @@ private:
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
+        // the memory still equals the checkpoint it was restored from: keep that one (claimed by this task)
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            static const bool skip_current = [] { const char * e = getenv("LLAMA_CKPT_SKIP_CURRENT"); return !e || atoi(e) != 0; }();
+            const int64_t current = slot.ckpt_current;
+            slot.ckpt_current = -1;
+            if (skip_current && current == n_tokens_new) {
+                for (auto & ck : slot.prompt.checkpoints) {
+                    if (ck.n_tokens == n_tokens_new) {
+                        ck.id_task = id_task;
+                        SLT_TRC(slot, "context checkpoint at n_tokens = %" PRId64 " is current (just restored), kept\n", n_tokens_new);
+                        return;
+                    }
+                }
+            }
+        }
+
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
             const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
@@ -3232,6 +3257,7 @@ private:
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
+                        slot->ckpt_current = -1;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
@@ -4184,6 +4210,7 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        slot.ckpt_current = n_past == it->n_tokens ? it->n_tokens : -1;
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
@@ -4350,6 +4377,7 @@ private:
                             return; // the slot is done, skip it entirely
                         }
 
+                        slot.ckpt_current = -1;
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
                         slot.stats.update_prompt_last();
@@ -4599,6 +4627,9 @@ private:
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            for (auto & slot : slots) {
+                slot.ckpt_current = -1;
+            }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
