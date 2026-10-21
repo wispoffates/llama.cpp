@@ -118,6 +118,37 @@ static const std::map<int, std::vector<int32_t>> & llama_moe_lru_profile() {
     return prof;
 }
 
+// LLAMA_MOE_LRU_SLOTS=<file> (2026-10-21, gate EL1/slot-budget simulation): per-layer VRAM slot budgets, one "<layer> <slots>" pair per
+// line (# comments allowed); layers not listed keep --moe-lru-slots. Misses concentrate in a few layers (Flash-Next: layer 0 85 % hit,
+// late layers 99 %), so the same VRAM spread unevenly saves fills (bench-tools expertcache/slotbudget.py sizes it from a trace).
+static const std::map<int, int> & llama_moe_lru_budget() {
+    static const std::map<int, int> budget = [] {
+        std::map<int, int> m;
+        const char * path = getenv("LLAMA_MOE_LRU_SLOTS");
+        if (path == nullptr || *path == 0) {
+            return m;
+        }
+        FILE * f = fopen(path, "r");
+        if (f == nullptr) {
+            throw std::runtime_error(std::string("llama_moe_lru: cannot open slot budget file ") + path);
+        }
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '#') {
+                continue;
+            }
+            int il = -1, ns = -1;
+            if (sscanf(line, "%d %d", &il, &ns) == 2 && il >= 0 && ns > 0) {
+                m[il] = ns;
+            }
+        }
+        fclose(f);
+        LLAMA_LOG_INFO("llama_moe_lru: slot budgets %s (%zu layers)\n", path, m.size());
+        return m;
+    }();
+    return budget;
+}
+
 // exclusive host pool layout: for kind k, device d's slices of all host slots are contiguous ([d][host slot][slice]) so a
 // prefill assembly moves them in one transfer and the fills read contiguous slices. Slices follow the meta split of the
 // experts: gate/up by rows (ne[1]), down by columns (ne[0], each row's d-th segment).
@@ -342,10 +373,27 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     }
     this->n_slot = n_slot;
     this->n_expert = n_expert;
+    // per-layer slot budgets (LLAMA_MOE_LRU_SLOTS); every layer needs one token's experts and fewer slots than experts to stay exclusive
+    std::vector<int> layer_slots(this->n_layers, n_slot);
+    {
+        const auto & budget = llama_moe_lru_budget();
+        for (int li = 0; li < this->n_layers; li++) {
+            auto it = budget.find(pooled_ids[li]);
+            if (it != budget.end()) {
+                layer_slots[li] = it->second;
+            }
+            if (layer_slots[li] < n_used_h || layer_slots[li] > n_expert) {
+                throw std::runtime_error("llama_moe_lru: layer " + std::to_string(pooled_ids[li]) + " budget " +
+                                         std::to_string(layer_slots[li]) + " slots is outside [n_expert_used, n_expert]");
+            }
+        }
+    }
+    const int slots_min = *std::min_element(layer_slots.begin(), layer_slots.end());
+    const int slots_max = *std::max_element(layer_slots.begin(), layer_slots.end());
     // exclusive: every expert lives in exactly one place -- the first n_slot of a layer in the VRAM pool, the rest in a pinned
     // host pool of (n_expert - n_slot) slots owned by this context; a miss swaps the incoming expert with the pool's victim
-    this->exclusive = exclusive_requested() && n_slot < n_expert;
-    const int64_t n_host = this->exclusive ? n_expert - n_slot : 0;
+    this->exclusive = exclusive_requested() && slots_max < n_expert;
+    const int64_t n_host = this->exclusive ? n_expert - n_slot : 0;   // uniform layers only (disk refill's control block)
     if (this->exclusive && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
         int n_gpu = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -366,6 +414,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         const int il = pooled_ids[li];
         per_layer & L = layers[li];
         L.buft = pending_buft[li];
+        L.n_slot = layer_slots[li];
+        const int64_t n_slot = L.n_slot;                          // this layer's slots (shadows the default)
+        const int64_t n_host = this->exclusive ? n_expert - n_slot : 0;
 
         ggml_tensor * exps[N_KIND] = {
             model.layers[il].ffn_gate_exps,
@@ -498,7 +549,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
 
     // disk refill: control block in device-readable host memory + the refill thread. The done tally needs every device that
     // fills a layer: all GPUs under -sm tensor, or a single GPU
-    if (this->exclusive && refill_requested()) {
+    if (this->exclusive && refill_requested() && slots_min != slots_max) {
+        LLAMA_LOG_WARN("llama_moe_lru: disk refill needs uniform slots (LLAMA_MOE_LRU_SLOTS given), using the write-back swap\n");
+    } else if (this->exclusive && refill_requested()) {
         uint32_t n_dev = 0;
         for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
             n_dev += ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
@@ -553,9 +606,14 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
     for (const auto & b : bufs) {
         pool_bytes += ggml_backend_buffer_get_size(b.get());
     }
-    LLAMA_LOG_INFO("llama_moe_lru: %d pooled layers x %d slots, %d experts, topk %lld, "
+    int64_t slots_total = 0;
+    for (int ns : layer_slots) {
+        slots_total += ns;
+    }
+    LLAMA_LOG_INFO("llama_moe_lru: %d pooled layers x %d slots (per layer %d..%d, total %lld), %d experts, topk %lld, "
                    "max verification batch %d, %.2f GiB%s\n",
-                   this->n_layers, n_slot, (int) n_expert, (long long) n_used_h, max_batch,
+                   this->n_layers, n_slot, slots_min, slots_max, (long long) slots_total, (int) n_expert, (long long) n_used_h,
+                   (int) (slots_min / n_used_h),
                    pool_bytes / 1073741824.0, this->exclusive ? " (exclusive: incl. the pinned host pool)" : "");
 }
 
@@ -573,7 +631,7 @@ void llama_moe_lru::log_final_stats() {
 
     for (int li = 0; li < n_layers; li++) {
         std::vector<int32_t> h(3);
-        const int64_t off = (n_expert + 2 * (int64_t) n_slot) * 4;
+        const int64_t off = (n_expert + 2 * (int64_t) layers[li].n_slot) * 4;
         ggml_backend_tensor_get(layers[li].state, h.data(), off, 3 * 4);
         total_ids += h[1];
         total_fills += h[2];
