@@ -63,6 +63,9 @@ struct llama_moe_lru {
     int n_slots() const { return n_slot; }   // the uniform default (--moe-lru-slots)
     // this layer's slots: the default unless LLAMA_MOE_LRU_SLOTS=<file> gives the layer its own budget
     int n_slots(int il) const { GGML_ASSERT(pooled(il)); return layers[layer_to_pool[il]].n_slot; }
+    // the smallest per-layer budget: the decide-vs-assemble choice uses it so every layer of a batch takes the SAME path (LB1: a per-layer
+    // choice mixed the paths for 13-38-token batches and the next layer's prefetched assembly stayed live -> a 6.9 GiB compute reserve)
+    int n_slots_min() const { return n_slot_min; }
 
     // large batches assemble the experts from the pools on the GPU (LLAMA_MOE_LRU_ASSEMBLE=0: scheduler upload of every expert)
     bool assemble() const { return use_assemble; }
@@ -91,7 +94,7 @@ private:
                                            // (owner | slot_of | last_use | tick | cum_ids | cum_fills)
     };
 
-    int n_layers = 0, n_slot = 0;
+    int n_layers = 0, n_slot = 0, n_slot_min = 0;
     bool exclusive = false;
     int n_split = 1;   // devices an expert is sliced over (-sm tensor): the host pool keeps each device's slices contiguous
     // copy expert e of layer L (kind k) from the mapped model into host slot hs, scattered into the per-device regions
