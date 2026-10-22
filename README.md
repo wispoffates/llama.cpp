@@ -1,3 +1,16 @@
+> [!NOTE]
+> **This is `p100-series`: llama.cpp tuned for NVIDIA Tesla P100 (Pascal, sm_60) GPUs.**
+> It is upstream llama.cpp plus a linear stack of Pascal patches: faster decode matvecs, two-GPU tensor split with an in-kernel
+> P2P AllReduce, an MoE expert cache for models larger than VRAM, and Qwen 3.8 Flash-Next support. The stack is replayed onto new
+> upstream commits and gated on real P100s (correctness, KL divergence, speed, serving) before each `p100-series-vX.Y` tag.
+> Other GPUs keep upstream's code paths.
+>
+> - What's in it and how to build: [P100-SERIES.md](P100-SERIES.md)
+> - Much of this builds on other people's work: [CREDITS.md](CREDITS.md)
+> - Contributing (AI-written PRs welcome here): [CONTRIBUTING.md](CONTRIBUTING.md)
+>
+> Everything below this note is upstream's README.
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

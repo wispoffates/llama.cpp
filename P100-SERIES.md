@@ -2,7 +2,8 @@
 
 A branch of [llama.cpp](https://github.com/ggml-org/llama.cpp) tuned for **NVIDIA Tesla P100 16 GB** (Pascal, sm_60: fp16 but no
 tensor cores, no bf16), developed and served on two P100s with tensor split. It is upstream plus a linear patch stack, replayed
-onto new upstream commits regularly; releases are tags `p100-series-vX.Y`. See [CREDITS.md](CREDITS.md) for where the work comes from.
+onto new upstream commits regularly; releases are tags `p100-series-vX.Y`. See [CREDITS.md](CREDITS.md) for where the work comes from
+and [CONTRIBUTING.md](CONTRIBUTING.md) to contribute (AI-written PRs are welcome).
 
 Everything here is runtime- or arch-gated: other GPUs take upstream's paths.
 
