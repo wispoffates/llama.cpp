@@ -210,8 +210,12 @@ static int llama_moe_trace_kind(const char * name) {
     static const bool qsa = [] { const char * e = getenv("LLAMA_MOE_TRACE_QSA"); return e && atoi(e) != 0; }();
     if (qsa) {
         if (strncmp(name, "indexer_sel-", 12) == 0)   return 3;
+        if (strncmp(name, "kq_mask_qsa-", 12) == 0)   return 3;
         if (strncmp(name, "indexer_top_k-", 14) == 0) return 4;
         if (strncmp(name, "indexer_score-", 14) == 0) return 5;
+        if (strncmp(name, "kqv_out-", 8) == 0)        return 6;
+        if (strncmp(name, "linear_attn_out-", 16) == 0) return 7;
+        if (strncmp(name, "ffn_out-", 8) == 0)        return 8;
         return -1;
     }
     if (strncmp(name, "ffn_moe_topk-", 13) == 0) return 0;
@@ -229,7 +233,8 @@ static bool llama_moe_trace_cb(struct ggml_tensor * t, bool ask, void * ud) {
     }
     auto * tr = (llama_moe_trace *) ud;
     const char * dash = strrchr(t->name, '-');
-    const int32_t hdr[4] = { dash ? (int32_t) atoi(dash + 1) : -1, kind, (int32_t) t->ne[0], (int32_t) t->ne[1] };
+    const int32_t hdr[4] = { dash ? (int32_t) atoi(dash + 1) : -1, kind >= 3 ? (kind | ((int32_t) t->type << 8)) : kind,
+                             (int32_t) t->ne[0], (int32_t) t->ne[1] };
     const size_t nb = ggml_nbytes(t);
     std::lock_guard<std::mutex> lock(tr->mtx);
     tr->buf.resize(nb);
