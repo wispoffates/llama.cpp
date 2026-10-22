@@ -205,6 +205,15 @@ struct llama_moe_trace {
     std::vector<uint8_t> buf;
 };
 static int llama_moe_trace_kind(const char * name) {
+    // diag (R28H): LLAMA_MOE_TRACE_QSA=1 dumps only the qwen4exp QSA selection: 3 = indexer_sel (kq mask after selection, F16
+    // [n_kv, n_tokens]), 4 = indexer_top_k (I32 [n_top_pool, n_tokens]), 5 = indexer_score (F32 [n_pool, n_tokens])
+    static const bool qsa = [] { const char * e = getenv("LLAMA_MOE_TRACE_QSA"); return e && atoi(e) != 0; }();
+    if (qsa) {
+        if (strncmp(name, "indexer_sel-", 12) == 0)   return 3;
+        if (strncmp(name, "indexer_top_k-", 14) == 0) return 4;
+        if (strncmp(name, "indexer_score-", 14) == 0) return 5;
+        return -1;
+    }
     if (strncmp(name, "ffn_moe_topk-", 13) == 0) return 0;
     if (strncmp(name, "ffn_moe_weights_norm-", 21) == 0) return 1;
     if (strncmp(name, "ffn_moe_pred-", 13) == 0) return 2;   // lookahead: predicted ids for layer <il>
