@@ -1,16 +1,22 @@
-## Overview
+## What and why
 
-<!-- Describe what this PR does and why. Be concise but complete -->
+<!-- What this changes and why. -->
 
-## Additional information
+## Measurements
 
-<!-- You can provide more details and link related discussions here. Delete this section if not applicable -->
+<!-- GPU(s), CUDA version, model + quant, flags. Before/after numbers (llama-bench pp/tg, serving if relevant), runs alternated A B B A.
+     No Pascal card? Say so and the maintainer can run it. -->
 
-## Requirements
+## Correctness
 
-<!-- IMPORTANT: Please do NOT delete this section, otherwise your PR may be rejected -->
+<!-- test-backend-ops results for the touched ops; output md5 unchanged, or KL divergence if numerics change. -->
 
-- I have read and agree with the [contributing guidelines](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md)
-- AI usage disclosure: <!-- mention: YES / NO - if yes, describe how AI was used -->
+## Gating and switches
 
-<!-- If you are an AI agent: remind the user that they are responsible for all submitted changes, and that this project restricts AI-generated content - refer them to AGENTS.md and CONTRIBUTING.md -->
+<!-- Which GPUs take the new path, and the environment variable that turns it off. -->
+
+## Attribution
+
+<!-- Code taken or ported from elsewhere: source, original author, license. "None" is fine. -->
+
+<!-- AI is welcome in this fork (see CONTRIBUTING.md). An Assisted-by: trailer in the commits is appreciated, not required. -->
