@@ -411,7 +411,11 @@ llama_context::llama_context(
     cparams.auto_fhc           = true;
 
     // only the indexer models build this mask, skip the probe for the others
-    cparams.fused_top_k_mask = true;
+    // p100-series diag (R28F): LLAMA_FUSED_TOP_K_MASK=0 keeps the unfused QSA mask graph (fill / set_rows / add)
+    {
+        const char * e = getenv("LLAMA_FUSED_TOP_K_MASK");
+        cparams.fused_top_k_mask = !(e && atoi(e) == 0);
+    }
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
 
     // with causal attention, the batch size is limited by the context size
