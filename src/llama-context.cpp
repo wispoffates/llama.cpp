@@ -213,9 +213,7 @@ static int llama_moe_trace_kind(const char * name) {
         if (strncmp(name, "kq_mask_qsa-", 12) == 0)   return 3;
         if (strncmp(name, "indexer_top_k-", 14) == 0) return 4;
         if (strncmp(name, "indexer_score-", 14) == 0) return 5;
-        if (strncmp(name, "kqv_out-", 8) == 0)        return 6;
-        if (strncmp(name, "linear_attn_out-", 16) == 0) return 7;
-        if (strncmp(name, "ffn_out-", 8) == 0)        return 8;
+        // kqv_out / linear_attn_out / ffn_out are PARTIAL sums under -sm tensor (meta tensor_get aborts) -> not dumped
         return -1;
     }
     if (strncmp(name, "ffn_moe_topk-", 13) == 0) return 0;
