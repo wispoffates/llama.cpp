@@ -7,6 +7,8 @@ and [CONTRIBUTING.md](CONTRIBUTING.md) to contribute (AI-written PRs are welcome
 
 Everything here is runtime- or arch-gated: other GPUs take upstream's paths.
 
+Numbers for every step of the stack (speed, accuracy, serving, Flash-Next): [docs/p100/PERFORMANCE.md](docs/p100/PERFORMANCE.md).
+
 ## What it adds (highlights)
 
 - **Decode matvecs for sm_60**: staged / cached activations, fp16 matvecs for Q4_0 / Q8_0 / Q4_K / Q5_K / Q6_K (one column and the
