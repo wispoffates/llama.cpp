@@ -9,15 +9,15 @@ directly comparable.
 
 Serving with the exact production settings (llama-server, decode tokens/s, mean of a chat, a triage and an edit request):
 
-| model | stock llama.cpp | Kmic-68 fork | p100-series v5.28 | vs stock |
-|---|---:|---:|---:|---:|
-| gemma4 26B-A4B (MoE) | 64.6 | 81.0 | **108.7** | **1.68x** |
-| Swift 27B Q6_K, MTP + ngram-mod speculation | 33.2 | 54.0 | **55.8** | **1.68x** |
-| qwen36 35B-A3B (MoE) | 58.1 | 81.9 | **88.5** | **1.52x** |
-| ornith 35B (MoE) | 59.7 | 84.2 | **90.6** | **1.52x** |
-| glimmer 30B Q6_K | 18.2 | 29.5 | **30.1** | **1.65x** |
-| nemotron 30B-A3B (layer split) | 70.5 | 94.4 | **94.0** | **1.33x** |
-| Qwen 3.8 Flash-Next (512 experts, host-RAM experts + VRAM cache), MTP | 22.1 | n/a (8.3 without MTP) | **37.8** | **1.71x** |
+| model | quant | stock llama.cpp | Kmic-68 fork | p100-series v5.28 | vs stock |
+|---|---|---:|---:|---:|---:|
+| gemma4 26B-A4B (MoE) | UD-Q4_K_XL (QAT) | 64.6 | 81.0 | **108.7** | **1.68x** |
+| Swift 27B, MTP + ngram-mod speculation | Q6_K | 33.2 | 54.0 | **55.8** | **1.68x** |
+| qwen36 35B-A3B (MoE) | UD-Q5_K_XL | 58.1 | 81.9 | **88.5** | **1.52x** |
+| ornith 35B (MoE) | Q5_K_M | 59.7 | 84.2 | **90.6** | **1.52x** |
+| glimmer 30B | UD-Q6_K_XL | 18.2 | 29.5 | **30.1** | **1.65x** |
+| nemotron 30B-A3B (layer split) | UD-Q4_K_XL | 70.5 | 94.4 | **94.0** | **1.33x** |
+| Qwen 3.8 Flash-Next (512 experts, host-RAM experts + VRAM cache), MTP | IQ2_XS (GSQ-RCO); MTP head Q8_0 (stock) / Q5_K reduced-vocab (v5.28) | 22.1 | n/a (8.3 without MTP) | **37.8** | **1.71x** |
 
 Prompt processing in serving is 1.15-1.6x faster (Flash-Next ~3.3x), and the stack is also **more accurate than stock** on every
 accuracy set we run: for example gemma4 single-token decode KL divergence vs an F32 reference drops from 0.0073 to 0.00028, and
