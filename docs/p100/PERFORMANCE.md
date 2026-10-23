@@ -17,7 +17,7 @@ Serving with the exact production settings (llama-server, decode tokens/s, mean 
 | ornith 35B (MoE) | 59.7 | 84.2 | **90.6** | **1.52x** |
 | glimmer 30B Q6_K | 18.2 | 29.5 | **30.1** | **1.65x** |
 | nemotron 30B-A3B (layer split) | 70.5 | 94.4 | **94.0** | **1.33x** |
-| Qwen 3.8 Flash-Next (512 experts, host-RAM experts + VRAM cache), MTP | 22.1 | n/a | **37.8** | **1.71x** |
+| Qwen 3.8 Flash-Next (512 experts, host-RAM experts + VRAM cache), MTP | 22.1 | n/a (8.3 without MTP) | **37.8** | **1.71x** |
 
 Prompt processing in serving is 1.15-1.6x faster (Flash-Next ~3.3x), and the stack is also **more accurate than stock** on every
 accuracy set we run: for example gemma4 single-token decode KL divergence vs an F32 reference drops from 0.0073 to 0.00028, and
@@ -107,6 +107,7 @@ keeps a cache of experts in VRAM. Three setups, same prompts (18 prompts x 256 t
 | setup | decode, no speculation | decode, MTP draft | prefill ~1K / ~5K / ~11K tokens | VRAM per GPU |
 |---|---:|---:|---|---:|
 | stock + upstream's MoE cache (layer split; upstream's cache refuses tensor split) | 18.6 | 22.1 | 75 / 79 / 74 | 9.9 GB |
+| Kmic-68 fork (layer split, 36 of 48 expert layers on the CPU, flash attention off) | 8.3 | n/a | 77 / crash / -- | -- |
 | lich-77 LRU cache base (R9: lich-77 + drrros + buun) | 27.3 | crash | 61 / 62 / 65 | 12.6 GB |
 | **p100-series v5.28 (R10)** | **29.2** | **37.8** | **221 / 251 / 268** | 13.9 GB |
 
@@ -117,7 +118,10 @@ keeps a cache of experts in VRAM. Three setups, same prompts (18 prompts x 256 t
 - At R9 the MTP draft crashes (a stack overflow in `libggml-base` at the first decode: the draft model also got LRU pools; our next
   commit keeps drafts out of the cache) and the cache needs `--load-mode none` (with mmap, the host-buffer overrides it relies on are
   dropped and no pools are allocated: 3.8 t/s). Both are fixed in R10.
-- Kmic-68's fork can't run this model with tensor split (its upstream base predates qwen4exp tensor-split support).
+- Kmic-68's fork runs it only in its slowest form: no tensor split for this architecture and no MoE cache, so experts that don't fit
+  run on the CPU (36 of 48 expert layers; fewer runs out of VRAM). Flash attention has to be off: with it on, his compact I32
+  attention mask reaches `ggml_fill` in the QSA layers and aborts. It cannot load the standalone MTP head, and prompts beyond
+  ~2K tokens stop with "illegal memory access" (the 1K prefill and all 18 decode prompts completed).
 
 ## Accuracy
 
