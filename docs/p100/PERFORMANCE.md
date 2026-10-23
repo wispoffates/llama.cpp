@@ -121,7 +121,9 @@ keeps a cache of experts in VRAM. Three setups, same prompts (18 prompts x 256 t
 - Kmic-68's fork runs it only in its slowest form: no tensor split for this architecture and no MoE cache, so experts that don't fit
   run on the CPU (36 of 48 expert layers; fewer runs out of VRAM). Flash attention has to be off: with it on, his compact I32
   attention mask reaches `ggml_fill` in the QSA layers and aborts. It cannot load the standalone MTP head, and prompts beyond
-  ~2K tokens stop with "illegal memory access" (the 1K prefill and all 18 decode prompts completed).
+  ~2K tokens stop with "illegal memory access" (the 1K prefill and all 18 decode prompts completed). Cherry-picking upstream #28569 (which re-enabled
+  tensor split for this architecture on 10-01, after his base) lets tensor split load, but it then needs flash attention, and with
+  the compact mask disabled (`LLAMA_KQ_MASK_COMPACT_MIN`) it stops at startup with the same illegal memory access.
 
 ## Accuracy
 
