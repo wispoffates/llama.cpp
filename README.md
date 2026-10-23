@@ -9,6 +9,16 @@
 > - Much of this builds on other people's work: [CREDITS.md](CREDITS.md)
 > - Contributing (AI-written PRs welcome here): [CONTRIBUTING.md](CONTRIBUTING.md)
 >
+> Who wrote the 176 code patches in `p100-series-v5.28` (git authorship; carried commits link their originals):
+>
+> | Author | Patches | What |
+> |---|---|---|
+> | [wispoffates](https://github.com/wispoffates) (maintainer, with Claude Code) | 136 | Pascal kernels, two-GPU tensor-split engine, expert cache, Flash-Next; 4 of them also credit [qr0n](https://github.com/qr0n/p100-llama-cpp) or [buun](https://github.com/spiritbuun/buun-llama-cpp) as co-author / source |
+> | Kaden ([Kmic-68](https://github.com/Kmic-68/llama.cpp)) | 32 | the original sm_60 matvec rebuild, fp16 Q6_K verify matvecs, cuBLAS ALGO6, sampler prefilter |
+> | [drrros](https://github.com/ggml-org/llama.cpp/pull/29963) | 5 | pipeline parallelism with MoE experts in host memory (upstream PR #29963) |
+> | [lich-77](https://github.com/lich-77/llama.cpp) | 2 | the GPU-resident MoE expert LRU cache our expert cache builds on |
+> | [wrj97](https://github.com/ggml-org/llama.cpp/pull/29509) | 1 | draft KV kept out of context checkpoints (upstream PR #29509) |
+>
 > Everything below this note is upstream's README.
 
 # llama.cpp
