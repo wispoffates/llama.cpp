@@ -6,6 +6,7 @@
 > Other GPUs keep upstream's code paths.
 >
 > - What's in it and how to build: [P100-SERIES.md](P100-SERIES.md)
+> - Measured gains, step by step vs stock llama.cpp (decode up to 1.7x, plus better accuracy): [docs/p100/PERFORMANCE.md](docs/p100/PERFORMANCE.md)
 > - Much of this builds on other people's work: [CREDITS.md](CREDITS.md)
 > - Contributing (AI-written PRs welcome here): [CONTRIBUTING.md](CONTRIBUTING.md)
 >
