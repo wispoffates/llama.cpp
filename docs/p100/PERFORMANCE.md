@@ -30,6 +30,9 @@ Swift's from 0.00032 to 0.000003 (100 % same top token).
 
 ## How it was measured
 
+Exact model files (with sha256), llama-bench flags, serving command lines, environment and accuracy-set flags for every model
+below: [SETTINGS.md](SETTINGS.md).
+
 The published branch is upstream plus a linear stack of 176 code patches. Each **step** below is a real commit of that stack
 (every step builds and runs), so a step's gain is measured exactly where those patches sit. The order follows the stack, because
 later work builds directly on earlier work (our MoE kernels extend qr0n's, our expert cache extends lich-77's).
@@ -125,7 +128,7 @@ keeps a cache of experts in VRAM. Three setups, same prompts (18 prompts x 256 t
   tensor split for this architecture on 10-01, after his base) lets tensor split load, but it then needs flash attention, and with
   the compact mask disabled (`LLAMA_KQ_MASK_COMPACT_MIN`) it stops at startup with the same illegal memory access.
 
-**How the v5.28/v5.29 numbers are served** (production command line, paths shortened; tensor split is required -- the expert cache
+**How the v5.28/v5.29 numbers are served** (see [SETTINGS.md](SETTINGS.md) for all models; production command line, paths shortened; tensor split is required -- the expert cache
 and the Flash-Next kernels are built and measured for `-sm tensor` only):
 
 ```bash
