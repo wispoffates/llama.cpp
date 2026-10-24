@@ -141,8 +141,9 @@ llama-server --model Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf
 ```
 
 - Experts go to host memory with `--n-cpu-moe 999` (not `-ot`); the model is memory-mapped (default load mode) on a 46 GiB-RAM host.
-- `LLAMA_MOE_LRU_PROFILE` (warm start) and `LLAMA_MOE_LRU_SLOTS` (per-layer slot budgets) are optional data files from our traces;
-  without them the cache starts cold with 256 uniform slots (about 5 % slower decode).
+- `LLAMA_MOE_LRU_PROFILE` (warm start) and `LLAMA_MOE_LRU_SLOTS` (per-layer slot budgets) are optional data files from our traces:
+  [profile-flashnext.txt](flashnext/profile-flashnext.txt), [slots-flashnext.txt](flashnext/slots-flashnext.txt); without them the
+  cache starts cold with 256 uniform slots (a few % slower decode, slower first request).
 - The `-conv` MTP head is the frequency-ranked 65k-row head converted for our reduced-vocabulary loader (d2t); with the plain Q8_0 MTP
   head expect ~31 t/s. Without MTP: 29.2 t/s.
 - Driver 580.178.04, CUDA 12.4 toolchain. sha256: part 1 `ca3b302d…7743b`, part 2 `e4996a6d…c9dbb`, MTP head (frspec-65k, before

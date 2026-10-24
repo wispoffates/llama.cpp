@@ -139,8 +139,11 @@ llama-server --model Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf
 
 - Tensor split is required: the expert cache and the Flash-Next kernels are built and measured for `-sm tensor` only.
 - Experts go to host memory with `--n-cpu-moe 999` (not `-ot`); the model is memory-mapped (default load mode).
-- `LLAMA_MOE_LRU_PROFILE` (warm start) and `LLAMA_MOE_LRU_SLOTS` (per-layer slot budgets) are data files from our traces; without them the
-  cache starts cold with 256 uniform slots (a few % slower decode, slower first request).
+- `LLAMA_MOE_LRU_PROFILE` = [flashnext/profile-flashnext.txt](flashnext/profile-flashnext.txt): one line per layer, the layer number and
+  then the expert ids from most to least used in our routing traces; the cache pre-loads the hottest experts at start (warm start).
+- `LLAMA_MOE_LRU_SLOTS` = [flashnext/slots-flashnext.txt](flashnext/slots-flashnext.txt): `<layer> <slots>` budgets (384 for layer 0 down
+  to 256) from an offline cache simulation at the same VRAM as 256 uniform slots (-14.9 % expert fills).
+- Without the two files the cache starts cold with 256 uniform slots (a few % slower decode, slower first request).
 - "No speculation" rows: the same line without `--model-draft` and the `--spec-*` flags.
 
 **Comparison setups in the Flash-Next table** (same prompts, `--ctx-size 16384 -ub 512 -b 2048 --parallel 1 --jinja`, `GGML_CUDA_P2P=1`):
