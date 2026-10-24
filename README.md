@@ -5,12 +5,14 @@
 > upstream commits and gated on real P100s (correctness, KL divergence, speed, serving) before each `p100-series-vX.Y` tag.
 > Other GPUs keep upstream's code paths.
 >
+> **Current release: [`p100-series-v5.29`](https://github.com/wispoffates/llama.cpp/releases/tag/p100-series-v5.29)** (on upstream [`1a24df163`](https://github.com/ggml-org/llama.cpp/commit/1a24df163), 2026-10-24).
+>
 > - What's in it and how to build: [P100-SERIES.md](P100-SERIES.md)
 > - Measured gains, step by step vs stock llama.cpp (decode up to 1.7x, plus better accuracy): [docs/p100/PERFORMANCE.md](docs/p100/PERFORMANCE.md)
 > - Much of this builds on other people's work: [CREDITS.md](CREDITS.md)
 > - Contributing (AI-written PRs welcome here): [CONTRIBUTING.md](CONTRIBUTING.md)
 >
-> Who wrote the 176 code patches in `p100-series-v5.28` (git authorship; carried commits link their originals):
+> Who wrote the 176 code patches in `p100-series-v5.29` (git authorship; carried commits link their originals):
 >
 > | Author | Patches | What |
 > |---|---|---|
