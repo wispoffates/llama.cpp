@@ -96,7 +96,7 @@ stops with "illegal memory access", and qwen36 at 16K depth crashed in llama-ben
 
 ## Flash-Next: a 512-expert model that doesn't fit in VRAM
 
-Qwen 3.8 Flash-Next (Swift-1.5 IQ2_XS, ~29 GB) is larger than the two cards together, so its experts live in host RAM and each setup
+Qwen 3.8 Flash-Next (Swift-1.5 IQ2_XS, 68 GB in two GGUF parts) is much larger than the two cards together, so its experts live in host RAM and each setup
 keeps a cache of experts in VRAM. Three setups, same prompts (18 prompts x 256 tokens, decode median), same 16K context:
 
 <picture>
@@ -124,6 +124,26 @@ keeps a cache of experts in VRAM. Three setups, same prompts (18 prompts x 256 t
   ~2K tokens stop with "illegal memory access" (the 1K prefill and all 18 decode prompts completed). Cherry-picking upstream #28569 (which re-enabled
   tensor split for this architecture on 10-01, after his base) lets tensor split load, but it then needs flash attention, and with
   the compact mask disabled (`LLAMA_KQ_MASK_COMPACT_MIN`) it stops at startup with the same illegal memory access.
+
+**How the v5.28/v5.29 numbers are served** (production command line, paths shortened; tensor split is required -- the expert cache
+and the Flash-Next kernels are built and measured for `-sm tensor` only):
+
+```bash
+GGML_CUDA_P2P=1 LLAMA_MOE_LRU_EXCLUSIVE=1 GGML_CUDA_LRU_DMA=1 LLAMA_MOE_LRU_PREFETCH=1 GGML_CUDA_LRU_ASYNC=1 \
+LLAMA_MOE_LRU_PROFILE=profile-flashnext.txt LLAMA_MOE_LRU_SLOTS=slots-flashnext.txt \
+llama-server --model Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  --model-draft mtp-Qwen3.8-Flash-Next-Q5_K-frspec-65k-conv.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 \
+  --ctx-size 16384 --n-gpu-layers 99 --fit off --flash-attn on --split-mode tensor -lzm on --no-repack \
+  --n-cpu-moe 999 --moe-lru-slots 256 -ub 512 -b 2048 --parallel 1 --jinja
+```
+
+- Experts go to host memory with `--n-cpu-moe 999` (not `-ot`); the model is memory-mapped (default load mode) on a 46 GiB-RAM host.
+- `LLAMA_MOE_LRU_PROFILE` (warm start) and `LLAMA_MOE_LRU_SLOTS` (per-layer slot budgets) are optional data files from our traces;
+  without them the cache starts cold with 256 uniform slots (about 5 % slower decode).
+- The `-conv` MTP head is the frequency-ranked 65k-row head converted for our reduced-vocabulary loader (d2t); with the plain Q8_0 MTP
+  head expect ~31 t/s. Without MTP: 29.2 t/s.
+- Driver 580.178.04, CUDA 12.4 toolchain. sha256: part 1 `ca3b302d…7743b`, part 2 `e4996a6d…c9dbb`, MTP head (frspec-65k, before
+  conversion) `282764bf…c48b9`, converted head `4166a416…9e932`, Q8_0 head `b9880220…74f4ec`.
 
 ## Accuracy
 
