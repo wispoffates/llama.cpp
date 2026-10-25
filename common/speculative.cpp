@@ -1825,6 +1825,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // Target positions of the rows above (ported from Keoian's Kmic-68 PR #7): pending_h holds h at pending_pos
+    // (-1: unknown), the row it replaced is kept as prev_h / prev_pos, verify row 0 is at verify_pos0. A batch
+    // starting at pos p pairs its first token with h at p-1, looked up by position: a checkpoint restore or a
+    // prompt-cache load resumes at a position the last process() call did not end on, and pairing it with the
+    // leftover row made the drafts (and, through the verify shapes, near-tie greedy output) depend on earlier
+    // requests. An unknown row is zeros. pending_h + pending_pos travel with checkpoints via get_state/set_state.
+    std::vector<llama_pos>          pending_pos;
+    std::vector<llama_pos>          prev_pos;
+    std::vector<std::vector<float>> prev_h;
+    std::vector<llama_pos>          verify_pos0;
+    std::vector<float>              zero_h;
+    int64_t                         n_h_miss = 0;
+
+    const float * h_at(llama_seq_id seq_id, llama_pos pos) {
+        if (pos >= 0) {
+            if (pending_pos[seq_id] == pos) {
+                return pending_h[seq_id].data();
+            }
+            if (prev_pos[seq_id] == pos) {
+                return prev_h[seq_id].data();
+            }
+            const llama_pos i = pos - verify_pos0[seq_id];
+            if (verify_pos0[seq_id] >= 0 && i >= 0 && i < verify_h_rows[seq_id]) {
+                return verify_h[seq_id].data() + (size_t) i * n_embd;
+            }
+            if (++n_h_miss <= 8) {
+                SPC_DBG("MTP: no target h for seq %d pos %d (pending %d, prev %d, verify %d+%d), using zeros\n",
+                        (int) seq_id, (int) pos, (int) pending_pos[seq_id], (int) prev_pos[seq_id],
+                        (int) verify_pos0[seq_id], (int) verify_h_rows[seq_id]);
+            }
+        }
+        return zero_h.data();
+    }
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1902,6 +1936,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos.assign(n_seq, -1);
+        prev_pos.assign(n_seq, -1);
+        prev_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        verify_pos0.assign(n_seq, -1);
+        zero_h.assign(n_embd, 0.0f);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1914,7 +1953,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_row0.assign(n_seq, -1);
 
         // shared memory and chained heads keep the host rows
-        if (!is_mem_shared && !chain_heads) {
+        // p100-series: so does everything else for now -- the device-row path (#31927) skips the position pairing above
+        // (pending_pos / verify_pos0 / h_at, checkpoint state), so h_at would hand the drafts zero rows. A port of the pairing
+        // (exp/mtp-devrows) never runs on our entries: under -sm tensor the rows land on the meta device, which has no events
+        static constexpr bool p100_mtp_dev_rows = false;
+        if (p100_mtp_dev_rows && !is_mem_shared && !chain_heads) {
             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
                 llama_set_ctx_state_src(ctx_dft, nullptr);
@@ -2031,7 +2074,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
+                    ? h_at(seq_id, t.pos[0] - 1)
                     : h_tgt + (size_t) (k - 1) * n_embd;
 
                 batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
@@ -2088,6 +2131,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t h_offset = is_mem_shared && !all_rows_output ? i_batch_end[seq_id] : i_batch_beg[seq_id];
 
             verify_h_rows[seq_id] = h_rows;
+            verify_pos0[seq_id]   = batch_in.tokens[h_offset].pos[0];
 
             if (dev_rows) {
                 // the rows stay on the device until the next target decode, only the pending row comes to the host
@@ -2103,8 +2147,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
+            std::swap(prev_h[seq_id], pending_h[seq_id]);
+            prev_pos[seq_id] = pending_pos[seq_id];
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (h_rows - 1) * n_embd, row_bytes);
+            pending_pos[seq_id] = batch_in.tokens[i_batch_end[seq_id]].pos[0];
         }
 
         return true;
@@ -2143,13 +2190,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
+            const float * h_last = h_at(seq_id, dp.pos0 - 1);
+
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
-            batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+            batch.set_embd_state(idx, { h_last, 1, (size_t) n_embd });
 
             i_last[seq_id] = idx;
 
             if (chain_heads) {
-                chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+                chain_h[seq_id].assign(h_last, h_last + n_embd);
             }
         }
 
@@ -2296,16 +2345,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_pos[seq_id] = verify_pos0[seq_id] + i_h;
     }
 
+    // the pending row and its position travel with context checkpoints (and the prompt cache / slot files that carry them)
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos[seq_id] < 0) {
             return false;
         }
-
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        data.resize(row_bytes);
-        std::memcpy(data.data(), pending_h[seq_id].data(), row_bytes);
+        data.resize(sizeof(llama_pos) + row_bytes);
+        std::memcpy(data.data(), &pending_pos[seq_id], sizeof(llama_pos));
+        std::memcpy(data.data() + sizeof(llama_pos), pending_h[seq_id].data(), row_bytes);
         return true;
     }
 
@@ -2313,12 +2364,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
-
+        // whatever else is stashed belongs to the state being replaced
+        prev_pos[seq_id]      = -1;
+        verify_pos0[seq_id]   = -1;
+        verify_h_rows[seq_id] = 0;
+        pending_pos[seq_id]   = -1;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        if (data.size() != row_bytes) {
+        if (data.size() != sizeof(llama_pos) + row_bytes) {
             return;
         }
-        std::memcpy(pending_h[seq_id].data(), data.data(), row_bytes);
+        std::memcpy(&pending_pos[seq_id], data.data(), sizeof(llama_pos));
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(llama_pos), row_bytes);
     }
 };
 
@@ -3559,6 +3615,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
 // TODO: support the case of more than one speculative implementations having a state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
     if (spec == nullptr) {
         return false;
     }
