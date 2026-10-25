@@ -10,6 +10,7 @@ Commits written by the maintainer with AI help carry an `Assisted-by:` trailer.
 | Source | What we carry | License |
 |---|---|---|
 | [Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp) `p100-optimizations` (Kaden) | the sm_60 matvec rebuild (staged activations, vdr/geometry, cached q8_1 activation), fp16 Q6_K verify matvecs, cuBLAS ALGO6 prefill, the sampler top-k prefilter, MTP catch-up and q4_0 draft head -- split into individual commits authored by Kaden, each linking its original | MIT |
+| [Keoian](https://github.com/Keoian), contributions to Kmic-68/llama.cpp (PRs #7, #8, #14, #16) | repetition penalties visiting only the window's tokens, LoRA adapters under `-sm tensor`, keeping the just-restored checkpoint, no prompt split at the last user message (cherry-picked with their authorship), and the MTP hidden-row-by-position fix (ported to upstream's drafter, co-authored) | MIT |
 | [qr0n/p100-llama-cpp](https://github.com/qr0n/p100-llama-cpp) | GP100 fp16 matvec (patches 0007, 0008), recurrent-state clear with fill (0014), activation buffer sizing (0017) | MIT |
 | [lich-77/llama.cpp](https://github.com/lich-77/llama.cpp) | GPU-resident MoE expert LRU cache and its tensor-split support (the base of our expert cache) | MIT |
 | [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) | meta-backend offload of host-weight ops and split-aware expert copies | MIT |
