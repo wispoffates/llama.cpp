@@ -31,6 +31,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <unordered_set>
 #include <vector>
 
@@ -2364,6 +2366,125 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+// Checkpoint buffer pool. A recurrent / SWA checkpoint is a 150-200 MiB host buffer, and a fresh one costs ~3 GB/s in page faults
+// and zero fill (VM111: 150 MiB 49 ms, 200 MiB 65 ms) on the request thread. Nothing is freed for the first n_ctx_checkpoints turns of a
+// slot, so recycling alone rarely helps: after every take a background thread pre-faults the next spare of the size just used, and
+// buffers of destroyed checkpoints are recycled. Pooled buffers keep size() == their full length, so taking one only shrinks it.
+// LLAMA_CKPT_POOL = buffers held (default 2, 0 = off). Leaked on purpose: checkpoints can be destroyed during static destruction.
+namespace {
+struct common_ckpt_pool {
+    static constexpr size_t MIN_BYTES = 1u << 20;
+
+    std::mutex                        mtx;
+    std::condition_variable           cv;
+    std::vector<std::vector<uint8_t>> bufs;
+    size_t                            want    = 0; // size of the next spare to pre-fault (0: none)
+    size_t                            cap     = 0;
+    bool                              started = false;
+
+    static common_ckpt_pool & get() {
+        static common_ckpt_pool * pool = new common_ckpt_pool();
+        return *pool;
+    }
+
+    static bool fits(size_t have, size_t n) { return have >= n && have <= n + n/2; }
+
+    void start_locked() {
+        if (started) {
+            return;
+        }
+        started = true;
+        const char * e = getenv("LLAMA_CKPT_POOL");
+        cap = e ? (size_t) std::max(0, atoi(e)) : 2;
+        if (cap > 0) {
+            std::thread([this] { worker(); }).detach();
+        }
+    }
+
+    // swap a fitting pooled buffer into out (out.size() >= n afterwards); always schedules the next spare
+    bool take(size_t n, std::vector<uint8_t> & out) {
+        if (n < MIN_BYTES) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(mtx);
+        start_locked();
+        if (cap == 0) {
+            return false;
+        }
+        want = n;
+        cv.notify_one();
+        size_t best = bufs.size();
+        for (size_t i = 0; i < bufs.size(); ++i) {
+            if (fits(bufs[i].size(), n) && (best == bufs.size() || bufs[i].size() < bufs[best].size())) {
+                best = i;
+            }
+        }
+        if (best == bufs.size()) {
+            return false;
+        }
+        out.swap(bufs[best]);
+        bufs.erase(bufs.begin() + best);
+        return true;
+    }
+
+    void give(std::vector<uint8_t> && v) {
+        if (v.capacity() < MIN_BYTES) {
+            return;
+        }
+        v.resize(v.capacity()); // pooled buffers keep their full length (a no-op for an exact-size buffer)
+        std::vector<uint8_t> drop;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (cap == 0 && started) {
+                return;
+            }
+            if (bufs.size() < std::max<size_t>(cap, 1)) {
+                bufs.push_back(std::move(v));
+            } else {
+                drop = std::move(v); // freed outside the lock
+            }
+        }
+    }
+
+    void worker() {
+        std::unique_lock<std::mutex> lk(mtx);
+        for (;;) {
+            cv.wait(lk, [this] { return want != 0; });
+            const size_t n = want;
+            want = 0;
+            bool have = false;
+            for (const auto & b : bufs) {
+                have = have || fits(b.size(), n);
+            }
+            if (have) {
+                continue;
+            }
+            std::vector<uint8_t> evicted;
+            if (bufs.size() >= cap) {
+                evicted = std::move(bufs.front()); // none of them fits the size in use
+                bufs.erase(bufs.begin());
+            }
+            lk.unlock();
+            evicted = std::vector<uint8_t>();
+            std::vector<uint8_t> spare(n); // page faults + zero fill, off the request thread
+            lk.lock();
+            if (bufs.size() < cap) {
+                bufs.push_back(std::move(spare));
+            }
+        }
+    }
+};
+} // namespace
+
+common_prompt_checkpoint::~common_prompt_checkpoint() {
+    if (data_tgt.capacity() >= common_ckpt_pool::MIN_BYTES) {
+        common_ckpt_pool::get().give(std::move(data_tgt));
+    }
+    if (data_dft.capacity() >= common_ckpt_pool::MIN_BYTES) {
+        common_ckpt_pool::get().give(std::move(data_dft));
+    }
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2402,6 +2523,13 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
+    // a fresh 150-200 MiB buffer costs ~50-65 ms in page faults: take a pre-faulted / recycled one when this one would grow
+    if (data_tgt.capacity() < ckpt_size) {
+        std::vector<uint8_t> pooled;
+        if (common_ckpt_pool::get().take(ckpt_size, pooled)) {
+            data_tgt.swap(pooled);
+        }
+    }
     data_tgt.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
