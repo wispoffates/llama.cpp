@@ -1308,6 +1308,14 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    common_prompt_checkpoint() = default;
+    common_prompt_checkpoint(const common_prompt_checkpoint &) = default;
+    common_prompt_checkpoint(common_prompt_checkpoint &&) noexcept = default;
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint &) = default;
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint &&) noexcept = default;
+    // hands large state buffers back to the checkpoint buffer pool (see update_tgt)
+    ~common_prompt_checkpoint();
+
     size_t size() const;
 
     bool empty() const;
