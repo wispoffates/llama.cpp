@@ -40,6 +40,10 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// open (true) / close (false) a batch of buffer get/set copies on this thread: copies are issued without a per-call synchronize, closing
+// synchronizes every device that was touched (used by llama's state save / restore with a pinned staging buffer)
+GGML_BACKEND_API void ggml_backend_cuda_copy_batch(bool begin);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus
