@@ -265,7 +265,7 @@ static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t 
     }
 }
 
-// TN = 5 (80 columns) needs > 32 KB of shared memory, so only one block fits per SM anyway: let it use the registers
+// TN >= 5 (80 / 96 columns) needs > 32 KB of shared memory, so only one block fits per SM anyway: let it use the registers
 // (with the 2-block bound it spilled; 65-column verify batches -- ngram-mod's 64-token drafts + 1 -- land here)
 template <ggml_type type, int TN, bool ID>
 static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const tile_mm_params prm) {
@@ -494,6 +494,7 @@ static void tile_mm_launch_tn(const int tn, const tile_mm_params & prm, const in
         case 2:  tile_mm_launch<type, 2, ID>(prm, splits_or_tiles, stream); break;
         case 3:  tile_mm_launch<type, 3, ID>(prm, splits_or_tiles, stream); break;
         case 4:  tile_mm_launch<type, 4, ID>(prm, splits_or_tiles, stream); break;
+        case 6:  tile_mm_launch<type, 6, ID>(prm, splits_or_tiles, stream); break;
         default: tile_mm_launch<type, 5, ID>(prm, splits_or_tiles, stream); break;
     }
 }
@@ -628,9 +629,11 @@ static bool tmm_type_ok(const ggml_type type) {
 
 bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // GGML_CUDA_TILE_Q6K=0 / _Q5K=0 / _Q4K=0 / _Q8_0=0 / _Q4_0=0 turn a type off; GGML_CUDA_TILE_MIN / _MAX (or the older _Q6K_MIN / _MAX) set the column
-    // range that takes this path (default 9..80)
+    // range that takes this path (default 9..127). 81..127 used to go to dequantize -> fp16 cuBLAS (tilemm2 harness, Swift per-GPU shapes,
+    // matmul ms per batch: N 96 606 -> 389 with a 96-column tile, N 112 613 -> 428 with 64-column tiles, N 128 440 vs 432 = even, so
+    // 128+ stays cuBLAS) and the tile kernel keeps NMSE ~8e-7 where fp16-accumulating cuBLAS is 1.1e-5
     static const int nmin = [] { const char * e = getenv("GGML_CUDA_TILE_MIN"); if (!e) { e = getenv("GGML_CUDA_TILE_Q6K_MIN"); } return e ? atoi(e) : 9; }();
-    static const int nmax = [] { const char * e = getenv("GGML_CUDA_TILE_MAX"); if (!e) { e = getenv("GGML_CUDA_TILE_Q6K_MAX"); } return e ? std::min(atoi(e), 80) : 80; }();
+    static const int nmax = [] { const char * e = getenv("GGML_CUDA_TILE_MAX"); if (!e) { e = getenv("GGML_CUDA_TILE_Q6K_MAX"); } return e ? std::min(atoi(e), 127) : 127; }();
     const ggml_type type = src0->type;
     if (!tmm_type_ok(type) || ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_PASCAL) {
         return false;
@@ -644,7 +647,8 @@ bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     if (!ok) {
         return false;
     }
-    const int tn   = N <= 16 ? 1 : N <= 32 ? 2 : N <= 48 ? 3 : N <= 64 ? 4 : 5;
+    // 81..96: one 96-column tile; 97..127: 64-column tiles (two along N) beat both a 128-column tile and cuBLAS
+    const int tn   = N <= 16 ? 1 : N <= 32 ? 2 : N <= 48 ? 3 : N <= 64 ? 4 : N <= 80 ? 5 : N <= 96 ? 6 : 4;
     const int nwin = (int) ((K + TMM_WIN - 1)/TMM_WIN);
     const int nu   = (int) (K/tmm_uv(type, K));
     const int tiles = (int) (((M + TMM_BM - 1)/TMM_BM)*((N + 16*tn - 1)/(16*tn)));
