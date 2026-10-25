@@ -629,17 +629,22 @@ static bool tmm_type_ok(const ggml_type type) {
 
 bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // GGML_CUDA_TILE_Q6K=0 / _Q5K=0 / _Q4K=0 / _Q8_0=0 / _Q4_0=0 turn a type off; GGML_CUDA_TILE_MIN / _MAX (or the older _Q6K_MIN / _MAX) set the column
-    // range that takes this path (default 9..127). 81..127 used to go to dequantize -> fp16 cuBLAS (tilemm2 harness, Swift per-GPU shapes,
-    // matmul ms per batch: N 96 606 -> 389 with a 96-column tile, N 112 613 -> 428 with 64-column tiles, N 128 440 vs 432 = even, so
-    // 128+ stays cuBLAS) and the tile kernel keeps NMSE ~8e-7 where fp16-accumulating cuBLAS is 1.1e-5
+    // range that takes this path (default 9..127, q6_K 9..80 -- see below). 81..127 used to go to dequantize -> fp16 cuBLAS; phase TWV
+    // (llama-bench, 81..127): gemma4 +8..14 %, qwen36 +8..10 %, KLD qwen36 0.00157 -> 0.00072 at -ub 96. (The tilemm2 harness's cuBLAS
+    // baseline was slower than the in-model cuBLAS path, so its q6_K numbers overstated the win.)
     static const int nmin = [] { const char * e = getenv("GGML_CUDA_TILE_MIN"); if (!e) { e = getenv("GGML_CUDA_TILE_Q6K_MIN"); } return e ? atoi(e) : 9; }();
     static const int nmax = [] { const char * e = getenv("GGML_CUDA_TILE_MAX"); if (!e) { e = getenv("GGML_CUDA_TILE_Q6K_MAX"); } return e ? std::min(atoi(e), 127) : 127; }();
     const ggml_type type = src0->type;
     if (!tmm_type_ok(type) || ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_PASCAL) {
         return false;
     }
+    // q6_K keeps 80: in the model (phase TWV, llama-bench) Swift / glimmer's dense q6_K weights lost 12-15 % at 104..127 columns with the
+    // tile kernel (cuBLAS on them is faster than the harness baseline suggested), while gemma4 / qwen36 gained 8-14 % at 88..127.
+    // GGML_CUDA_TILE_MAX_Q6K overrides (capped at nmax).
+    static const int nmax_q6k = [] { const char * e = getenv("GGML_CUDA_TILE_MAX_Q6K"); return e ? atoi(e) : 80; }();
     const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
-    const bool ok = src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && N >= nmin && N <= nmax &&
+    const int nmax_t = type == GGML_TYPE_Q6_K ? std::min(nmax, nmax_q6k) : nmax;
+    const bool ok = src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && N >= nmin && N <= nmax_t &&
                     src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
                     src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
                     (src1->nb[1] % sizeof(float)) == 0 && (dst->nb[1] % sizeof(float)) == 0 && tmm_weights_ok(src0);
