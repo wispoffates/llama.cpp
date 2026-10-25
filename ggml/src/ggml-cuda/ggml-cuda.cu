@@ -2825,7 +2825,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             return;
         }
     }
-    // Pascal has no MMQ: q6_K / q8_0 batches of 9..80 columns (verify batches, short prompts) take the fused tile kernel (tile-mm.cu)
+    // Pascal has no MMQ: quantized batches of 9..127 columns (verify batches, short prompts, follow-up chat turns) take the fused tile kernel (tile-mm.cu)
     if (ggml_cuda_tile_mm_try(ctx, src0, src1, dst)) {
         return;
     }
