@@ -3752,7 +3752,61 @@ size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_fl
     }
 }
 
+// the CUDA backend's copy batching (ggml_backend_cuda_copy_batch), or nullptr when no loaded backend offers it
+using llama_copy_batch_fn = void (*)(bool);
+static llama_copy_batch_fn llama_copy_batch_get() {
+    static const llama_copy_batch_fn fn = [] {
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            if (void * p = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_copy_batch")) {
+                return (llama_copy_batch_fn) p;
+            }
+        }
+        return (llama_copy_batch_fn) nullptr;
+    }();
+    return fn;
+}
+
+uint8_t * llama_context::state_stage_get(size_t size) {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_STATE_STAGING"); return !e || atoi(e) != 0; }();
+    // small states (draft contexts, attention-only KV slices) are not worth a second copy
+    if (!enabled || size < (1u << 20) || llama_copy_batch_get() == nullptr) {
+        return nullptr;
+    }
+    if (!state_stage || ggml_backend_buffer_get_size(state_stage.get()) < size) {
+        ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_buffer_type_t host = gpu ? ggml_backend_dev_host_buffer_type(gpu) : nullptr;
+        state_stage.reset(host ? ggml_backend_buft_alloc_buffer(host, size) : nullptr);
+        if (!state_stage) {
+            return nullptr;
+        }
+        LLAMA_LOG_INFO("%s: pinned state staging buffer %.1f MiB\n", __func__, size/1048576.0);
+    }
+    return (uint8_t *) ggml_backend_buffer_get_base(state_stage.get());
+}
+
 size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags) {
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        if (uint8_t * stage = state_stage_get(size)) {
+            const llama_copy_batch_fn batch = llama_copy_batch_get();
+            size_t n = 0;
+            batch(true);
+            try {
+                llama_io_write_host io(stage, size); // its destructor issues the tensor copies, inside the batch
+                io.write(&io_magic, sizeof(io_magic));
+                io.write(&seq_id, sizeof(seq_id));
+                n = state_seq_write_data(io, seq_id, flags);
+            } catch (const std::exception & err) {
+                LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
+                n = 0;
+            }
+            batch(false); // synchronizes every device the copies touched
+            if (n > 0) {
+                memcpy(dst, stage, n);
+            }
+            return n;
+        }
+    }
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
@@ -3772,6 +3826,33 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 }
 
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE)) {
+        if (uint8_t * stage = state_stage_get(size)) {
+            const llama_copy_batch_fn batch = llama_copy_batch_get();
+            memcpy(stage, src, size);
+            size_t n = 0;
+            batch(true);
+            {
+                llama_io_read_host io(stage, size); // its destructor issues the tensor copies, inside the batch
+                try {
+                    uint32_t magic_read;
+                    io.read(&magic_read, sizeof(magic_read));
+                    if (io_magic != magic_read) {
+                        throw std::runtime_error("wrong sequence state magic");
+                    }
+                    llama_seq_id seq_id_read;
+                    io.read(&seq_id_read, sizeof(seq_id_read));
+                    n = state_seq_read_data(io, seq_id, flags);
+                } catch (const std::exception & err) {
+                    LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
+                    io.discard();
+                    n = 0;
+                }
+            }
+            batch(false); // the restored state is on the devices before anything reads it
+            return n;
+        }
+    }
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         // create a temporary io to read the magic and the src seq_id

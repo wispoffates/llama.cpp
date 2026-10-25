@@ -879,6 +879,37 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// Copy batching for host <-> device state transfers (llama checkpoint save / restore): while a batch is open on this thread, the
+// buffer get/set calls below issue their copy on cudaStreamPerThread and only record the device; closing the batch synchronizes
+// each recorded device once. With a pinned host side the copies of both GPUs (and of all the state tensors) overlap instead of
+// one synchronized copy per tensor per device. Only for callers that keep the host memory alive until the batch is closed.
+static thread_local bool     ggml_cuda_copy_batch_open    = false;
+static thread_local uint64_t ggml_cuda_copy_batch_devices = 0;
+
+static void ggml_cuda_copy_sync_or_defer(int device) {
+    if (ggml_cuda_copy_batch_open && device < 64) {
+        ggml_cuda_copy_batch_devices |= (uint64_t) 1 << device;
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+void ggml_backend_cuda_copy_batch(bool begin) {
+    if (begin) {
+        ggml_cuda_copy_batch_open    = true;
+        ggml_cuda_copy_batch_devices = 0;
+        return;
+    }
+    ggml_cuda_copy_batch_open = false;
+    for (int dev = 0; dev < 64 && ggml_cuda_copy_batch_devices != 0; ++dev) {
+        if (ggml_cuda_copy_batch_devices & ((uint64_t) 1 << dev)) {
+            ggml_cuda_set_device(dev);
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            ggml_cuda_copy_batch_devices &= ~((uint64_t) 1 << dev);
+        }
+    }
+}
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -892,7 +923,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -900,7 +931,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -910,7 +941,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
@@ -920,7 +951,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -7743,6 +7774,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_ar_rank_run_norm") == 0) {
         return (void *)ggml_backend_cuda_ar_rank_run_norm;
+    }
+    if (strcmp(name, "ggml_backend_cuda_copy_batch") == 0) {
+        return (void *) ggml_backend_cuda_copy_batch;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
