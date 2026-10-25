@@ -449,6 +449,11 @@ private:
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
+    // pinned host staging for host-side sequence state save / restore (context checkpoints): the per-tensor copies of all GPUs are
+    // issued as one batch into / out of this buffer, then one memcpy to / from the caller's memory (LLAMA_STATE_STAGING=0: off)
+    ggml_backend_buffer_ptr state_stage;
+    uint8_t * state_stage_get(size_t size);
+
     bool has_evaluated_once = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
