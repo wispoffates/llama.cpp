@@ -2721,13 +2721,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    // Pascal, short batches just past the matvec limit (9..GGML_CUDA_MMVQ_CHUNK_MAX columns, e.g. a short chat turn): run the matvec
-    // kernels over column chunks of GGML_CUDA_MMVQ_CHUNK instead of the tile kernel. At 16 columns tile_mm<q6_K, TN=1> spends
-    // ~107 ms/GPU on Swift's Q6_K weights (decode + split-K for a quarter of a tile's math) where 4-column matvecs take ~23 ms per pass.
-    if (cc == GGML_CUDA_CC_PASCAL && ne11 > MMVQ_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
-        static const int chunk_max = [] { const char * e = getenv("GGML_CUDA_MMVQ_CHUNK_MAX"); return e ? atoi(e) : 0; }();
-        static const int chunk     = [] { const char * e = getenv("GGML_CUDA_MMVQ_CHUNK"); return std::max(1, std::min(e ? atoi(e) : 4, MMVQ_MAX_BATCH_SIZE)); }();
+    // Pascal, q6_K batches just past the matvec limit (9..GGML_CUDA_MMVQ_CHUNK_MAX columns, default 14: a short chat turn): run the
+    // fp16 matvec over balanced column chunks of at most GGML_CUDA_MMVQ_CHUNK (default 5 = the widest the fp16 path takes; 6..8
+    // columns go to the integer path, which measured KLD 0.00026 vs 0.000002) instead of the tile kernel. At 9..16 columns
+    // tile_mm<q6_K, TN=1> reads Swift's weights at ~95 GB/s (decode + split-K for a quarter of a tile's math) where the 4..5-column
+    // matvec reaches ~430 GB/s. Phase SBQ (Swift, llama-bench): pp9 53 -> 84 t/s, pp10 59 -> 92, pp12 70 -> 89, pp14 80 -> 91;
+    // pp16 even, pp20+ the tile kernel wins. Other types: gemma4 / qwen36 (q8_0 / q5_K dense weights) had no cliff and lose with it.
+    // GGML_CUDA_MMVQ_CHUNK_MAX=0 turns it off.
+    if (cc == GGML_CUDA_CC_PASCAL && src0->type == GGML_TYPE_Q6_K && ne11 > MMVQ_MAX_BATCH_SIZE &&
+            ne2 == 1 && ne3 == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
+        static const int chunk_max = [] { const char * e = getenv("GGML_CUDA_MMVQ_CHUNK_MAX"); return e ? atoi(e) : 14; }();
+        static const int chunk     = [] { const char * e = getenv("GGML_CUDA_MMVQ_CHUNK"); return std::max(1, std::min(e ? atoi(e) : 5, MMVQ_MAX_BATCH_SIZE)); }();
         if (ne11 <= chunk_max && ggml_cuda_should_use_mmvq(src0->type, cc, chunk)) {
+            // the activation caches of the matvec paths are keyed on the src1 node; the chunk views below are stack copies at one
+            // address, so a cached entry from another node that reused this buffer could match -- start each chunked matmul clean
+            ctx.mmvq_q8_1_invalidate();
+            ggml_cuda_mmvq_f16_invalidate(ctx);
+            ggml_cuda_mmvq_h1_invalidate(ctx);
             // balanced chunks of at most `chunk` columns (e.g. 9 -> 5 + 4 at chunk 5)
             const int64_t n_chunks = (ne11 + chunk - 1)/chunk;
             int64_t c0 = 0;
