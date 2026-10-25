@@ -2857,6 +2857,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // Pascal, short batches just past the matvec limit (9..GGML_CUDA_MMVQ_CHUNK_MAX columns, e.g. a short chat turn): run the matvec
+    // kernels over column chunks of GGML_CUDA_MMVQ_CHUNK instead of the tile kernel. At 16 columns tile_mm<q6_K, TN=1> spends
+    // ~107 ms/GPU on Swift's Q6_K weights (decode + split-K for a quarter of a tile's math) where 4-column matvecs take ~23 ms per pass.
+    if (cc == GGML_CUDA_CC_PASCAL && ne11 > MMVQ_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1 && src1->ne[2] == 1 && src1->ne[3] == 1) {
+        static const int chunk_max = [] { const char * e = getenv("GGML_CUDA_MMVQ_CHUNK_MAX"); return e ? atoi(e) : 0; }();
+        static const int chunk     = [] { const char * e = getenv("GGML_CUDA_MMVQ_CHUNK"); return std::max(1, std::min(e ? atoi(e) : 4, MMVQ_MAX_BATCH_SIZE)); }();
+        if (ne11 <= chunk_max && ggml_cuda_should_use_mmvq(src0->type, cc, chunk)) {
+            // balanced chunks of at most `chunk` columns (e.g. 9 -> 5 + 4 at chunk 5)
+            const int64_t n_chunks = (ne11 + chunk - 1)/chunk;
+            int64_t c0 = 0;
+            for (int64_t i = 0; i < n_chunks; ++i) {
+                const int64_t n = (ne11 - c0)/(n_chunks - i);
+                ggml_tensor src1_c = *src1;
+                ggml_tensor dst_c  = *dst;
+                src1_c.ne[1] = n;
+                src1_c.data  = (char *) src1->data + c0*src1->nb[1];
+                dst_c.ne[1]  = n;
+                dst_c.data   = (char *) dst->data + c0*dst->nb[1];
+                ggml_cuda_mul_mat_vec_q(ctx, src0, &src1_c, nullptr, &dst_c);
+                c0 += n;
+            }
+            return;
+        }
+    }
     // Pascal has no MMQ: q6_K / q8_0 batches of 9..80 columns (verify batches, short prompts) take the fused tile kernel (tile-mm.cu)
     if (ggml_cuda_tile_mm_try(ctx, src0, src1, dst)) {
         return;
