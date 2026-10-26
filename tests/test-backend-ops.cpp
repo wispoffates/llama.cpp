@@ -12683,6 +12683,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // p100-series (exp/hcperf): Flash-Next hyper-connection matmuls (qwen4exp hc_mix, hc = 4 x n_embd 2560 = 10240, low rank 320), both
+    // GPUs compute them in full (mirrored): down 10240 -> 320, inject 10240 -> 4, up 320 -> 10240; BF16 as shipped vs F16 / Q8_0, at
+    // 1 token (decode), 4 (MTP n3 verify) and 2 / 5 around it
+    for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 2, 4, 5}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 320,   n, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4,     n, 10240, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 10240, n, 320,   {1, 1}, {1, 1}));
+        }
+    }
+
     // MoE prefill: gemma4's experts (128 x 8 used, q4_0) per GPU under tensor split (ffn_gate_up 2816 -> 704 shared input, ffn_down
     // 704 -> 1408 per slot) at ubatch 512 / 1536; qwen35moe's (256 x 8, q6_K / q8_0) at 512
     for (int n : {512, 1536}) {
