@@ -863,16 +863,17 @@ void launch_mul_mat_vec_f_cuda(
                               (ncols_dst == 1 || (stride_col_y*sizeof(float)) % 16 == 0);
             if (ids == nullptr && !has_fusion && warp_size == 32 && ncols >= 4096 && ncols % 8 == 0 && nrows <= 2048 && al16 && nc_ok &&
                     ggml_cuda_mmvf_shortk_enabled()) {
-                // Pascal only (allocates per-stream scratch on first use, not capture-safe). GGML_CUDA_MMVF_SPLITK=0: block-per-row(s)
-                // kernel below; GGML_CUDA_MMVF_SPLITK_BLOCKS: target block count (default 2 per SM)
+                // Pascal only (allocates per-stream scratch on first use, not capture-safe). HC5: wins only with few rows (hc inject
+                // 10240 -> 4: 11.2 -> 6.1 us at 4 columns) and 2+ columns; at 320 rows (hc down) or 1 column the block-per-row kernel
+                // is as fast or faster. GGML_CUDA_MMVF_SPLITK=0: block-per-row kernel below; _BLOCKS: target block count (2 per SM)
                 static const bool splitk_on = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK"); return e == nullptr || atoi(e) != 0; }();
                 static const int  splitk_blocks = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK_BLOCKS"); return e ? atoi(e) : 0; }();
-                if (splitk_on && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_PASCAL && nrows <= 512 && nchannels_dst == 1 && nsamples_or_ntokens == 1 && (stride_col_y*sizeof(float)) % 16 == 0) {
+                if (splitk_on && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_PASCAL && nrows <= 32 && ncols_dst >= 2 && nchannels_dst == 1 && nsamples_or_ntokens == 1 && (stride_col_y*sizeof(float)) % 16 == 0) {
                     const int rpw   = nrows >= 64 ? 4 : 1;
                     const int TR    = 8*rpw;
                     const int ntile = (int) ((nrows + TR - 1)/TR);
                     const int target = splitk_blocks > 0 ? splitk_blocks : 2*ggml_cuda_info().devices[device].nsm;
-                    const int max_kslice = (48*1024/(int) sizeof(float)/ncols_dst) & ~7;   // shared memory: ncols_dst x kslice floats
+                    const int max_kslice = ((48*1024 - 256)/(int) sizeof(float)/ncols_dst) & ~7;   // ncols_dst x kslice floats + the static is_last flag <= 48 KB
                     int nks = std::max(1, std::min((int) (ncols/512), (target + ntile - 1)/ntile));
                     int kslice = (int) (((ncols + nks - 1)/nks + 7) & ~7);
                     if (kslice > max_kslice) {
