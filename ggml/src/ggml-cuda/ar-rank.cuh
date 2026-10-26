@@ -6,6 +6,8 @@
 struct ggml_cuda_ar_rank_ctx;
 
 ggml_cuda_ar_rank_ctx * ggml_cuda_ar_rank_init(int dev0, int dev1, size_t max_bytes);
+// GGML_CUDA_AR_WIRE: 16-bit wire for reductions above 1 MiB (2 = scaled fp16, default; 1 = bf16; 0 = off)
+int ggml_cuda_ar_rank_wire();
 void                    ggml_cuda_ar_rank_free(ggml_cuda_ar_rank_ctx * c);
 bool                    ggml_cuda_ar_rank_eligible(const ggml_cuda_ar_rank_ctx * c, const ggml_tensor * t);
 void                    ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t stream, ggml_tensor * t);
