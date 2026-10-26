@@ -471,6 +471,91 @@ static __global__ void mul_mat_vec_f_shortk(
     }
 }
 
+// p100-series: short rows (K <= 64*max_steps) with the activations held in registers. mul_mat_vec_f_shortk re-reads the activation
+// pair of every column for each weight pair, so with 4 columns 4 of 5 loads are activations (qwen4exp hc up-projection BF16
+// 320 -> 10240 at 4 columns: 38 us = 171 GB/s). Here each lane loads its activation pairs once (max_steps x ncols_dst float2,
+// K = 320: 5 per column) and a warp then streams rows_per_warp rows with weight loads only; the warp reduction per row is unchanged.
+template <typename T, int rows_per_warp, int ncols_dst, int max_steps>
+static __global__ void __launch_bounds__(256) mul_mat_vec_f_shortk2(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols2, const int nrows,
+        const int stride_row, const int stride_col_y2, const int stride_col_dst, const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+        const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    const int lane        = threadIdx.x;
+    const int row0        = (blockIdx.x*blockDim.y + threadIdx.y)*rows_per_warp;
+    const int channel_dst = blockIdx.y;
+    const int sample_dst  = blockIdx.z;
+    const int channel_x   = fastdiv((uint32_t) channel_dst, channel_ratio);
+    const int sample_x    = fastdiv((uint32_t) sample_dst,  sample_ratio);
+
+    ggml_cuda_pdl_sync();
+    if (row0 >= nrows) {
+        return;
+    }
+    x   += int64_t(sample_x)  *stride_sample_x   + int64_t(channel_x)*stride_channel_x + int64_t(row0)*stride_row;
+    y   += int64_t(sample_dst)*stride_sample_y   + int64_t(channel_dst)*stride_channel_y;
+    dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
+
+    const float2 * y2 = (const float2 *) y;
+    float2 yr[max_steps][ncols_dst];
+#pragma unroll
+    for (int s = 0; s < max_steps; ++s) {
+        const int col2 = lane + s*WARP_SIZE;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            yr[s][j] = col2 < ncols2 ? __ldg(y2 + j*stride_col_y2 + col2) : make_float2(0.0f, 0.0f);
+        }
+    }
+    const int nr = min(rows_per_warp, nrows - row0);
+    float sumf[rows_per_warp][ncols_dst] = {{0.0f}};
+#pragma unroll
+    for (int r = 0; r < rows_per_warp; ++r) {
+        if (r >= nr) {
+            break;
+        }
+        const T * xr = x + int64_t(r)*stride_row;
+#pragma unroll
+        for (int s = 0; s < max_steps; ++s) {
+            const int col2 = lane + s*WARP_SIZE;
+            if (col2 >= ncols2) {
+                break;
+            }
+            float2 tmpx;
+            if constexpr (std::is_same_v<T, float>) {
+                tmpx = __ldg((const float2 *) xr + col2);
+            } else if constexpr (std::is_same_v<T, half>) {
+                tmpx = __half22float2(((const half2 *) xr)[col2]);
+            } else {
+                const uint32_t w = __ldg((const uint32_t *) xr + col2);
+                tmpx = make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));   // bf16 pair -> f32 exact
+            }
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumf[r][j] += tmpx.x*yr[s][j].x;
+                sumf[r][j] += tmpx.y*yr[s][j].y;
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+#pragma unroll
+    for (int r = 0; r < rows_per_warp; ++r) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            sumf[r][j] = warp_reduce_sum<WARP_SIZE>(sumf[r][j]);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) {
+            if (r < nr) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    dst[j*stride_col_dst + row0 + r] = sumf[r][j];
+                }
+            }
+        }
+    }
+}
+
 // p100-series: one column, long rows of 16-bit weights (K >= 4096) and few rows (qwen4exp hyper-connection down-projections,
 // BF16 10240 -> 320: 320 blocks of 256 threads with 4-byte loads keep too little in flight, ~330 GB/s). Same block-per-row shape,
 // 16-byte loads (8 weights per thread per step).
@@ -605,6 +690,27 @@ void launch_mul_mat_vec_f_cuda(
     if constexpr (ncols_dst <= 8 && !is_multi_token_id && std::is_same_v<type_acc, float>) {
         const bool nc_ok = ncols_dst == 1 || (ggml_cuda_mmvf_shortk_nc_enabled() && stride_col_y % 2 == 0);
         if (ids == nullptr && !has_fusion && warp_size == 32 && ncols <= 1024 && nrows >= 1024 && nc_ok && ggml_cuda_mmvf_shortk_enabled()) {
+            // GGML_CUDA_MMVF_SHORTK2=0: the warp-per-row kernel below for every short-K shape
+            static const bool sk2 = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK2"); return e == nullptr || atoi(e) != 0; }();
+            static const int sk2_rpw = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK2_RPW"); return e ? atoi(e) : 4; }();
+            if (sk2 && ncols <= 320 && sizeof(T) == 2) {
+                constexpr int wpb = 8;
+                const auto launch_sk2 = [&](auto rpw_c) {
+                    constexpr int rpw = decltype(rpw_c)::value;
+                    const dim3 block_nums_sk2((nrows + wpb*rpw - 1)/(wpb*rpw), nchannels_dst, nsamples_or_ntokens);
+                    const ggml_cuda_kernel_launch_params launch_params = {block_nums_sk2, dim3(WARP_SIZE, wpb, 1), 0, stream};
+                    ggml_cuda_kernel_launch(mul_mat_vec_f_shortk2<T, rpw, ncols_dst, 5>, launch_params,
+                        x, y, dst, (int) (ncols/2), (int) nrows, (int) stride_row, (int) (stride_col_y/2), (int) stride_col_dst, channel_ratio_fd, (int) stride_channel_x,
+                        (int) stride_channel_y, (int) stride_channel_dst, sample_ratio_fd, (int) stride_sample_x, (int) stride_sample_y, (int) stride_sample_dst);
+                };
+                switch (sk2_rpw) {
+                    case 1:  launch_sk2(std::integral_constant<int, 1>{}); break;
+                    case 2:  launch_sk2(std::integral_constant<int, 2>{}); break;
+                    case 8:  launch_sk2(std::integral_constant<int, 8>{}); break;
+                    default: launch_sk2(std::integral_constant<int, 4>{}); break;
+                }
+                return;
+            }
             constexpr int rpb = 8;
             const dim3 block_nums_sk((nrows + rpb - 1)/rpb, nchannels_dst, nsamples_or_ntokens);
             const dim3 block_dims_sk(WARP_SIZE, rpb, 1);
