@@ -81,12 +81,15 @@ static __device__ __forceinline__ float ar_ll_get(const uint2 * p, const int tok
 }
 // p100-series 10-25: compressed wire for LARGE reductions (prefill activations, > 1 MiB, GGML_META_AR_MAX_BYTES raised): the PCIe P2P
 // bytes are the cost there (gemma4 prefill: 20 % of GPU time in AllReduce copies; the in-kernel path at f32 measured even with the peer
-// copy), so send 16 bits per element. GGML_CUDA_AR_WIRE: 0 = f32 (default), 1 = bf16 (fp32 range, 8-bit mantissa), 2 = fp16 with a
+// copy), so send 16 bits per element. GGML_CUDA_AR_WIRE: 2 = default, 1 = bf16 (fp32 range, 8-bit mantissa), 0 = f32; 2 = fp16 with a
 // power-of-two scale per chunk / row (11-bit mantissa; the scale keeps gemma4's large activations in range). Both devices must hold the
 // SAME sum (the next subgraph reads mirrored activations): each device writes its own partial back ROUNDED the same way before adding the
 // peer's decoded one, so both compute round(x0) + round(x1). Decode and small reductions (<= 1 MiB, LL path) are not touched.
+// Phases AW1-AW3: gemma4 prefill +10..13 % (serving 1K / 4K / 11.5K prompts +13 / +12 / +11 %), qwen36 +7 %, Swift +7 %, glimmer +10 %;
+// KLD gemma4 16-chunk +6 % on average over -ub 512 / 1024 / 1536 (inside the batching noise), ornith even, qwen36 better, Swift / glimmer
+// bit-identical (their q6_K prefill matmuls already produce fp16 values, which the scaled wire carries exactly).
 static int ar_wire() {
-    static const int w = [] { const char * e = getenv("GGML_CUDA_AR_WIRE"); return e ? std::max(0, std::min(2, atoi(e))) : 0; }();
+    static const int w = [] { const char * e = getenv("GGML_CUDA_AR_WIRE"); return e ? std::max(0, std::min(2, atoi(e))) : 2; }();
     return w;
 }
 static __device__ __forceinline__ uint32_t ar_bf16_enc(const float x) {
@@ -116,8 +119,9 @@ struct ar_prof_meta { uint32_t token; uint8_t kind; int32_t n; int32_t nrows; };
 
 struct ggml_cuda_ar_rank_ctx {
     int      devices[2];
-    size_t   max_bytes;
-    char   * inbox[2];    // device i: AR_RANK_SLOTS * max_bytes, written by the peer
+    size_t   max_bytes;   // largest reduction taken
+    size_t   slot_bytes;  // inbox bytes per slot: max_bytes at f32, about half with the 16-bit wire (reductions > 1 MiB)
+    char   * inbox[2];    // device i: AR_RANK_SLOTS * slot_bytes, written by the peer
     char   * arrival[2];  // device i: AR_RANK_SLOTS * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE, written by the peer
     uint32_t calls[2];    // per rank; both ranks issue the same sequence of reductions
     unsigned long long * prof[2] = {nullptr, nullptr};  // GGML_CUDA_AR_PROF: device ring per rank
@@ -525,11 +529,16 @@ ggml_cuda_ar_rank_ctx * ggml_cuda_ar_rank_init(int dev0, int dev1, size_t max_by
     c->devices[0] = dev0;
     c->devices[1] = dev1;
     c->max_bytes  = max_bytes;
+    // with the 16-bit wire every reduction above 1 MiB travels as 16-bit values + fp32 scales (one per 1024-element chunk or per row, rows
+    // <= 65535 on the fused-norm path), so a slot needs about half of max_bytes
+    c->slot_bytes = ar_wire() != 0 && max_bytes > ((size_t) 1 << 20)
+        ? std::max((size_t) 1 << 20, ar_wire_scales_off((int64_t) (max_bytes / sizeof(float))) + (size_t) 65536 * sizeof(float))
+        : max_bytes;
     const size_t arrival_bytes = (size_t) AR_RANK_SLOTS * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE;
     bool ok = true;
     for (int i = 0; i < 2 && ok; ++i) {
         ggml_cuda_set_device(c->devices[i]);
-        ok = cudaMalloc((void **) &c->inbox[i], AR_RANK_SLOTS * max_bytes) == cudaSuccess &&
+        ok = cudaMalloc((void **) &c->inbox[i], AR_RANK_SLOTS * c->slot_bytes) == cudaSuccess &&
              cudaMalloc((void **) &c->arrival[i], arrival_bytes) == cudaSuccess &&
              cudaMemset(c->arrival[i], 0, arrival_bytes) == cudaSuccess &&
              cudaDeviceSynchronize() == cudaSuccess;
@@ -602,8 +611,22 @@ void ggml_cuda_ar_rank_free(ggml_cuda_ar_rank_ctx * c) {
     delete c;
 }
 
+int ggml_cuda_ar_rank_wire() {
+    return ar_wire();
+}
+
 bool ggml_cuda_ar_rank_eligible(const ggml_cuda_ar_rank_ctx * c, const ggml_tensor * t) {
-    return c != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nbytes(t) <= c->max_bytes && ggml_nelements(t) > 0;
+    if (c == nullptr || t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || ggml_nbytes(t) > c->max_bytes || ggml_nelements(t) <= 0) {
+        return false;
+    }
+    if (ar_wire() == 0 || ggml_nbytes(t) <= ((size_t) 1 << 20)) {
+        return ggml_nbytes(t) <= c->slot_bytes;
+    }
+    // above 1 MiB only the 16-bit wire fits a slot: the plain wire kernel needs n % 4 == 0 and 16-byte alignment (the fused-norm kernel
+    // has neither restriction, but it is only tried after this check)
+    const int64_t n = ggml_nelements(t);
+    return n % 4 == 0 && ((uintptr_t) t->data & 15) == 0 &&
+           ar_wire_scales_off(n) + (size_t) (n / 1024 + 1) * sizeof(float) <= c->slot_bytes;
 }
 
 void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t stream, ggml_tensor * t) {
@@ -615,8 +638,8 @@ void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t 
     const int      maxb  = (size_t) n * sizeof(float) > ((size_t) 1 << 20) ? ar_blocks_large() : AR_RANK_MAX_BLOCKS;
     const int      nb    = std::max(1, std::min(maxb, (n4 + AR_RANK_THREADS - 1) / AR_RANK_THREADS));
 
-    float * wire_out   = (float *) (c->inbox[peer] + (size_t) slot * c->max_bytes);
-    float * wire_in    = (float *) (c->inbox[rank] + (size_t) slot * c->max_bytes);
+    float * wire_out   = (float *) (c->inbox[peer] + (size_t) slot * c->slot_bytes);
+    float * wire_in    = (float *) (c->inbox[rank] + (size_t) slot * c->slot_bytes);
     int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
     int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
 
@@ -637,7 +660,7 @@ void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t 
         return;
     }
     if (ar_wire() != 0 && (size_t) n * sizeof(float) > ((size_t) 1 << 20) && n % 4 == 0 && ((uintptr_t) t->data & 15) == 0 &&
-            ar_wire_scales_off(n) + (size_t) ((n4 + AR_RANK_THREADS - 1) / AR_RANK_THREADS) * sizeof(float) <= c->max_bytes) {
+            ar_wire_scales_off(n) + (size_t) ((n4 + AR_RANK_THREADS - 1) / AR_RANK_THREADS) * sizeof(float) <= c->slot_bytes) {
         if (ar_wire() == 1) {
             ggml_cuda_ar_rank_wire_kernel<1><<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, (char *) wire_out, (const char *) wire_in,
                                                                                  signal_out, signal_in, (int) token);
@@ -670,8 +693,8 @@ void ggml_cuda_ar_rank_reduce_norm(ggml_cuda_ar_rank_ctx * c, int rank, cudaStre
     const int      nrows = (int) ggml_nrows(t);
     const int      nb    = std::min((size_t) ggml_nbytes(t) > ((size_t) 1 << 20) ? ar_blocks_large() : AR_RANK_MAX_BLOCKS, nrows);
 
-    float * wire_out   = (float *) (c->inbox[peer] + (size_t) slot * c->max_bytes);
-    float * wire_in    = (float *) (c->inbox[rank] + (size_t) slot * c->max_bytes);
+    float * wire_out   = (float *) (c->inbox[peer] + (size_t) slot * c->slot_bytes);
+    float * wire_in    = (float *) (c->inbox[rank] + (size_t) slot * c->slot_bytes);
     int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
     int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
 
@@ -685,7 +708,7 @@ void ggml_cuda_ar_rank_reduce_norm(ggml_cuda_ar_rank_ctx * c, int rank, cudaStre
         wire_out, wire_in, ll_out, ll_in, v4, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps, c->prof[rank])
     // compressed wire only for large reductions (see ar_wire); the f16 scales (one per row) must fit after the 16-bit values
     const int wire = !ll && ar_wire() != 0 && (size_t) ggml_nbytes(t) > ((size_t) 1 << 20) &&
-                     ar_wire_scales_off((int64_t) ncols*nrows) + (size_t) nrows*sizeof(float) <= c->max_bytes ? ar_wire() : 0;
+                     ar_wire_scales_off((int64_t) ncols*nrows) + (size_t) nrows*sizeof(float) <= c->slot_bytes ? ar_wire() : 0;
 #define AR_NORM_LAUNCH(BS, AF, AA) do { if (ll) AR_NORM_LAUNCH1(BS, AF, AA, true); else if (wire == 1) AR_NORM_LAUNCHW(BS, AF, AA, 1); \
         else if (wire == 2) AR_NORM_LAUNCHW(BS, AF, AA, 2); else AR_NORM_LAUNCH1(BS, AF, AA, false); } while (0)
     const bool af = a.res != nullptr;
