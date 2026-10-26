@@ -4,6 +4,7 @@
 #include "mmvf.cuh"
 #include "mmf.cuh"
 #include "convert.cuh"
+#include "pass-timer.cuh"
 
 #include <mutex>
 #include <unordered_map>
@@ -829,7 +830,8 @@ void launch_mul_mat_vec_f_cuda(
             // GGML_CUDA_MMVF_SHORTK2_RPW: rows per warp (HC3: 8 is fastest up to 5 columns; 6+ columns need 128+ registers at 8 -> 4)
             static const int sk2_rpw_env = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK2_RPW"); return e ? atoi(e) : 0; }();
             const int sk2_rpw = sk2_rpw_env > 0 ? sk2_rpw_env : ncols_dst <= 5 ? 8 : 4;
-            if constexpr (sizeof(T) == 2) if (sk2 && ncols <= 320) {
+            static const bool sk2_ab = ggml_cuda_ab_listed("shortk2");
+            if constexpr (sizeof(T) == 2) if (sk2 && !(sk2_ab && ggml_cuda_ab_arm() == 1) && ncols <= 320) {
                 constexpr int wpb = 8;
                 const auto launch_sk2 = [&](auto rpw_c) {
                     constexpr int rpw = decltype(rpw_c)::value;
@@ -868,7 +870,8 @@ void launch_mul_mat_vec_f_cuda(
                 // is as fast or faster. GGML_CUDA_MMVF_SPLITK=0: block-per-row kernel below; _BLOCKS: target block count (2 per SM)
                 static const bool splitk_on = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK"); return e == nullptr || atoi(e) != 0; }();
                 static const int  splitk_blocks = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK_BLOCKS"); return e ? atoi(e) : 0; }();
-                if (splitk_on && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_PASCAL && nrows <= 32 && ncols_dst >= 2 && nchannels_dst == 1 && nsamples_or_ntokens == 1 && (stride_col_y*sizeof(float)) % 16 == 0) {
+                static const bool splitk_ab = ggml_cuda_ab_listed("splitk");
+                if (splitk_on && !(splitk_ab && ggml_cuda_ab_arm() == 1) && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_PASCAL && nrows <= 32 && ncols_dst >= 2 && nchannels_dst == 1 && nsamples_or_ntokens == 1 && (stride_col_y*sizeof(float)) % 16 == 0) {
                     const int rpw   = nrows >= 64 ? 4 : 1;
                     const int TR    = 8*rpw;
                     const int ntile = (int) ((nrows + TR - 1)/TR);
