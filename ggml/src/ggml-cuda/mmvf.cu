@@ -5,6 +5,9 @@
 #include "mmf.cuh"
 #include "convert.cuh"
 
+#include <mutex>
+#include <unordered_map>
+
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -651,6 +654,125 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_f_longk(
     }
 }
 
+// p100-series: split-K matvec for long rows of 16-bit weights and few rows (qwen4exp hyper-connection down 10240 -> 320 and inject
+// 10240 -> 4). mul_mat_vec_f_longk gives a row (or 4) one block: inject runs on 4 blocks of a 56-SM GPU (11 us at 4 columns), and
+// with several columns every block re-reads the whole activation vector (160 KB at 4 x 10240) from L2 (down: 22 us, 293 GB/s).
+// Here a block owns a tile of 8*rows_per_warp rows and one K-slice: it stages the slice of every column in shared memory once, each
+// warp streams its rows with 16-byte weight loads, and the per-row partial sums go to a scratch buffer. The last block of a row tile
+// (atomic counter) adds the slices in index order and resets the counter -> deterministic, no memset, no float atomics.
+template <typename T, int ncols_dst, int rows_per_warp>
+static __global__ void __launch_bounds__(256) mul_mat_vec_f_splitk(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, float * __restrict__ scratch,
+        unsigned int * __restrict__ counters, const int ncols, const int nrows, const int stride_row, const int stride_col_y,
+        const int stride_col_dst, const int kslice) {
+    static_assert(sizeof(T) == 2, "16-bit weights");
+    constexpr int TR = 8*rows_per_warp;
+    extern __shared__ float ys[];   // [ncols_dst][kslice]
+    __shared__ bool is_last;
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int tile = blockIdx.x;
+    const int ks   = blockIdx.y;
+    const int nks  = gridDim.y;
+    const int k0   = ks*kslice;
+    const int klen = min(kslice, ncols - k0);   // multiple of 8
+
+    ggml_cuda_pdl_sync();
+    for (int i = tid; i < ncols_dst*(klen/4); i += 256) {
+        const int j = i / (klen/4), c = i % (klen/4);
+        ((float4 *) (ys + j*kslice))[c] = __ldg((const float4 *) (y + int64_t(j)*stride_col_y + k0) + c);
+    }
+    __syncthreads();
+
+    const int row0 = tile*TR + warp*rows_per_warp;
+    float sumf[rows_per_warp][ncols_dst] = {{0.0f}};
+    for (int c = lane; c < klen/8; c += WARP_SIZE) {
+        uint4 w[rows_per_warp];
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) {
+            w[r] = row0 + r < nrows ? __ldg((const uint4 *) (x + int64_t(row0 + r)*stride_row + k0) + c) : make_uint4(0, 0, 0, 0);
+        }
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float4 ya = ((const float4 *) (ys + j*kslice))[2*c], yb = ((const float4 *) (ys + j*kslice))[2*c + 1];
+#pragma unroll
+            for (int r = 0; r < rows_per_warp; ++r) {
+                const uint32_t ww[4] = {w[r].x, w[r].y, w[r].z, w[r].w};
+                float2 f[4];
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    if constexpr (std::is_same_v<T, half>) {
+                        f[q] = __half22float2(*(const half2 *) &ww[q]);
+                    } else {
+                        f[q] = make_float2(__uint_as_float(ww[q] << 16), __uint_as_float(ww[q] & 0xffff0000u));   // bf16 -> f32 exact
+                    }
+                }
+                float & sf = sumf[r][j];
+                sf += f[0].x*ya.x; sf += f[0].y*ya.y; sf += f[1].x*ya.z; sf += f[1].y*ya.w;
+                sf += f[2].x*yb.x; sf += f[2].y*yb.y; sf += f[3].x*yb.z; sf += f[3].y*yb.w;
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+    // partials: scratch[ks][row][j], rows of this tile only
+#pragma unroll
+    for (int r = 0; r < rows_per_warp; ++r) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float v = warp_reduce_sum<WARP_SIZE>(sumf[r][j]);
+            if (lane == 0 && row0 + r < nrows) {
+                scratch[(int64_t(ks)*nrows + row0 + r)*ncols_dst + j] = v;
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) {
+        is_last = atomicAdd(counters + tile, 1u) == (unsigned int) (nks - 1);
+    }
+    __syncthreads();
+    if (!is_last) {
+        return;
+    }
+    for (int i = tid; i < TR*ncols_dst; i += 256) {
+        const int row = tile*TR + i / ncols_dst, j = i % ncols_dst;
+        if (row < nrows) {
+            float v = 0.0f;
+            for (int k = 0; k < nks; ++k) {
+                v += __ldcg(scratch + (int64_t(k)*nrows + row)*ncols_dst + j);
+            }
+            dst[j*stride_col_dst + row] = v;
+        }
+    }
+    if (tid == 0) {
+        counters[tile] = 0;   // ready for the next launch on this stream (stream order)
+    }
+}
+
+// per-stream scratch + zeroed tile counters for mul_mat_vec_f_splitk (allocated once per stream, counters self-reset)
+struct ggml_cuda_splitk_state { float * scratch = nullptr; unsigned int * counters = nullptr; };
+static constexpr size_t GGML_CUDA_SPLITK_SCRATCH_FLOATS = 1 << 18;   // 1 MiB
+static constexpr int    GGML_CUDA_SPLITK_MAX_TILES      = 4096;
+static ggml_cuda_splitk_state ggml_cuda_splitk_get(cudaStream_t stream) {
+    static std::mutex mtx;
+    static std::unordered_map<cudaStream_t, ggml_cuda_splitk_state> states;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto it = states.find(stream);
+    if (it != states.end()) {
+        return it->second;
+    }
+    ggml_cuda_splitk_state st;
+    if (cudaMalloc((void **) &st.scratch, GGML_CUDA_SPLITK_SCRATCH_FLOATS*sizeof(float)) != cudaSuccess ||
+            cudaMalloc((void **) &st.counters, GGML_CUDA_SPLITK_MAX_TILES*sizeof(unsigned int)) != cudaSuccess ||
+            cudaMemsetAsync(st.counters, 0, GGML_CUDA_SPLITK_MAX_TILES*sizeof(unsigned int), stream) != cudaSuccess) {
+        (void) cudaGetLastError();
+        st = {};
+    }
+    states[stream] = st;
+    return st;
+}
+
 static bool ggml_cuda_mmvf_shortk_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK"); return e == nullptr || atoi(e) != 0; }();
     return on;
@@ -741,6 +863,36 @@ void launch_mul_mat_vec_f_cuda(
                               (ncols_dst == 1 || (stride_col_y*sizeof(float)) % 16 == 0);
             if (ids == nullptr && !has_fusion && warp_size == 32 && ncols >= 4096 && ncols % 8 == 0 && nrows <= 2048 && al16 && nc_ok &&
                     ggml_cuda_mmvf_shortk_enabled()) {
+                // Pascal only (allocates per-stream scratch on first use, not capture-safe). GGML_CUDA_MMVF_SPLITK=0: block-per-row(s)
+                // kernel below; GGML_CUDA_MMVF_SPLITK_BLOCKS: target block count (default 2 per SM)
+                static const bool splitk_on = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK"); return e == nullptr || atoi(e) != 0; }();
+                static const int  splitk_blocks = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK_BLOCKS"); return e ? atoi(e) : 0; }();
+                if (splitk_on && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_PASCAL && nrows <= 512 && nchannels_dst == 1 && nsamples_or_ntokens == 1 && (stride_col_y*sizeof(float)) % 16 == 0) {
+                    const int rpw   = nrows >= 64 ? 4 : 1;
+                    const int TR    = 8*rpw;
+                    const int ntile = (int) ((nrows + TR - 1)/TR);
+                    const int target = splitk_blocks > 0 ? splitk_blocks : 2*ggml_cuda_info().devices[device].nsm;
+                    const int max_kslice = (48*1024/(int) sizeof(float)/ncols_dst) & ~7;   // shared memory: ncols_dst x kslice floats
+                    int nks = std::max(1, std::min((int) (ncols/512), (target + ntile - 1)/ntile));
+                    int kslice = (int) (((ncols + nks - 1)/nks + 7) & ~7);
+                    if (kslice > max_kslice) {
+                        kslice = max_kslice;
+                    }
+                    nks = (int) ((ncols + kslice - 1)/kslice);
+                    const ggml_cuda_splitk_state sst = ggml_cuda_splitk_get(stream);
+                    if (sst.scratch && ntile <= GGML_CUDA_SPLITK_MAX_TILES && (size_t) nks*nrows*ncols_dst <= GGML_CUDA_SPLITK_SCRATCH_FLOATS) {
+                        const dim3 grid(ntile, nks, 1);
+                        const size_t smem = (size_t) ncols_dst*kslice*sizeof(float);
+                        if (rpw == 4) {
+                            mul_mat_vec_f_splitk<T, ncols_dst, 4><<<grid, 256, smem, stream>>>(x, y, dst, sst.scratch, sst.counters,
+                                (int) ncols, (int) nrows, (int) stride_row, (int) stride_col_y, (int) stride_col_dst, kslice);
+                        } else {
+                            mul_mat_vec_f_splitk<T, ncols_dst, 1><<<grid, 256, smem, stream>>>(x, y, dst, sst.scratch, sst.counters,
+                                (int) ncols, (int) nrows, (int) stride_row, (int) stride_col_y, (int) stride_col_dst, kslice);
+                        }
+                        return;
+                    }
+                }
                 // GGML_CUDA_MMVF_LONGK_RPB=0: one row per block for 2..8 columns too (the MNC geometry)
                 static const bool rpb_on = [] { const char * e = getenv("GGML_CUDA_MMVF_LONGK_RPB"); return e == nullptr || atoi(e) != 0; }();
                 if (ncols_dst > 1 && nrows >= 256 && rpb_on) {
