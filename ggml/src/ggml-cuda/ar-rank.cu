@@ -79,6 +79,39 @@ static __device__ __forceinline__ float ar_ll_get(const uint2 * p, const int tok
     } while (y != (unsigned) token);
     return __uint_as_float(x);
 }
+// p100-series 10-25: compressed wire for LARGE reductions (prefill activations, > 1 MiB, GGML_META_AR_MAX_BYTES raised): the PCIe P2P
+// bytes are the cost there (gemma4 prefill: 20 % of GPU time in AllReduce copies; the in-kernel path at f32 measured even with the peer
+// copy), so send 16 bits per element. GGML_CUDA_AR_WIRE: 0 = f32 (default), 1 = bf16 (fp32 range, 8-bit mantissa), 2 = fp16 with a
+// power-of-two scale per chunk / row (11-bit mantissa; the scale keeps gemma4's large activations in range). Both devices must hold the
+// SAME sum (the next subgraph reads mirrored activations): each device writes its own partial back ROUNDED the same way before adding the
+// peer's decoded one, so both compute round(x0) + round(x1). Decode and small reductions (<= 1 MiB, LL path) are not touched.
+static int ar_wire() {
+    static const int w = [] { const char * e = getenv("GGML_CUDA_AR_WIRE"); return e ? std::max(0, std::min(2, atoi(e))) : 0; }();
+    return w;
+}
+static __device__ __forceinline__ uint32_t ar_bf16_enc(const float x) {
+    uint32_t u = __float_as_uint(x);
+    u += 0x7FFFu + ((u >> 16) & 1u);   // round to nearest even (activations are finite)
+    return u >> 16;
+}
+static __device__ __forceinline__ float ar_bf16_dec(const uint32_t b) {
+    return __uint_as_float(b << 16);
+}
+// scale for a chunk / row with absolute maximum m: values * inv land below 2^15 (fp16 max 65504), power of two = exact
+static __device__ __forceinline__ void ar_f16_scale(const float m, float & inv, float & scale) {
+    int e = 0;
+    if (m > 0.0f) {
+        frexpf(m, &e);                 // m = f * 2^e, f in [0.5, 1)
+    }
+    const int sh = max(-30, min(30, 15 - e));
+    inv   = ldexpf(1.0f, sh);
+    scale = ldexpf(1.0f, -sh);
+}
+// 16-bit values at the start of the slot, the fp32 scales (WIRE 2) after them
+static __host__ __device__ __forceinline__ size_t ar_wire_scales_off(const int64_t n) {
+    return ((size_t) n*2 + 255) & ~(size_t) 255;
+}
+
 struct ar_prof_meta { uint32_t token; uint8_t kind; int32_t n; int32_t nrows; };
 
 struct ggml_cuda_ar_rank_ctx {
@@ -221,7 +254,7 @@ static __global__ void ggml_cuda_ar_rank_ll_kernel(float * data, const int n, ui
 //   otherwise:  x = mine + peer, then norm                                                     (gemma4:    AR -> RMS_NORM -> MUL [-> ADD])
 //   y = rsqrt(mean(x^2) + eps) * x * w [+ add2]
 // One block per row (rows striped over the grid); the handshake partition is by row on both devices.
-template <int BS, bool ADD_FIRST, bool ADD_AFTER, bool LL>
+template <int BS, bool ADD_FIRST, bool ADD_AFTER, bool LL, int WIRE = 0>
 static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
         float * data, const int ncols, const int nrows, float * __restrict__ wire_out, const float * __restrict__ wire_in,
         uint2 * __restrict__ ll_out, const uint2 * __restrict__ ll_in, const bool ll_v4,
@@ -248,6 +281,37 @@ static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
                 }
                 continue;
             }
+        }
+        if constexpr (!LL && WIRE != 0) {
+            // 16-bit wire: encode the row into the peer's inbox, keep the rounded row in place (see ar_wire)
+            uint16_t * w16 = (uint16_t *) wire_out;
+            float inv = 1.0f, scale = 1.0f;
+            if constexpr (WIRE == 2) {
+                float m = 0.0f;
+                for (int col = tid; col < ncols; col += BS) {
+                    m = fmaxf(m, fabsf(data[(int64_t) r*ncols + col]));
+                }
+                m = block_reduce<block_reduce_method::MAX, BS>(m, s_sum);
+                __syncthreads();
+                ar_f16_scale(m, inv, scale);
+                if (tid == 0) {
+                    ((float *) ((char *) wire_out + ar_wire_scales_off((int64_t) ncols*nrows)))[r] = scale;
+                }
+            }
+            for (int col = tid; col < ncols; col += BS) {
+                const int64_t o = (int64_t) r*ncols + col;
+                const float x = data[o];
+                if constexpr (WIRE == 1) {
+                    const uint32_t b = ar_bf16_enc(x);
+                    w16[o]  = (uint16_t) b;
+                    data[o] = ar_bf16_dec(b);
+                } else {
+                    const half h = __float2half_rn(x*inv);
+                    w16[o]  = __half_as_ushort(h);
+                    data[o] = __half2float(h)*scale;
+                }
+            }
+            continue;
         }
         for (int col = tid; col < ncols; col += BS) {
             if constexpr (LL) {
@@ -291,6 +355,10 @@ static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
         const int64_t o = (int64_t) r*ncols;
         float xv[max_regs];
         float tmp = 0.0f;
+        float wscale = 1.0f;
+        if constexpr (!LL && WIRE == 2) {
+            wscale = __ldcg((const float *) ((const char *) wire_in + ar_wire_scales_off((int64_t) ncols*nrows)) + r);
+        }
 #pragma unroll
         for (int u = 0; u < max_regs; ++u) {
             const int col = tid + u*BS;
@@ -298,6 +366,10 @@ static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
             if (col < ncols) {
                 if constexpr (LL) {
                     v = data[o + col] + ar_ll_get(ll_in + o + col, token);
+                } else if constexpr (WIRE == 1) {
+                    v = data[o + col] + ar_bf16_dec(__ldcg((const unsigned short *) wire_in + o + col));
+                } else if constexpr (WIRE == 2) {
+                    v = data[o + col] + __half2float(__ushort_as_half(__ldcg((const unsigned short *) wire_in + o + col)))*wscale;
                 } else {
                     v = data[o + col] + __ldcg(wire_in + o + col);
                 }
@@ -331,6 +403,84 @@ static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
             ar_prof_mark(prof, token, 3);
         }
         ar_prof_mark(prof, token, 4);
+    }
+}
+
+// ggml_cuda_ar_rank_kernel with a 16-bit wire (n % 4 == 0, data 16-byte aligned). Chunk = the 1024 elements one block covers per
+// iteration (256 threads x float4); WIRE 2 scales per chunk.
+template <int WIRE>
+static __global__ void __launch_bounds__(256) ggml_cuda_ar_rank_wire_kernel(float * data, const int n, char * __restrict__ wire_out,
+        const char * __restrict__ wire_in, int * signal_out, const int * signal_in, const int token) {
+    __shared__ float s_red[32];
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int n4  = n / 4;
+    const int gnt = gridDim.x * blockDim.x;
+    float4 * d4 = (float4 *) data;
+    uint2  * w_out = (uint2 *) wire_out;
+    const uint2 * w_in = (const uint2 *) wire_in;
+    float * s_out = (float *) (wire_out + ar_wire_scales_off(n));
+    const float * s_in = (const float *) (wire_in + ar_wire_scales_off(n));
+
+    // phase 1: encode my partial into the peer's inbox and keep the rounded value in place
+    for (int base = bid*blockDim.x; base < n4; base += gnt) {
+        const int i = base + tid;
+        float4 v = i < n4 ? d4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        uint2 w;
+        if constexpr (WIRE == 1) {
+            w.x = ar_bf16_enc(v.x) | (ar_bf16_enc(v.y) << 16);
+            w.y = ar_bf16_enc(v.z) | (ar_bf16_enc(v.w) << 16);
+            v = make_float4(ar_bf16_dec(w.x & 0xFFFFu), ar_bf16_dec(w.x >> 16), ar_bf16_dec(w.y & 0xFFFFu), ar_bf16_dec(w.y >> 16));
+        } else {
+            float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+            m = block_reduce<block_reduce_method::MAX, 256>(m, s_red);
+            float inv, scale;
+            ar_f16_scale(m, inv, scale);
+            const half2 h0 = __floats2half2_rn(v.x*inv, v.y*inv), h1 = __floats2half2_rn(v.z*inv, v.w*inv);
+            w.x = *(const uint32_t *) &h0;
+            w.y = *(const uint32_t *) &h1;
+            const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
+            v = make_float4(f0.x*scale, f0.y*scale, f1.x*scale, f1.y*scale);
+            if (tid == 0) {
+                s_out[base / blockDim.x] = scale;
+            }
+            __syncthreads();             // s_red reuse by the next chunk
+        }
+        if (i < n4) {
+            w_out[i] = w;
+            d4[i]    = v;
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    // phase 2: per-block handshake (same striping on both devices)
+    if (tid == 0) {
+        *(volatile int *) (signal_out + bid * (AR_RANK_STRIDE / sizeof(int))) = token;
+        __threadfence_system();
+        const volatile int * in = (const volatile int *) (signal_in + bid * (AR_RANK_STRIDE / sizeof(int)));
+        while (*in != token) {
+        }
+    }
+    __syncthreads();
+    __threadfence();
+    // phase 3: rounded mine (in place) + decoded peer
+    for (int base = bid*blockDim.x; base < n4; base += gnt) {
+        const int i = base + tid;
+        if (i >= n4) {
+            continue;
+        }
+        const uint2 w = __ldcg(w_in + i);
+        float4 o;
+        if constexpr (WIRE == 1) {
+            o = make_float4(ar_bf16_dec(w.x & 0xFFFFu), ar_bf16_dec(w.x >> 16), ar_bf16_dec(w.y & 0xFFFFu), ar_bf16_dec(w.y >> 16));
+        } else {
+            const float scale = __ldcg(s_in + base / blockDim.x);
+            const float2 f0 = __half22float2(*(const half2 *) &w.x), f1 = __half22float2(*(const half2 *) &w.y);
+            o = make_float4(f0.x*scale, f0.y*scale, f1.x*scale, f1.y*scale);
+        }
+        float4 v = d4[i];
+        v.x += o.x; v.y += o.y; v.z += o.z; v.w += o.w;
+        d4[i] = v;
     }
 }
 
@@ -486,6 +636,18 @@ void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+    if (ar_wire() != 0 && (size_t) n * sizeof(float) > ((size_t) 1 << 20) && n % 4 == 0 && ((uintptr_t) t->data & 15) == 0 &&
+            ar_wire_scales_off(n) + (size_t) ((n4 + AR_RANK_THREADS - 1) / AR_RANK_THREADS) * sizeof(float) <= c->max_bytes) {
+        if (ar_wire() == 1) {
+            ggml_cuda_ar_rank_wire_kernel<1><<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, (char *) wire_out, (const char *) wire_in,
+                                                                                 signal_out, signal_in, (int) token);
+        } else {
+            ggml_cuda_ar_rank_wire_kernel<2><<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, (char *) wire_out, (const char *) wire_in,
+                                                                                 signal_out, signal_in, (int) token);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     ggml_cuda_ar_rank_kernel<<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, wire_out, wire_in, signal_out, signal_in, (int) token,
                                                                   c->prof[rank]);
     CUDA_CHECK(cudaGetLastError());
@@ -519,7 +681,13 @@ void ggml_cuda_ar_rank_reduce_norm(ggml_cuda_ar_rank_ctx * c, int rank, cudaStre
     uint2 * ll_in  = c->ll[rank] + (size_t) slot * AR_LL_MAX_ELEMS;
 #define AR_NORM_LAUNCH1(BS, AF, AA, LLV) ggml_cuda_ar_rank_norm_kernel<BS, AF, AA, LLV><<<nb, BS, 0, stream>>>((float *) t->data, ncols, nrows, \
         wire_out, wire_in, ll_out, ll_in, v4, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps, c->prof[rank])
-#define AR_NORM_LAUNCH(BS, AF, AA) do { if (ll) AR_NORM_LAUNCH1(BS, AF, AA, true); else AR_NORM_LAUNCH1(BS, AF, AA, false); } while (0)
+#define AR_NORM_LAUNCHW(BS, AF, AA, W) ggml_cuda_ar_rank_norm_kernel<BS, AF, AA, false, W><<<nb, BS, 0, stream>>>((float *) t->data, ncols, nrows, \
+        wire_out, wire_in, ll_out, ll_in, v4, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps, c->prof[rank])
+    // compressed wire only for large reductions (see ar_wire); the f16 scales (one per row) must fit after the 16-bit values
+    const int wire = !ll && ar_wire() != 0 && (size_t) ggml_nbytes(t) > ((size_t) 1 << 20) &&
+                     ar_wire_scales_off((int64_t) ncols*nrows) + (size_t) nrows*sizeof(float) <= c->max_bytes ? ar_wire() : 0;
+#define AR_NORM_LAUNCH(BS, AF, AA) do { if (ll) AR_NORM_LAUNCH1(BS, AF, AA, true); else if (wire == 1) AR_NORM_LAUNCHW(BS, AF, AA, 1); \
+        else if (wire == 2) AR_NORM_LAUNCHW(BS, AF, AA, 2); else AR_NORM_LAUNCH1(BS, AF, AA, false); } while (0)
     const bool af = a.res != nullptr;
     const bool aa = a.add2 != nullptr;
     if (c->prof[rank] != nullptr) {
@@ -533,6 +701,7 @@ void ggml_cuda_ar_rank_reduce_norm(ggml_cuda_ar_rank_ctx * c, int rank, cudaStre
         else    { if (aa) AR_NORM_LAUNCH(1024, false, true); else AR_NORM_LAUNCH(1024, false, false); }
     }
 #undef AR_NORM_LAUNCH
+#undef AR_NORM_LAUNCHW
 #undef AR_NORM_LAUNCH1
     CUDA_CHECK(cudaGetLastError());
 }
