@@ -7806,8 +7806,8 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 }
 
 // p100-series: per-device AllReduce for the meta backend's threaded dispatch (ar-rank.cu). Returns nullptr unless both backends are
-// CUDA devices with peer access (GGML_CUDA_P2P). GGML_META_AR_MAX_BYTES: largest reduction taken (default 1 MiB; larger ones keep
-// the peer copy + ADD path).
+// CUDA devices with peer access (GGML_CUDA_P2P). GGML_META_AR_MAX_BYTES: largest reduction taken (default 32 MiB with the 16-bit wire
+// for prefill reductions (GGML_CUDA_AR_WIRE, default on), 1 MiB without it; larger ones keep the peer copy + ADD path).
 static void * ggml_backend_cuda_ar_rank_create(ggml_backend_t b0, ggml_backend_t b1) {
     if (!ggml_backend_is_cuda(b0) || !ggml_backend_is_cuda(b1)) {
         return nullptr;
@@ -7818,7 +7818,7 @@ static void * ggml_backend_cuda_ar_rank_create(ggml_backend_t b0, ggml_backend_t
         return nullptr;
     }
     const char * env = getenv("GGML_META_AR_MAX_BYTES");
-    const size_t max_bytes = env ? (size_t) strtoull(env, nullptr, 10) : (size_t) 1 << 20;
+    const size_t max_bytes = env ? (size_t) strtoull(env, nullptr, 10) : ggml_cuda_ar_rank_wire() != 0 ? (size_t) 32 << 20 : (size_t) 1 << 20;
     return max_bytes > 0 ? ggml_cuda_ar_rank_init(d0, d1, max_bytes) : nullptr;
 }
 
