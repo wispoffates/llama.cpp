@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/ar-rank.cuh"
+#include "ggml-cuda/pass-timer.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1586,7 +1587,7 @@ static __global__ void k_lru_decide(
         int32_t * state, int32_t * fill_list,
         int n_used, int n_tokens, int n_expert, int n_slot, int ids_stride, int exclusive,
         ggml_lru_ctrl * ctrl, int layer, int log_dev, int log_dev_index, int remap,
-        int tail, int32_t * keep, int tail_stats) {
+        int tail, int32_t * keep, int tail_stats, unsigned long long * pass_fills) {
     const int lane = threadIdx.x;
     int32_t * owner    = state;                     // expert -> slot
     int32_t * slot_of  = state + n_expert;          // slot -> expert
@@ -1723,6 +1724,9 @@ static __global__ void k_lru_decide(
         state[n_expert + 2 * n_slot + 1] += n_total;
         state[n_expert + 2 * n_slot + 2] += n_fill;
         fill_list[3 * n_slot] = n_fill;
+        if (pass_fills != nullptr) {   // GGML_CUDA_PASS_TIMER: fills per pass
+            atomicAdd(pass_fills, (unsigned long long) n_fill);
+        }
         if (tail_stats) {   // GGML_CUDA_LRU_TAIL_STATS=1: cumulative skipped / filled entries (device 0, layer 0 calls)
             lru_tail_skipped += n_skip; lru_tail_filled += n_fill;
             if (log_dev && (++lru_tail_calls % 4096) == 0) {
@@ -2993,7 +2997,7 @@ static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * 
         (const int32_t *) ids->data, (int32_t *) dst->data,
         (int32_t *) state->data, fill_list,
         n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, remap ? nullptr : ctrl, layer, dev == 0, dev, remap,
-        tail, keep, tail > 0 && tail_stats);
+        tail, keep, tail > 0 && tail_stats, ggml_cuda_pass_fill_counter(dev));
 }
 
 static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {
@@ -7836,6 +7840,13 @@ static void ggml_backend_cuda_ar_rank_run(void * c, int rank, ggml_backend_t bac
     ggml_cuda_ar_rank_reduce((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), t);
 }
 
+// per-pass timer / A/B switch hooks for the meta backend (pass-timer.cu)
+static void ggml_backend_cuda_pass_mark(ggml_backend_t backend, int k) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_pass_mark(ctx->device, ctx->stream(), k);
+}
+
 static bool ggml_backend_cuda_ar_rank_can_norm(void * c, const ggml_tensor * t) {
     return ggml_cuda_ar_rank_norm_eligible((const ggml_cuda_ar_rank_ctx *) c, t);
 }
@@ -7877,6 +7888,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_ar_rank_run_norm") == 0) {
         return (void *)ggml_backend_cuda_ar_rank_run_norm;
+    }
+    if (strcmp(name, "ggml_backend_pass_active") == 0) {
+        return (void *) ggml_cuda_pass_active;
+    }
+    if (strcmp(name, "ggml_backend_pass_begin") == 0) {
+        return (void *) ggml_cuda_pass_begin;
+    }
+    if (strcmp(name, "ggml_backend_pass_mark") == 0) {
+        return (void *) ggml_backend_cuda_pass_mark;
+    }
+    if (strcmp(name, "ggml_backend_pass_end") == 0) {
+        return (void *) ggml_cuda_pass_end;
     }
     if (strcmp(name, "ggml_backend_cuda_copy_batch") == 0) {
         return (void *) ggml_backend_cuda_copy_batch;

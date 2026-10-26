@@ -1904,6 +1904,13 @@ struct ggml_backend_meta_context {
         // GGML_META_AR_STATS=1: per-rank counts printed at teardown (fused AllReduce, + norm chain, peer copy + ADD)
         bool                 stats = false;
         std::atomic<int64_t> n_ar{0}, n_ar_norm{0}, n_copy{0};
+        // per-pass timer / A/B switch (GGML_CUDA_PASS_TIMER / GGML_CUDA_PASS_AB, exp/passtimer): begin before the pass, a mark on
+        // each device thread before its first and after its last launch, end once both have issued
+        void (*pass_begin)(int sig, int n_out, int n_pos) = nullptr;
+        void (*pass_mark)(ggml_backend_t backend, int k)  = nullptr;
+        void (*pass_end)()                                = nullptr;
+        uint64_t pass_uid   = 0;
+        int      pass_n_out = 0, pass_n_pos = -1;
 
         static inline void cpu_relax() {
 #if defined(__x86_64__) || defined(__i386__)
@@ -2067,6 +2074,20 @@ struct ggml_backend_meta_context {
                     if (disp.ar_can_norm == nullptr || disp.ar_run_norm == nullptr) {
                         disp.ar_can_norm = nullptr;
                         disp.ar_run_norm = nullptr;
+                    }
+                }
+            }
+            {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+                auto pass_active = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pass_active");
+                if (pass_active != nullptr && pass_active()) {
+                    disp.pass_begin = (void (*)(int, int, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pass_begin");
+                    disp.pass_mark  = (void (*)(ggml_backend_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pass_mark");
+                    disp.pass_end   = (void (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pass_end");
+                    if (disp.pass_begin == nullptr || disp.pass_mark == nullptr || disp.pass_end == nullptr) {
+                        disp.pass_begin = nullptr;
+                        disp.pass_mark  = nullptr;
+                        disp.pass_end   = nullptr;
                     }
                 }
             }
@@ -2763,6 +2784,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         //   wait on ours) -> [barrier B: both pulls enqueued before either in-place ADD overwrites its partial] -> ADD(i) -> ...
         // The receive buffer alternates by parity: the peer's copy(i) runs after its wait on our copy-out(i - 1), which our stream
         // issues after ADD(i - 2) -- the last reader of recv[i % 2]. Each device uses its own slice of the aux node / graph pools.
+        auto & pd = backend_ctx->disp;
+        if (pd.pass_begin != nullptr) {
+            if (cgraph->uid == 0 || cgraph->uid != pd.pass_uid) {
+                pd.pass_uid   = cgraph->uid;
+                pd.pass_n_out = cgraph->n_nodes > 0 ? (int) cgraph->nodes[cgraph->n_nodes - 1]->ne[1] : 0;
+                pd.pass_n_pos = -1;
+                for (int i = 0; i < cgraph->n_leafs; i++) {
+                    if (strstr(cgraph->leafs[i]->name, "inp_pos") != nullptr) {   // also the scheduler's copy "<backend>#inp_pos#0"
+                        pd.pass_n_pos = (int) cgraph->leafs[i]->ne[0];
+                        break;
+                    }
+                }
+            }
+            pd.pass_begin(cgraph->n_nodes, pd.pass_n_out, pd.pass_n_pos);
+        }
         const size_t n_sub = backend_ctx->n_subgraphs;
         const size_t ms    = backend_ctx->max_subgraphs;
         auto run = [&](const size_t j) -> ggml_status {
@@ -2781,6 +2817,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 return ret;
             };
+            if (backend_ctx->disp.pass_mark != nullptr) {
+                backend_ctx->disp.pass_mark(me.backend, 0);
+            }
             int skip = 0; // leading nodes of subgraph i already computed by the previous AllReduce kernel
             for (size_t i = 0; i < n_sub; i++) {
                 ggml_cgraph * gi = me.cgraphs[i].cgraph_main;
@@ -2861,9 +2900,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 st = ggml_backend_graph_compute_async(me.backend, g);
                 GGML_ASSERT(st == GGML_STATUS_SUCCESS);
             }
+            if (backend_ctx->disp.pass_mark != nullptr) {
+                backend_ctx->disp.pass_mark(me.backend, 1);
+            }
             return GGML_STATUS_SUCCESS;
         };
-        return backend_ctx->disp.run(run);
+        const ggml_status st_run = backend_ctx->disp.run(run);
+        if (pd.pass_end != nullptr) {
+            pd.pass_end();
+        }
+        return st_run;
     }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
