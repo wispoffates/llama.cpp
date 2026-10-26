@@ -704,7 +704,9 @@ void launch_mul_mat_vec_f_cuda(
         if (ids == nullptr && !has_fusion && warp_size == 32 && ncols <= 1024 && nrows >= 1024 && nc_ok && ggml_cuda_mmvf_shortk_enabled()) {
             // GGML_CUDA_MMVF_SHORTK2=0: the warp-per-row kernel below for every short-K shape
             static const bool sk2 = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK2"); return e == nullptr || atoi(e) != 0; }();
-            static const int sk2_rpw = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK2_RPW"); return e ? atoi(e) : 4; }();
+            // GGML_CUDA_MMVF_SHORTK2_RPW: rows per warp (HC3: 8 is fastest up to 5 columns; 6+ columns need 128+ registers at 8 -> 4)
+            static const int sk2_rpw_env = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK2_RPW"); return e ? atoi(e) : 0; }();
+            const int sk2_rpw = sk2_rpw_env > 0 ? sk2_rpw_env : ncols_dst <= 5 ? 8 : 4;
             if constexpr (sizeof(T) == 2) if (sk2 && ncols <= 320) {
                 constexpr int wpb = 8;
                 const auto launch_sk2 = [&](auto rpw_c) {
