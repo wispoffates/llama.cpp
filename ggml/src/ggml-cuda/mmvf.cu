@@ -480,6 +480,7 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_f_shortk2(
         const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, const int ncols2, const int nrows,
         const int stride_row, const int stride_col_y2, const int stride_col_dst, const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst) {
+    static_assert(sizeof(T) == 2, "16-bit weights");
     const int lane        = threadIdx.x;
     const int row0        = (blockIdx.x*blockDim.y + threadIdx.y)*rows_per_warp;
     const int channel_dst = blockIdx.y;
@@ -495,6 +496,29 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_f_shortk2(
     y   += int64_t(sample_dst)*stride_sample_y   + int64_t(channel_dst)*stride_channel_y;
     dst += int64_t(sample_dst)*stride_sample_dst + int64_t(channel_dst)*stride_channel_dst;
 
+    // all weight loads of this warp first (rows_per_warp x max_steps 4-byte loads in flight), then the activations, then the math;
+    // the bounds are uniform per warp, so a warp with all rows and the full K takes the unguarded loads
+    const int  nr   = min(rows_per_warp, nrows - row0);
+    const bool full = nr == rows_per_warp && ncols2 == max_steps*WARP_SIZE;
+    uint32_t w[rows_per_warp][max_steps];
+    if (full) {
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) {
+#pragma unroll
+            for (int s = 0; s < max_steps; ++s) {
+                w[r][s] = __ldg((const uint32_t *) (x + int64_t(r)*stride_row) + lane + s*WARP_SIZE);
+            }
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < rows_per_warp; ++r) {
+#pragma unroll
+            for (int s = 0; s < max_steps; ++s) {
+                const int col2 = lane + s*WARP_SIZE;
+                w[r][s] = r < nr && col2 < ncols2 ? __ldg((const uint32_t *) (x + int64_t(r)*stride_row) + col2) : 0u;
+            }
+        }
+    }
     const float2 * y2 = (const float2 *) y;
     float2 yr[max_steps][ncols_dst];
 #pragma unroll
@@ -502,31 +526,19 @@ static __global__ void __launch_bounds__(256) mul_mat_vec_f_shortk2(
         const int col2 = lane + s*WARP_SIZE;
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
-            yr[s][j] = col2 < ncols2 ? __ldg(y2 + j*stride_col_y2 + col2) : make_float2(0.0f, 0.0f);
+            yr[s][j] = full || col2 < ncols2 ? __ldg(y2 + j*stride_col_y2 + col2) : make_float2(0.0f, 0.0f);
         }
     }
-    const int nr = min(rows_per_warp, nrows - row0);
     float sumf[rows_per_warp][ncols_dst] = {{0.0f}};
 #pragma unroll
     for (int r = 0; r < rows_per_warp; ++r) {
-        if (r >= nr) {
-            break;
-        }
-        const T * xr = x + int64_t(r)*stride_row;
 #pragma unroll
         for (int s = 0; s < max_steps; ++s) {
-            const int col2 = lane + s*WARP_SIZE;
-            if (col2 >= ncols2) {
-                break;
-            }
             float2 tmpx;
-            if constexpr (std::is_same_v<T, float>) {
-                tmpx = __ldg((const float2 *) xr + col2);
-            } else if constexpr (std::is_same_v<T, half>) {
-                tmpx = __half22float2(((const half2 *) xr)[col2]);
+            if constexpr (std::is_same_v<T, half>) {
+                tmpx = __half22float2(*(const half2 *) &w[r][s]);
             } else {
-                const uint32_t w = __ldg((const uint32_t *) xr + col2);
-                tmpx = make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xffff0000u));   // bf16 pair -> f32 exact
+                tmpx = make_float2(__uint_as_float(w[r][s] << 16), __uint_as_float(w[r][s] & 0xffff0000u));   // bf16 pair -> f32 exact
             }
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
@@ -693,7 +705,7 @@ void launch_mul_mat_vec_f_cuda(
             // GGML_CUDA_MMVF_SHORTK2=0: the warp-per-row kernel below for every short-K shape
             static const bool sk2 = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK2"); return e == nullptr || atoi(e) != 0; }();
             static const int sk2_rpw = [] { const char * e = getenv("GGML_CUDA_MMVF_SHORTK2_RPW"); return e ? atoi(e) : 4; }();
-            if (sk2 && ncols <= 320 && sizeof(T) == 2) {
+            if constexpr (sizeof(T) == 2) if (sk2 && ncols <= 320) {
                 constexpr int wpb = 8;
                 const auto launch_sk2 = [&](auto rpw_c) {
                     constexpr int rpw = decltype(rpw_c)::value;
