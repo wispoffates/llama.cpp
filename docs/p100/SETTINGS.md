@@ -71,6 +71,12 @@ llama-server --model Swift-1.5-Qwen3.8-27B-Q6_K.gguf --mmproj mmproj-Swift-1.5-Q
 Since 2026-10-24 (after these measurements) production also sets `LLAMA_MTP_DRAFT_VOCAB=98304`: the MTP draft scores the first 98,304
 token ids instead of the default 81,920 (+0.7 % decode on average, +1.5 % on triage, identical output).
 
+Since 2026-10-26 production drops `--tensor-split 49.3,50.7` and adds `--mmproj-device CUDA1 --device-draft CUDA0`. The tensor split
+rounds each GPU's share down to whole split units (4 KV-head groups on the attention layers, 16 key heads on the GDN layers), so 49.3
+made every other attention layer 25/75 and every other GDN layer 7/9, and GPU 0 waited ~3.3 ms per token at the AllReduce. An even
+split has no imbalance (decode +3.3 % in llama-bench, +2-3 % serving); VRAM stays balanced by putting the vision projector on GPU 1 and
+the MTP draft on GPU 0 (worst-case peak 14.4 / 14.3 GB per GPU, more headroom than before).
+
 ### qwen36 35B-A3B (MoE)
 
 - Model: `Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf` (UD-Q5_K_XL; 26.59 GB) sha256 `25233af7642e3a91bd52cc4aeefdbd4a117479088e06cf1aea5b6bedb443c506`
