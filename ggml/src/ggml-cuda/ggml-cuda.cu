@@ -3240,6 +3240,56 @@ static void ggml_cuda_lru_fill(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ggml_cuda_lru_fill_n(ctx, &dst, 1);
 }
 
+// per-pass timer op marks (GGML_CUDA_PASS_TIMER_OPS): layer from the "<name>-<il>" suffix, fill bytes per fill on this device
+static int ggml_cuda_pt_layer(const char * name) {
+    const char * d = strrchr(name, '-');
+    return d != nullptr && d[1] >= '0' && d[1] <= '9' ? atoi(d + 1) : -1;
+}
+
+struct ggml_cuda_pt_op_scope {
+    int idx = -1;
+    cudaStream_t stream = nullptr;
+    const int32_t * fill_count = nullptr;
+    ~ggml_cuda_pt_op_scope() {
+        ggml_cuda_pass_op_end(idx, stream, fill_count);
+    }
+    void begin(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        int kind = 0, ntok = 0;
+        long long bytes = 0;
+        switch (node->op) {
+            case GGML_OP_LRU_DECIDE:
+                ntok = (int) node->src[0]->ne[1];
+                break;
+            case GGML_OP_LRU_FILL: {
+                kind = 1;
+                const ggml_tensor * fl = node->src[0];
+                int n = 1;
+                if (i + 2 < cgraph->n_nodes &&
+                        cgraph->nodes[i + 1]->op == GGML_OP_LRU_FILL && cgraph->nodes[i + 1]->src[0] == fl &&
+                        cgraph->nodes[i + 2]->op == GGML_OP_LRU_FILL && cgraph->nodes[i + 2]->src[0] == fl) {
+                    n = 3;   // fused gate/up/down fill (ggml_cuda_try_fuse)
+                }
+                for (int k = 0; k < n; k++) {
+                    const lru_fill_desc d = ggml_cuda_lru_fill_desc(cgraph->nodes[i + k]);
+                    bytes += (long long) (d.seg_bytes * d.n_rows);
+                }
+                fill_count = (const int32_t *) fl->data + 3 * ((fl->ne[0] - 1) / 3);
+                ntok = ggml_get_op_params_i32(node, 2);
+                break;
+            }
+            case GGML_OP_MUL_MAT_ID:
+                kind = 2;
+                ntok = (int) node->ne[2];
+                break;
+            default:
+                return;
+        }
+        stream = ctx.stream();
+        idx = ggml_cuda_pass_op_begin(ctx.device, stream, kind, ggml_cuda_pt_layer(node->name), bytes, ntok);
+    }
+};
+
 // p100-series: prefill copy/compute overlap for LRU_ASSEMBLE (GGML_CUDA_LRU_ASYNC=0: on the main stream). The side stream gets
 // a narrow grid (GGML_CUDA_LRU_ASYNC_GX, default 4 blocks per expert): zero-copy reads need only a few warps in flight to fill
 // PCIe, and every SM the assembly takes is one the overlapped compute does not get.
@@ -6233,6 +6283,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             };
 
             cuda_ctx->n_fuse_skip = 0;
+            static const bool pt_ops_on = ggml_cuda_pass_ops_on();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
 #ifdef USE_CUDA_GRAPH
@@ -6312,6 +6363,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_pt_op_scope pt_op;   // end mark when this iteration ends (every continue below)
+                if (pt_ops_on) {
+                    pt_op.begin(*cuda_ctx, cgraph, i);
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip < 0) {   // p100-series: the fusion handled node i only (and deferred a later node)
