@@ -1909,6 +1909,7 @@ struct ggml_backend_meta_context {
         void (*pass_begin)(int sig, int n_out, int n_pos) = nullptr;
         void (*pass_mark)(ggml_backend_t backend, int k)  = nullptr;
         void (*pass_end)()                                = nullptr;
+        void (*lru_pass)(ggml_backend_t backend, int k)   = nullptr;   // per device: k = 0 before it issues a pass, 1 after
         uint64_t pass_uid   = 0;
         int      pass_n_out = 0, pass_n_pos = -1;
 
@@ -2079,6 +2080,7 @@ struct ggml_backend_meta_context {
             }
             {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+                disp.lru_pass = (void (*)(ggml_backend_t, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_lru_pass");
                 auto pass_active = (bool (*)()) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pass_active");
                 if (pass_active != nullptr && pass_active()) {
                     disp.pass_begin = (void (*)(int, int, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pass_begin");
@@ -2817,6 +2819,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 return ret;
             };
+            if (backend_ctx->disp.lru_pass != nullptr) {
+                backend_ctx->disp.lru_pass(me.backend, 0);
+            }
             if (backend_ctx->disp.pass_mark != nullptr) {
                 backend_ctx->disp.pass_mark(me.backend, 0);
             }
@@ -2902,6 +2907,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             if (backend_ctx->disp.pass_mark != nullptr) {
                 backend_ctx->disp.pass_mark(me.backend, 1);
+            }
+            if (backend_ctx->disp.lru_pass != nullptr) {
+                backend_ctx->disp.lru_pass(me.backend, 1);
             }
             return GGML_STATUS_SUCCESS;
         };

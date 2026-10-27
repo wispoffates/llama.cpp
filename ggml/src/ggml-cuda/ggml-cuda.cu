@@ -784,6 +784,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(lru_staging));
     }
+    if (lru_stash_ctl != nullptr) {   // the flushes ran on lru_wb_stream (synchronized above)
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(lru_stash_ctl));
+        if (lru_stash_rec != nullptr) {
+            CUDA_CHECK(cudaFree(lru_stash_rec));
+            CUDA_CHECK(cudaFree(lru_stash));
+        }
+        CUDA_CHECK(cudaEventDestroy(lru_stash_main_event));
+        CUDA_CHECK(cudaEventDestroy(lru_stash_event));
+    }
     if (lru_counter != nullptr) {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(lru_counter));
@@ -1587,7 +1597,8 @@ static __global__ void k_lru_decide(
         int32_t * state, int32_t * fill_list,
         int n_used, int n_tokens, int n_expert, int n_slot, int ids_stride, int exclusive,
         ggml_lru_ctrl * ctrl, int layer, int log_dev, int log_dev_index, int remap,
-        int tail, int32_t * keep, int tail_stats, unsigned long long * pass_fills) {
+        int tail, int32_t * keep, int tail_stats, unsigned long long * pass_fills,
+        lru_stash_ctl * stash, int stash_alloc) {
     const int lane = threadIdx.x;
     int32_t * owner    = state;                     // expert -> slot
     int32_t * slot_of  = state + n_expert;          // slot -> expert
@@ -1603,6 +1614,22 @@ static __global__ void k_lru_decide(
             slot_ids[i] = (e < 0 || e >= n_expert) ? e : (owner[e] >= 0 ? owner[e] : n_slot + hslot[e]);
         }
         return;
+    }
+
+    if (stash != nullptr) {
+        // victim stash: every fill launched before this kernel has completed -> the flushes may take its entries; this layer's
+        // host slots must hold what the state says before a fill reads them -> wait until its newest entry has been written back
+        // (normally a pass ago; the flush for it was issued before this kernel, so it can always run)
+        if (lane == 0) {
+            volatile lru_stash_ctl * vs = stash;
+            vs->snap = vs->counter;
+            const uint32_t need = layer < 1024 ? vs->last[layer] : 0;
+            if (need != 0) {
+                while ((int32_t) (vs->flushed - need) < 0) {
+                }
+            }
+        }
+        __syncwarp();
     }
 
     for (int i = lane; i < n_total; i += WARP_SIZE) {
@@ -1707,6 +1734,17 @@ static __global__ void k_lru_decide(
                         h |= 1 << 30;                      // the fill swaps this entry
                     }
                 }
+                // victim stash: take a ring entry (none free -> the fill writes this victim back itself); host slot < 4096,
+                // ring slot + 1 in bits 12..29
+                if (stash_alloc && prev >= 0) {
+                    volatile lru_stash_ctl * vs = stash;
+                    const uint32_t k = vs->counter;
+                    if (k - vs->flushed < vs->cap) {
+                        vs->counter = k + 1;
+                        vs->last[layer] = k + 1;
+                        h |= (int32_t) ((k % vs->cap + 1) << 12);
+                    }
+                }
             }
             slot_of[best] = e;
             owner[e] = best;
@@ -1794,22 +1832,54 @@ struct lru_fill_desc {
 };
 struct lru_fill_descs { lru_fill_desc d[3]; };
 
+// victim stash for one fill launch. decode: the fill list carries ring slots (bits 12..29 of the host slot); use: victims go to
+// the ring (otherwise the fill swaps in place and marks the entry empty for the flush)
+struct lru_stash_args {
+    lru_stash_rec * rec;
+    char * buf;
+    size_t stride;
+    uint32_t koff[3];
+    int decode, use;
+};
+
 // blockIdx.z = descriptor, block rows walk the fill list (the grid is sized by the batch's ids, not by the slot count:
 // most decode steps fill nothing, and 16K blocks that only read the count cost ~45 us per launch on sm_60)
 static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_slot, const lru_fill_descs descs,
-                                  ggml_lru_ctrl * ctrl, int layer, int dev, unsigned int * counter) {
+                                  ggml_lru_ctrl * ctrl, int layer, int dev, unsigned int * counter, const lru_stash_args st) {
     const lru_fill_desc & d = descs.d[blockIdx.z];
     const int n_fill = fill_list[3 * n_slot];
     for (int j = blockIdx.y; j < n_fill; j += gridDim.y) {
         const int32_t s = fill_list[3 * j + 1];
         const int32_t hraw = fill_list[3 * j + 2];  // inclusive: the expert id (row of the model tensor)
-        const int32_t h = hraw & 0x3fffffff;
+        int32_t h = hraw & 0x3fffffff;
+        int sl = 0;                                 // victim stash: ring slot + 1
+        if (st.decode) {
+            sl = (h >> 12) & 0x3ffff;
+            h &= 0xfff;
+        }
         const bool swap = d.swap || ((hraw >> 30) & 1);   // hybrid refill: this device writes the victim back itself
         if (ctrl != nullptr) {
             lru_wait_content(ctrl, layer, h, fill_list[3 * j + 0]);
         }
         char * src_e = d.src + (size_t) h * d.src_estride + d.src_off;
         char * dst_e = d.pool + (size_t) s * d.estride;
+        char * wb_e  = nullptr;                     // victim stash: this slice's place in the ring entry
+        if (sl != 0) {
+            if (blockIdx.x == 0 && threadIdx.x == 0) {
+                lru_stash_rec & r = st.rec[sl - 1];
+                r.dst[blockIdx.z]   = src_e;
+                r.off[blockIdx.z]   = st.koff[blockIdx.z];
+                r.bytes[blockIdx.z] = st.use ? (uint32_t) (d.n_rows * d.seg_bytes) : 0;
+                if (blockIdx.z == 0) {
+                    for (int z = gridDim.z; z < 3; ++z) {
+                        r.bytes[z] = 0;
+                    }
+                }
+            }
+            if (st.use) {
+                wb_e = st.buf + (size_t) (sl - 1) * st.stride + st.koff[blockIdx.z];
+            }
+        }
         if (d.vec) {
             const size_t seg16 = d.seg_bytes / 16, total = d.n_rows * seg16;
             for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
@@ -1817,7 +1887,9 @@ static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_
                 uint4 * pd = (uint4 *) (dst_e + row * d.seg_bytes) + c;
                 uint4 * ps = (uint4 *) (src_e + row * d.src_row_stride) + c;
                 const uint4 incoming = *ps;
-                if (swap) {
+                if (wb_e != nullptr) {
+                    ((uint4 *) (wb_e + row * d.seg_bytes))[c] = *pd;
+                } else if (swap) {
                     *ps = *pd;
                 }
                 *pd = incoming;
@@ -1851,6 +1923,45 @@ static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_
                 __threadfence_system();
             }
         }
+    }
+}
+
+// victim stash: snapshot of the completed entries at the end of a pass, latch of the next flush range, and the flush itself
+// (each block takes whole slices; the last block publishes the new flushed count after a system fence)
+static __global__ void k_lru_stash_snap(lru_stash_ctl * s) {
+    volatile lru_stash_ctl * v = s;
+    v->snap = v->counter;
+}
+
+static __global__ void k_lru_stash_latch(lru_stash_ctl * s) {
+    volatile lru_stash_ctl * v = s;
+    v->a = v->flushed;
+    v->b = v->snap;
+}
+
+static __global__ void k_lru_stash_flush(lru_stash_ctl * s, const lru_stash_rec * rec, const char * __restrict__ buf, size_t stride) {
+    const uint32_t a = s->a, b = s->b, cap = s->cap;
+    const uint32_t n = b - a;
+    for (uint32_t w = blockIdx.x; w < 3 * n; w += gridDim.x) {
+        const uint32_t sl = (a + w / 3) % cap;
+        const int z = w % 3;
+        const volatile lru_stash_rec * r = rec + sl;
+        const uint32_t bytes = r->bytes[z];
+        if (bytes == 0) {
+            continue;
+        }
+        const uint4 * src = (const uint4 *) (buf + (size_t) sl * stride + r->off[z]);
+        uint4 * dst = (uint4 *) r->dst[z];
+        for (uint32_t i = threadIdx.x; i < bytes / 16; i += blockDim.x) {
+            dst[i] = __ldcg(src + i);
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(&s->done, 1u) == gridDim.x - 1) {
+        s->done = 0;
+        __threadfence_system();
+        ((volatile lru_stash_ctl *) s)->flushed = b;
     }
 }
 
@@ -1926,12 +2037,111 @@ static void ggml_cuda_lru_wb_wait(ggml_backend_cuda_context & ctx, cudaStream_t 
     }
 }
 
+// p100-series LRU victim stash (GGML_CUDA_LRU_STASH=<MiB> of VRAM per device, exclusive cache, decode fills inside meta passes).
+// PTM2: a fill moves 755 KB in 166 us; read-only it would run at link speed, the in-kernel victim write-back adds ~48 us (+40 %),
+// ~1.8 ms of a ~55 ms Flash-Next verify pass. The 10-13 staged write-back (GGML_CUDA_LRU_STAGED) lost on a main/side event round
+// trip per layer. Here nothing on the main stream waits for a write-back: decides allocate ring entries and fills park victims
+// in them; every GGML_CUDA_LRU_STASH_CHUNK fill calls (default 8) and at the end of the pass a latch + flush kernel pair on
+// lru_wb_stream writes the completed entries back (GGML_CUDA_LRU_STASH_BLOCKS blocks, default 16). A decide spins only while its
+// own layer's newest entry is unflushed (a fill would read a stale host slot); prefill readers wait for the last flush event.
+// Off with GGML_CUDA_LRU_STAGED / GGML_CUDA_LRU_OVERLAP; A/B feature "stash".
+static size_t ggml_cuda_lru_stash_bytes() {
+    static const size_t b = [] {
+        const char * e = getenv("GGML_CUDA_LRU_STASH");
+        const char * st = getenv("GGML_CUDA_LRU_STAGED");
+        const char * ov = getenv("GGML_CUDA_LRU_OVERLAP");
+        if (e == nullptr || atoi(e) <= 0 || (st != nullptr && atoi(st) != 0) || (ov != nullptr && atoi(ov) != 0)) {
+            return (size_t) 0;
+        }
+        return (size_t) atoi(e) << 20;
+    }();
+    return b;
+}
+
+// final: at the end of a pass, after k_lru_stash_snap (takes every entry); a mid-pass flush only takes the entries of the fills
+// before the current layer (its decide's snapshot), so the pass stays dirty until the final flush
+static void ggml_cuda_lru_stash_flush(ggml_backend_cuda_context & ctx, bool final) {
+    static const int blocks = [] { const char * e = getenv("GGML_CUDA_LRU_STASH_BLOCKS"); return e && atoi(e) > 0 ? atoi(e) : 16; }();
+    CUDA_CHECK(cudaEventRecord(ctx.lru_stash_main_event, ctx.stream()));
+    CUDA_CHECK(cudaStreamWaitEvent(ctx.lru_wb_stream, ctx.lru_stash_main_event, 0));
+    k_lru_stash_latch<<<1, 1, 0, ctx.lru_wb_stream>>>(ctx.lru_stash_ctl);
+    k_lru_stash_flush<<<blocks, 256, 0, ctx.lru_wb_stream>>>(ctx.lru_stash_ctl, ctx.lru_stash_rec, ctx.lru_stash, ctx.lru_stash_stride);
+    CUDA_CHECK(cudaEventRecord(ctx.lru_stash_event, ctx.lru_wb_stream));
+    if (final) {
+        ctx.lru_stash_dirty = false;
+    }
+    ctx.lru_stash_flushed = true;
+    ctx.lru_stash_calls   = 0;
+}
+
+// a stream about to read host slots outside the decode fills (assembly, DMA) waits for the last flush
+static void ggml_cuda_lru_stash_wait(ggml_backend_cuda_context & ctx, cudaStream_t stream) {
+    if (ctx.lru_stash_flushed) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.lru_stash_event, 0));
+    }
+}
+
+// meta backend pass hook (threaded dispatch, on the device's thread): k = 0 before the device issues the pass, 1 after
+static void ggml_cuda_lru_stash_pass(ggml_backend_cuda_context & ctx, int k) {
+    const size_t bytes = ggml_cuda_lru_stash_bytes();
+    if (bytes == 0) {
+        return;
+    }
+    if (k == 1) {
+        if (ctx.lru_stash_dirty) {
+            k_lru_stash_snap<<<1, 1, 0, ctx.stream()>>>(ctx.lru_stash_ctl);
+            ggml_cuda_lru_stash_flush(ctx, true);
+        }
+        ctx.lru_stash_armed = false;
+        return;
+    }
+    if (ctx.lru_stash_ctl == nullptr) {
+        ggml_cuda_set_device(ctx.device);
+        if (ctx.lru_wb_stream == nullptr) {
+            CUDA_CHECK(cudaStreamCreateWithFlags(&ctx.lru_wb_stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_wb_event, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_fill_event, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_stash_main_event, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_stash_event, cudaEventDisableTiming));
+        CUDA_CHECK(cudaMalloc(&ctx.lru_stash_ctl, sizeof(lru_stash_ctl)));
+        CUDA_CHECK(cudaMemset(ctx.lru_stash_ctl, 0, sizeof(lru_stash_ctl)));   // cap 0: no entries until a fill size is known
+    }
+    if (ctx.lru_stash_need > ctx.lru_stash_stride) {
+        // (re)size the ring for the largest fill seen (the first passes visit every layer): everything in flight must be done
+        ggml_cuda_set_device(ctx.device);
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.lru_wb_stream));
+        if (ctx.lru_stash_rec != nullptr) {
+            CUDA_CHECK(cudaFree(ctx.lru_stash_rec));
+            CUDA_CHECK(cudaFree(ctx.lru_stash));
+            ctx.lru_stash_rec = nullptr;
+            ctx.lru_stash = nullptr;
+        }
+        const size_t stride = (ctx.lru_stash_need + 255) & ~(size_t) 255;
+        const uint32_t cap = (uint32_t) std::min<size_t>(bytes / stride, (1u << 18) - 2);
+        if (cap > 0) {
+            CUDA_CHECK(cudaMalloc(&ctx.lru_stash, (size_t) cap * stride));
+            CUDA_CHECK(cudaMalloc(&ctx.lru_stash_rec, (size_t) cap * sizeof(lru_stash_rec)));
+            CUDA_CHECK(cudaMemset(ctx.lru_stash_rec, 0, (size_t) cap * sizeof(lru_stash_rec)));
+        }
+        ctx.lru_stash_stride = stride;
+        ctx.lru_stash_cap = cap;
+        CUDA_CHECK(cudaMemcpy((char *) ctx.lru_stash_ctl + offsetof(lru_stash_ctl, cap), &cap, sizeof(cap), cudaMemcpyHostToDevice));
+        GGML_LOG_INFO("%s: device %d: LRU victim stash %u entries x %zu KiB\n", __func__, ctx.device, cap, stride >> 10);
+    }
+    static const bool stash_ab = ggml_cuda_ab_listed("stash");
+    ctx.lru_stash_armed = ctx.lru_stash_cap > 0 && !(stash_ab && ggml_cuda_ab_arm() == 1);
+    ctx.lru_stash_calls = 0;
+}
+
 static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor * dst, cudaStream_t stream = nullptr, int gx = 32, int pooled_only = 0) {
     if (stream == nullptr) {
         stream = ctx.stream();
     }
     if (!pooled_only) {
         ggml_cuda_lru_wb_wait(ctx, stream);
+        ggml_cuda_lru_stash_wait(ctx, stream);
     }
     const ggml_tensor * state = dst->src[0];
     const ggml_tensor * pool  = dst->src[1];
@@ -2066,6 +2276,7 @@ static void ggml_cuda_lru_assemble_dma(ggml_backend_cuda_context & ctx, ggml_ten
 
     const std::vector<int32_t> & m = ggml_cuda_lru_mirror_get(ctx, state);
     ggml_cuda_lru_wb_wait(ctx, copy_stream);
+    ggml_cuda_lru_stash_wait(ctx, copy_stream);
     ggml_lru_ctrl * dctrl;
     memcpy(&dctrl, (const char *) dst->op_params + 8, sizeof(dctrl));
     const int dlayer = ggml_get_op_params_i32(dst, 4);
@@ -2992,12 +3203,18 @@ static void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * 
     static const int tail_stats = [] { const char * e = getenv("GGML_CUDA_LRU_TAIL_STATS"); return e && atoi(e) != 0; }();
     int dev = 0;
     cudaGetDevice(&dev);
+    // victim stash: every decide of an exclusive cache keeps the ring's hazard rule once a ring exists; allocation only in a pass
+    lru_stash_ctl * stash = exclusive && !remap && ctrl == nullptr && n_expert <= 4096 ? ctx.lru_stash_ctl : nullptr;
+    const int stash_alloc = stash != nullptr && ctx.lru_stash_armed && layer < 1024;
+    if (stash_alloc) {
+        ctx.lru_stash_dirty = true;
+    }
 
     k_lru_decide<<<1, WARP_SIZE, 0, ctx.stream()>>>(
         (const int32_t *) ids->data, (int32_t *) dst->data,
         (int32_t *) state->data, fill_list,
         n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, remap ? nullptr : ctrl, layer, dev == 0, dev, remap,
-        tail, keep, tail > 0 && tail_stats, ggml_cuda_pass_fill_counter(dev));
+        tail, keep, tail > 0 && tail_stats, ggml_cuda_pass_fill_counter(dev), stash, stash_alloc);
 }
 
 static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {
@@ -3164,6 +3381,28 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_lru_ctrl * ctrl;
     memcpy(&ctrl, (const char *) nodes[0]->op_params + 16, sizeof(ctrl));
     const int layer = ggml_get_op_params_i32(nodes[0], 6);
+
+    // victim stash: the decide encoded ring slots when the cache is exclusive (same condition as in ggml_cuda_lru_decide)
+    lru_stash_args st{};
+    {
+        ggml_tensor * src0;
+        memcpy(&src0, nodes[0]->op_params, sizeof(src0));
+        st.decode = ctx.lru_stash_ctl != nullptr && ctrl == nullptr && ggml_get_op_params_i32(nodes[0], 7) && src0->ne[2] <= 4096;
+        if (st.decode) {
+            size_t sum = 0;
+            bool ok = true;
+            for (int k = 0; k < n; k++) {
+                st.koff[k] = (uint32_t) sum;
+                sum += descs.d[k].n_rows * descs.d[k].seg_bytes;
+                ok = ok && descs.d[k].vec && descs.d[k].swap && descs.d[k].n_rows == 1;
+            }
+            ctx.lru_stash_need = std::max(ctx.lru_stash_need, sum);
+            st.use    = ok && ctx.lru_stash != nullptr && sum <= ctx.lru_stash_stride;
+            st.rec    = ctx.lru_stash_rec;
+            st.buf    = ctx.lru_stash;
+            st.stride = ctx.lru_stash_stride;
+        }
+    }
     int dev = 0;
     if (ctrl != nullptr) {
         cudaGetDevice(&dev);
@@ -3195,7 +3434,7 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
             CUDA_CHECK(cudaEventRecord(ctx.lru_ovl_dec_event, ctx.stream()));
             CUDA_CHECK(cudaStreamWaitEvent(ctx.lru_ovl_stream, ctx.lru_ovl_dec_event, 0));
             ggml_cuda_lru_wb_wait(ctx, ctx.lru_ovl_stream);
-            k_lru_fill<<<grid, block, 0, ctx.lru_ovl_stream>>>(fl, n_slot, descs, ctrl, layer, dev, ctx.lru_counter);
+            k_lru_fill<<<grid, block, 0, ctx.lru_ovl_stream>>>(fl, n_slot, descs, ctrl, layer, dev, ctx.lru_counter, st);
             CUDA_CHECK(cudaEventRecord(ctx.lru_ovl_fill_event, ctx.lru_ovl_stream));
             ctx.lru_ovl_active = true;
             ctx.lru_ovl_fill   = fl;
@@ -3208,7 +3447,11 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
         ggml_cuda_lru_wb_wait(ctx, ctx.stream());
-        k_lru_fill<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, descs, ctrl, layer, dev, ctx.lru_counter);
+        k_lru_fill<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, descs, ctrl, layer, dev, ctx.lru_counter, st);
+        static const int stash_chunk = [] { const char * e = getenv("GGML_CUDA_LRU_STASH_CHUNK"); return e && atoi(e) > 0 ? atoi(e) : 8; }();
+        if (ctx.lru_stash_armed && ctx.lru_stash_dirty && ++ctx.lru_stash_calls >= stash_chunk) {
+            ggml_cuda_lru_stash_flush(ctx, false);   // takes the entries of the fills before this one (this decide's snapshot)
+        }
         return;
     }
     size_t koff[3] = { 0, 0, 0 }, need = 0;
@@ -3238,7 +3481,7 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
     for (int k = 0; k < n; k++) {
         plain.d[k].swap = 0;
     }
-    k_lru_fill<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, plain, nullptr, 0, 0, nullptr);
+    k_lru_fill<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, plain, nullptr, 0, 0, nullptr, st);
     CUDA_CHECK(cudaEventRecord(ctx.lru_fill_event, ctx.stream()));
     CUDA_CHECK(cudaStreamWaitEvent(ctx.lru_wb_stream, ctx.lru_fill_event, 0));
     const dim3 grid_wb(8, rows, n);
@@ -7907,6 +8150,12 @@ static void ggml_backend_cuda_ar_rank_run(void * c, int rank, ggml_backend_t bac
 }
 
 // per-pass timer / A/B switch hooks for the meta backend (pass-timer.cu)
+static void ggml_backend_cuda_lru_pass(ggml_backend_t backend, int k) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_lru_stash_pass(*ctx, k);
+}
+
 static void ggml_backend_cuda_pass_mark(ggml_backend_t backend, int k) {
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(ctx->device);
@@ -7966,6 +8215,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_pass_end") == 0) {
         return (void *) ggml_cuda_pass_end;
+    }
+    if (strcmp(name, "ggml_backend_lru_pass") == 0) {
+        return (void *) ggml_backend_cuda_lru_pass;
     }
     if (strcmp(name, "ggml_backend_cuda_copy_batch") == 0) {
         return (void *) ggml_backend_cuda_copy_batch;
