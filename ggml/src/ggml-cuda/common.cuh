@@ -1560,6 +1560,12 @@ struct ggml_backend_cuda_context {
     int          lru_stash_calls = 0;          // fill calls since the last flush
     cudaEvent_t  lru_stash_main_event = nullptr;
     cudaEvent_t  lru_stash_event = nullptr;
+    // copy-engine flush (GGML_CUDA_LRU_STASH_CE=1): records + snapshot in mapped pinned memory, the host issues the write-back
+    // copies at the next pass once this one has completed
+    uint32_t *   lru_stash_hsnap = nullptr;
+    uint32_t     lru_stash_hflushed = 0;       // entries covered by issued copy-engine flushes
+    bool         lru_stash_ce_pending = false;
+    cudaEvent_t  lru_stash_ce_event = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
