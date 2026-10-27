@@ -1469,6 +1469,24 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// p100-series LRU victim stash (exclusive cache, GGML_CUDA_LRU_STASH=<MiB>): ring control block in device memory
+struct lru_stash_ctl {
+    uint32_t counter;      // entries allocated by the decides (monotonic; ring slot = entry % cap)
+    uint32_t flushed;      // entries written back to the host slots (set by the last block of a flush)
+    uint32_t snap;         // entries whose fills have completed (every decide and the end of a pass write it)
+    uint32_t done;         // flush last-block counter
+    uint32_t a, b;         // range of the next flush (latched on the flush stream)
+    uint32_t cap;          // ring entries (0 = no ring yet)
+    uint32_t pad;
+    uint32_t last[1024];   // per LRU layer index: its newest entry + 1 (0 = none)
+};
+// one ring entry: where each of the (up to 3) slices of the victim goes; bytes 0 = nothing to write
+struct lru_stash_rec {
+    char *   dst[3];
+    uint32_t off[3];
+    uint32_t bytes[3];
+};
+
 struct ggml_backend_cuda_context {
     // advanced on every graph_compute: lets the GP100 fp16 MMVQ path (mmvq-gp100.cu, from qr0n/p100-llama-cpp 0007)
     // reuse an activation conversion only within one graph evaluation
@@ -1527,6 +1545,21 @@ struct ggml_backend_cuda_context {
     bool         lru_wb_pending = false;
     // exclusive LRU with disk refill: last-block counter of the fill kernel (device memory, reset by the last block)
     unsigned int * lru_counter = nullptr;
+    // p100-series LRU victim stash (GGML_CUDA_LRU_STASH=<MiB>, exclusive cache): a decode fill parks each victim in a VRAM ring
+    // instead of writing it back over PCIe inside the fill; small flush kernels on lru_wb_stream drain the ring every few fill
+    // calls and at the end of the pass (meta backend hook); a decide only waits until its own layer's earlier victims have landed
+    lru_stash_ctl * lru_stash_ctl = nullptr;   // device memory
+    lru_stash_rec * lru_stash_rec = nullptr;   // device memory, cap entries
+    char *       lru_stash = nullptr;          // cap x lru_stash_stride bytes
+    size_t       lru_stash_stride = 0;         // bytes per entry (the largest fill seen when the ring was sized)
+    size_t       lru_stash_need = 0;           // largest fill seen so far
+    uint32_t     lru_stash_cap = 0;
+    bool         lru_stash_armed = false;      // inside a meta pass: decides may allocate entries
+    bool         lru_stash_dirty = false;      // entries allocated since the last flush
+    bool         lru_stash_flushed = false;    // a flush has been issued (host-slot readers wait for lru_stash_event)
+    int          lru_stash_calls = 0;          // fill calls since the last flush
+    cudaEvent_t  lru_stash_main_event = nullptr;
+    cudaEvent_t  lru_stash_event = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
