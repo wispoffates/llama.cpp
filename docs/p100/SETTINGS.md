@@ -132,10 +132,11 @@ llama-server --model NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf \
   `282764bf3ce11b1ff6c715d65b37d7d690eb782734127429d2af6bd72b4c48b9`); `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (full vocabulary)
   sha256 `b9880220df29fc224bbce408c867cd5d9c021263b754033ea624b669e374f4ec`
 
-**p100-series (v5.28 / v5.29), production:**
+**p100-series (v5.28 and later), production:**
 
 ```bash
 GGML_CUDA_P2P=1 LLAMA_MOE_LRU_EXCLUSIVE=1 GGML_CUDA_LRU_DMA=1 LLAMA_MOE_LRU_PREFETCH=1 GGML_CUDA_LRU_ASYNC=1 \
+GGML_CUDA_LRU_STASH=48 GGML_CUDA_LRU_STASH_CE=1 \
 LLAMA_MOE_LRU_PROFILE=profile-flashnext.txt LLAMA_MOE_LRU_SLOTS=slots-flashnext.txt \
 llama-server --model Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
   --model-draft mtp-Qwen3.8-Flash-Next-Q5_K-frspec-65k-conv.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 \
@@ -149,6 +150,10 @@ llama-server --model Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf
   then the expert ids from most to least used in our routing traces; the cache pre-loads the hottest experts at start (warm start).
 - `LLAMA_MOE_LRU_SLOTS` = [flashnext/slots-flashnext.txt](flashnext/slots-flashnext.txt): `<layer> <slots>` budgets (384 for layer 0 down
   to 256) from an offline cache simulation at the same VRAM as 256 uniform slots (-14.9 % expert fills).
+- `GGML_CUDA_LRU_STASH=48 GGML_CUDA_LRU_STASH_CE=1` (since v5.32): decode fills park evicted experts in a 48 MiB VRAM ring per GPU
+  and the copy engine writes them back to host memory off the critical path (a worker thread per device issues the copies), instead of
+  swapping each victim out inside the fill. Draft + verify cycle about -2 ms (~3 %), output identical; costs 48 MiB per GPU. Leave both
+  out to get the v5.31 behaviour.
 - Without the two files the cache starts cold with 256 uniform slots (a few % slower decode, slower first request).
 - "No speculation" rows: the same line without `--model-draft` and the `--spec-*` flags.
 
