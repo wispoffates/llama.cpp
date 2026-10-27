@@ -2118,8 +2118,36 @@ static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx) {
     if (cudaEventQuery(ctx.lru_stash_ce_event) != cudaSuccess) {
         CUDA_CHECK(cudaEventSynchronize(ctx.lru_stash_ce_event));   // no sync since the pass (not the decode loop): wait for it
     }
+    // PTS3: one flushed count after the whole flush made layer 0 of the next pass wait for all of it -> publish every
+    // GGML_CUDA_LRU_STASH_CE_STEP entries (default 4; entries are in layer order). GGML_CUDA_LRU_STASH_STATS=1: flush timing
+    static const uint32_t step = [] { const char * e = getenv("GGML_CUDA_LRU_STASH_CE_STEP"); return e && atoi(e) > 0 ? (uint32_t) atoi(e) : 4u; }();
+    static const bool stats = [] { const char * e = getenv("GGML_CUDA_LRU_STASH_STATS"); return e != nullptr && atoi(e) != 0; }();
+    struct ce_stats { cudaEvent_t e0 = nullptr, e1 = nullptr; bool live = false; double ms = 0, bytes = 0, n = 0, entries = 0; };
+    static thread_local ce_stats cs[GGML_CUDA_MAX_DEVICES];
+    ce_stats & S = cs[ctx.device];
+    if (stats) {
+        if (S.e0 == nullptr) {
+            CUDA_CHECK(cudaEventCreate(&S.e0));
+            CUDA_CHECK(cudaEventCreate(&S.e1));
+        }
+        if (S.live && cudaEventQuery(S.e1) == cudaSuccess) {   // the previous flush, if done (never blocks)
+            float ms = 0;
+            CUDA_CHECK(cudaEventElapsedTime(&ms, S.e0, S.e1));
+            S.ms += ms; S.n += 1;
+            if ((int) S.n % 200 == 0) {
+                GGML_LOG_INFO("%s: device %d: %.0f flushes, mean %.2f ms, %.1f entries, %.2f MB, %.2f GB/s\n", __func__, ctx.device, S.n,
+                              S.ms / S.n, S.entries / S.n, S.bytes / S.n / 1e6, S.bytes / (S.ms * 1e6));
+            }
+            S.live = false;
+        }
+    }
     const uint32_t b = *(volatile uint32_t *) ctx.lru_stash_hsnap;
     const volatile lru_stash_rec * rec = ctx.lru_stash_rec;
+    const bool time_it = stats && !S.live && b != ctx.lru_stash_hflushed;
+    if (time_it) {
+        CUDA_CHECK(cudaEventRecord(S.e0, ctx.lru_wb_stream));
+    }
+    double bytes_all = 0;
     for (uint32_t k = ctx.lru_stash_hflushed; k != b; ++k) {
         const uint32_t sl = k % ctx.lru_stash_cap;
         for (int z = 0; z < 3; ++z) {
@@ -2127,10 +2155,18 @@ static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx) {
             if (bytes != 0) {
                 CUDA_CHECK(cudaMemcpyAsync((void *) rec[sl].dst[z], ctx.lru_stash + (size_t) sl * ctx.lru_stash_stride + rec[sl].off[z],
                                            bytes, cudaMemcpyDeviceToHost, ctx.lru_wb_stream));
+                bytes_all += bytes;
             }
+        }
+        if (k + 1 != b && (k + 1 - ctx.lru_stash_hflushed) % step == 0) {
+            k_lru_stash_set<<<1, 1, 0, ctx.lru_wb_stream>>>(ctx.lru_stash_ctl, k + 1);
         }
     }
     k_lru_stash_set<<<1, 1, 0, ctx.lru_wb_stream>>>(ctx.lru_stash_ctl, b);
+    if (time_it) {
+        CUDA_CHECK(cudaEventRecord(S.e1, ctx.lru_wb_stream));
+        S.live = true; S.bytes += bytes_all; S.entries += b - ctx.lru_stash_hflushed;
+    }
     CUDA_CHECK(cudaEventRecord(ctx.lru_stash_event, ctx.lru_wb_stream));
     ctx.lru_stash_hflushed   = b;
     ctx.lru_stash_flushed    = true;
@@ -4375,6 +4411,12 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
         cuda_ctx->lru_wb_pending = false;
     }
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (cuda_ctx->lru_stash_ce_pending) {
+        // victim stash, copy-engine mode: the pass has completed -> start the write-back now (the host samples meanwhile),
+        // not at the next pass
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_lru_stash_flush_ce(*cuda_ctx);
+    }
 
     GGML_UNUSED(backend);
 }
