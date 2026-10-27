@@ -1576,6 +1576,7 @@ struct ggml_backend_cuda_context {
     uint32_t     lru_stash_hflushed = 0;       // entries covered by issued copy-engine flushes
     bool         lru_stash_ce_pending = false;
     cudaEvent_t  lru_stash_ce_event = nullptr;
+    void *       lru_stash_worker = nullptr;   // ggml_cuda_stash_worker (ggml-cuda.cu): issues the copies off the host's critical path
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
