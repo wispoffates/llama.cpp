@@ -3046,12 +3046,23 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * fill_list = nodes[0]->src[0];
     const int n_slot = (int) ((fill_list->ne[0] - 1) / 3);
     const int n_ids  = ggml_get_op_params_i32(nodes[0], 2);   // at most this many fills (0: unknown -> n_slot)
-    const int rows   = std::max(1, std::min(n_slot, n_ids > 0 ? n_ids : n_slot));
+    int rows = std::max(1, std::min(n_slot, n_ids > 0 ? n_ids : n_slot));
     lru_fill_descs descs{};
     for (int k = 0; k < n; k++) {
         descs.d[k] = ggml_cuda_lru_fill_desc(nodes[k]);
     }
-    const dim3 grid(64, rows, n), block(256);
+    // p100-series fill grid (PTM2): blocks whose fill-list row is past n_fill only read the count and exit, but sm_60 still
+    // dispatches every one (~36 ns per block): 64 x 40 x 3 blocks at a 4-token verify = ~277 us per layer with nothing to fill.
+    // The block rows walk the fill list, so a few rows cover any count; GGML_CUDA_LRU_FILL_ROWS (default 4, 0 = one row per id as
+    // before), GGML_CUDA_LRU_FILL_BX blocks per slice (default 32; fillbench: 32 moves a fill faster than 64 or 128)
+    static const int fill_rows = [] { const char * e = getenv("GGML_CUDA_LRU_FILL_ROWS"); return e ? atoi(e) : 4; }();
+    static const int fill_bx   = [] { const char * e = getenv("GGML_CUDA_LRU_FILL_BX"); return e && atoi(e) > 0 ? atoi(e) : 32; }();
+    static const bool fill_ab  = ggml_cuda_ab_listed("fillgrid");
+    const bool old_grid = fill_rows <= 0 || (fill_ab && ggml_cuda_ab_arm() == 1);
+    if (!old_grid) {
+        rows = std::min(rows, fill_rows);
+    }
+    const dim3 grid(old_grid ? 64 : fill_bx, rows, n), block(256);
     const int32_t * fl = (const int32_t *) fill_list->data;
     ggml_lru_ctrl * ctrl;
     memcpy(&ctrl, (const char *) nodes[0]->op_params + 16, sizeof(ctrl));
