@@ -23,7 +23,7 @@
 //
 // GGML_CUDA_PASS_AB=<feature>[,<feature>...][:period] (default period 1) alternates arm A (as built) and arm B (the listed features
 // off) every <period> passes of the same graph signature (node count + output rows), so both arms share one model load, expert-cache
-// state and thermal history. Features: shortk2, splitk (mmvf.cu), fillgrid (LRU fill launch geometry, ggml-cuda.cu).
+// state and thermal history. Features: shortk2, splitk (mmvf.cu), fillgrid (LRU fill launch geometry, ggml-cuda.cu), stash (LRU victim stash, ggml-cuda.cu).
 
 static constexpr int PT_RING   = 1 << 14;
 static constexpr int PT_MAXDEV = 8;
