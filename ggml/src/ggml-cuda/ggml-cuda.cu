@@ -93,6 +93,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -772,8 +773,10 @@ struct ggml_cuda_lru_mirror {
 };
 
 static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx);
+static void ggml_cuda_lru_stash_worker_stop(ggml_backend_cuda_context & ctx);
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    ggml_cuda_lru_stash_worker_stop(*this);
     delete (ggml_cuda_lru_mirror *) lru_mirror;
     if (lru_wb_stream != nullptr) {
         ggml_cuda_set_device(device);
@@ -2099,8 +2102,11 @@ static void ggml_cuda_lru_stash_flush(ggml_backend_cuda_context & ctx, bool fina
 }
 
 // a stream about to read host slots outside the decode fills (assembly, DMA) waits for the last flush
+static void ggml_cuda_lru_stash_worker_wait(ggml_backend_cuda_context & ctx);
+
 static void ggml_cuda_lru_stash_wait(ggml_backend_cuda_context & ctx, cudaStream_t stream) {
     if (ctx.lru_stash_flushed) {
+        ggml_cuda_lru_stash_worker_wait(ctx);   // copy-engine mode: the event is recorded once the copies are issued
         CUDA_CHECK(cudaStreamWaitEvent(stream, ctx.lru_stash_event, 0));
     }
 }
@@ -2114,10 +2120,91 @@ static bool ggml_cuda_lru_stash_ce() {
     return on;
 }
 
+// PTS4: issuing ~125 copies + publishes inside synchronize() cost ~0.9 ms of host time per cycle -> a worker thread per device
+// issues them (GGML_CUDA_LRU_STASH_CE_THREAD=0: inline). Everything else that touches the ring's host side (readers of host
+// slots, the next pass's inline flush, a resize, teardown) first waits until the worker is idle.
+struct ggml_cuda_stash_worker {
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    bool job = false, quit = false;
+    uint32_t b = 0;
+};
+
+static void ggml_cuda_lru_stash_flush_ce_issue(ggml_backend_cuda_context & ctx, uint32_t b);
+
+static void ggml_cuda_lru_stash_worker_wait(ggml_backend_cuda_context & ctx) {
+    auto * w = (ggml_cuda_stash_worker *) ctx.lru_stash_worker;
+    if (w != nullptr) {
+        std::unique_lock<std::mutex> lk(w->m);
+        w->cv.wait(lk, [w] { return !w->job; });
+    }
+}
+
+static void ggml_cuda_lru_stash_worker_stop(ggml_backend_cuda_context & ctx) {
+    auto * w = (ggml_cuda_stash_worker *) ctx.lru_stash_worker;
+    if (w != nullptr) {
+        {
+            std::lock_guard<std::mutex> lk(w->m);
+            w->quit = true;
+        }
+        w->cv.notify_all();
+        w->th.join();
+        delete w;
+        ctx.lru_stash_worker = nullptr;
+    }
+}
+
+// hand [hflushed, b) to the worker (started on first use); false = inline
+static bool ggml_cuda_lru_stash_worker_post(ggml_backend_cuda_context & ctx, uint32_t b) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LRU_STASH_CE_THREAD"); return e == nullptr || atoi(e) != 0; }();
+    if (!on) {
+        return false;
+    }
+    auto * w = (ggml_cuda_stash_worker *) ctx.lru_stash_worker;
+    if (w == nullptr) {
+        w = new ggml_cuda_stash_worker;
+        ctx.lru_stash_worker = w;
+        ggml_backend_cuda_context * c = &ctx;
+        w->th = std::thread([w, c] {
+            ggml_cuda_set_device(c->device);
+            std::unique_lock<std::mutex> lk(w->m);
+            while (true) {
+                w->cv.wait(lk, [w] { return w->job || w->quit; });
+                if (!w->job) {
+                    return;
+                }
+                const uint32_t jb = w->b;
+                lk.unlock();
+                ggml_cuda_lru_stash_flush_ce_issue(*c, jb);
+                lk.lock();
+                w->job = false;
+                w->cv.notify_all();
+            }
+        });
+    }
+    {
+        std::unique_lock<std::mutex> lk(w->m);
+        w->cv.wait(lk, [w] { return !w->job; });
+        w->b = b;
+        w->job = true;
+    }
+    w->cv.notify_all();
+    return true;
+}
+
+// inline flush (next pass, teardown): the pass must have completed
 static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_lru_stash_worker_wait(ctx);
     if (cudaEventQuery(ctx.lru_stash_ce_event) != cudaSuccess) {
         CUDA_CHECK(cudaEventSynchronize(ctx.lru_stash_ce_event));   // no sync since the pass (not the decode loop): wait for it
     }
+    ggml_cuda_lru_stash_flush_ce_issue(ctx, *(volatile uint32_t *) ctx.lru_stash_hsnap);
+    ctx.lru_stash_flushed    = true;
+    ctx.lru_stash_ce_pending = false;
+}
+
+static void ggml_cuda_lru_stash_flush_ce_issue(ggml_backend_cuda_context & ctx, uint32_t b) {
     // PTS3: one flushed count after the whole flush made layer 0 of the next pass wait for all of it -> publish every
     // GGML_CUDA_LRU_STASH_CE_STEP entries (default 4; entries are in layer order). GGML_CUDA_LRU_STASH_STATS=1: flush timing
     static const uint32_t step = [] { const char * e = getenv("GGML_CUDA_LRU_STASH_CE_STEP"); return e && atoi(e) > 0 ? (uint32_t) atoi(e) : 4u; }();
@@ -2141,7 +2228,6 @@ static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx) {
             S.live = false;
         }
     }
-    const uint32_t b = *(volatile uint32_t *) ctx.lru_stash_hsnap;
     const volatile lru_stash_rec * rec = ctx.lru_stash_rec;
     const bool time_it = stats && !S.live && b != ctx.lru_stash_hflushed;
     if (time_it) {
@@ -2168,9 +2254,7 @@ static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx) {
         S.live = true; S.bytes += bytes_all; S.entries += b - ctx.lru_stash_hflushed;
     }
     CUDA_CHECK(cudaEventRecord(ctx.lru_stash_event, ctx.lru_wb_stream));
-    ctx.lru_stash_hflushed   = b;
-    ctx.lru_stash_flushed    = true;
-    ctx.lru_stash_ce_pending = false;
+    ctx.lru_stash_hflushed = b;
 }
 
 // meta backend pass hook (threaded dispatch, on the device's thread): k = 0 before the device issues the pass, 1 after
@@ -2214,6 +2298,7 @@ static void ggml_cuda_lru_stash_pass(ggml_backend_cuda_context & ctx, int k) {
     }
     if (ctx.lru_stash_need > ctx.lru_stash_stride) {
         // (re)size the ring for the largest fill seen (the first passes visit every layer): everything in flight must be done
+        ggml_cuda_lru_stash_worker_wait(ctx);
         ggml_cuda_set_device(ctx.device);
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         CUDA_CHECK(cudaStreamSynchronize(ctx.lru_wb_stream));
@@ -4415,7 +4500,12 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
         // victim stash, copy-engine mode: the pass has completed -> start the write-back now (the host samples meanwhile),
         // not at the next pass
         ggml_cuda_set_device(cuda_ctx->device);
-        ggml_cuda_lru_stash_flush_ce(*cuda_ctx);
+        if (ggml_cuda_lru_stash_worker_post(*cuda_ctx, *(volatile uint32_t *) cuda_ctx->lru_stash_hsnap)) {
+            cuda_ctx->lru_stash_flushed    = true;
+            cuda_ctx->lru_stash_ce_pending = false;
+        } else {
+            ggml_cuda_lru_stash_flush_ce(*cuda_ctx);
+        }
     }
 
     GGML_UNUSED(backend);
