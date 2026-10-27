@@ -771,6 +771,8 @@ struct ggml_cuda_lru_mirror {
     }
 };
 
+static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx);
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     delete (ggml_cuda_lru_mirror *) lru_mirror;
     if (lru_wb_stream != nullptr) {
@@ -786,10 +788,22 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     }
     if (lru_stash_ctl != nullptr) {   // the flushes ran on lru_wb_stream (synchronized above)
         ggml_cuda_set_device(device);
+        if (lru_stash_ce_pending) {    // copy-engine mode: the last pass's victims are still in the ring
+            ggml_cuda_lru_stash_flush_ce(*this);
+            CUDA_CHECK(cudaStreamSynchronize(lru_wb_stream));
+        }
         CUDA_CHECK(cudaFree(lru_stash_ctl));
         if (lru_stash_rec != nullptr) {
-            CUDA_CHECK(cudaFree(lru_stash_rec));
+            if (lru_stash_hsnap != nullptr) {
+                CUDA_CHECK(cudaFreeHost(lru_stash_rec));
+            } else {
+                CUDA_CHECK(cudaFree(lru_stash_rec));
+            }
             CUDA_CHECK(cudaFree(lru_stash));
+        }
+        if (lru_stash_hsnap != nullptr) {
+            CUDA_CHECK(cudaFreeHost(lru_stash_hsnap));
+            CUDA_CHECK(cudaEventDestroy(lru_stash_ce_event));
         }
         CUDA_CHECK(cudaEventDestroy(lru_stash_main_event));
         CUDA_CHECK(cudaEventDestroy(lru_stash_event));
@@ -1928,9 +1942,19 @@ static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_
 
 // victim stash: snapshot of the completed entries at the end of a pass, latch of the next flush range, and the flush itself
 // (each block takes whole slices; the last block publishes the new flushed count after a system fence)
-static __global__ void k_lru_stash_snap(lru_stash_ctl * s) {
+static __global__ void k_lru_stash_snap(lru_stash_ctl * s, uint32_t * hsnap) {
     volatile lru_stash_ctl * v = s;
     v->snap = v->counter;
+    if (hsnap != nullptr) {   // copy-engine mode: the host reads it once the pass has completed
+        *(volatile uint32_t *) hsnap = v->snap;
+        __threadfence_system();
+    }
+}
+
+// copy-engine mode: after the write-back copies on this stream
+static __global__ void k_lru_stash_set(lru_stash_ctl * s, uint32_t flushed) {
+    __threadfence_system();
+    ((volatile lru_stash_ctl *) s)->flushed = flushed;
 }
 
 static __global__ void k_lru_stash_latch(lru_stash_ctl * s) {
@@ -2081,6 +2105,38 @@ static void ggml_cuda_lru_stash_wait(ggml_backend_cuda_context & ctx, cudaStream
     }
 }
 
+// GGML_CUDA_LRU_STASH_CE=1 (PTS2: flush kernels slow whatever runs beside them almost 1:1 -> test DMA instead of SM stores):
+// no flush kernels; at the end of a pass the snapshot also goes to mapped host memory, and at the next pass (the host has
+// read the logits, so the pass has completed) the host reads the ring records and issues one D2H copy per slice on
+// lru_wb_stream, then a 1-thread kernel publishes the flushed count
+static bool ggml_cuda_lru_stash_ce() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LRU_STASH_CE"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx) {
+    if (cudaEventQuery(ctx.lru_stash_ce_event) != cudaSuccess) {
+        CUDA_CHECK(cudaEventSynchronize(ctx.lru_stash_ce_event));   // no sync since the pass (not the decode loop): wait for it
+    }
+    const uint32_t b = *(volatile uint32_t *) ctx.lru_stash_hsnap;
+    const volatile lru_stash_rec * rec = ctx.lru_stash_rec;
+    for (uint32_t k = ctx.lru_stash_hflushed; k != b; ++k) {
+        const uint32_t sl = k % ctx.lru_stash_cap;
+        for (int z = 0; z < 3; ++z) {
+            const uint32_t bytes = rec[sl].bytes[z];
+            if (bytes != 0) {
+                CUDA_CHECK(cudaMemcpyAsync((void *) rec[sl].dst[z], ctx.lru_stash + (size_t) sl * ctx.lru_stash_stride + rec[sl].off[z],
+                                           bytes, cudaMemcpyDeviceToHost, ctx.lru_wb_stream));
+            }
+        }
+    }
+    k_lru_stash_set<<<1, 1, 0, ctx.lru_wb_stream>>>(ctx.lru_stash_ctl, b);
+    CUDA_CHECK(cudaEventRecord(ctx.lru_stash_event, ctx.lru_wb_stream));
+    ctx.lru_stash_hflushed   = b;
+    ctx.lru_stash_flushed    = true;
+    ctx.lru_stash_ce_pending = false;
+}
+
 // meta backend pass hook (threaded dispatch, on the device's thread): k = 0 before the device issues the pass, 1 after
 static void ggml_cuda_lru_stash_pass(ggml_backend_cuda_context & ctx, int k) {
     const size_t bytes = ggml_cuda_lru_stash_bytes();
@@ -2088,8 +2144,13 @@ static void ggml_cuda_lru_stash_pass(ggml_backend_cuda_context & ctx, int k) {
         return;
     }
     if (k == 1) {
-        if (ctx.lru_stash_dirty) {
-            k_lru_stash_snap<<<1, 1, 0, ctx.stream()>>>(ctx.lru_stash_ctl);
+        if (ctx.lru_stash_dirty && ctx.lru_stash_hsnap != nullptr) {
+            k_lru_stash_snap<<<1, 1, 0, ctx.stream()>>>(ctx.lru_stash_ctl, ctx.lru_stash_hsnap);
+            CUDA_CHECK(cudaEventRecord(ctx.lru_stash_ce_event, ctx.stream()));
+            ctx.lru_stash_ce_pending = true;
+            ctx.lru_stash_dirty      = false;
+        } else if (ctx.lru_stash_dirty) {
+            k_lru_stash_snap<<<1, 1, 0, ctx.stream()>>>(ctx.lru_stash_ctl, nullptr);
             ggml_cuda_lru_stash_flush(ctx, true);
         }
         ctx.lru_stash_armed = false;
@@ -2106,6 +2167,14 @@ static void ggml_cuda_lru_stash_pass(ggml_backend_cuda_context & ctx, int k) {
         CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_stash_event, cudaEventDisableTiming));
         CUDA_CHECK(cudaMalloc(&ctx.lru_stash_ctl, sizeof(lru_stash_ctl)));
         CUDA_CHECK(cudaMemset(ctx.lru_stash_ctl, 0, sizeof(lru_stash_ctl)));   // cap 0: no entries until a fill size is known
+        if (ggml_cuda_lru_stash_ce()) {
+            CUDA_CHECK(cudaHostAlloc((void **) &ctx.lru_stash_hsnap, sizeof(uint32_t), cudaHostAllocMapped | cudaHostAllocPortable));
+            *ctx.lru_stash_hsnap = 0;
+            CUDA_CHECK(cudaEventCreateWithFlags(&ctx.lru_stash_ce_event, cudaEventDisableTiming));
+        }
+    }
+    if (ctx.lru_stash_ce_pending) {
+        ggml_cuda_lru_stash_flush_ce(ctx);   // the previous pass's victims (before any resize below)
     }
     if (ctx.lru_stash_need > ctx.lru_stash_stride) {
         // (re)size the ring for the largest fill seen (the first passes visit every layer): everything in flight must be done
@@ -2113,7 +2182,11 @@ static void ggml_cuda_lru_stash_pass(ggml_backend_cuda_context & ctx, int k) {
         CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
         CUDA_CHECK(cudaStreamSynchronize(ctx.lru_wb_stream));
         if (ctx.lru_stash_rec != nullptr) {
-            CUDA_CHECK(cudaFree(ctx.lru_stash_rec));
+            if (ctx.lru_stash_hsnap != nullptr) {
+                CUDA_CHECK(cudaFreeHost(ctx.lru_stash_rec));
+            } else {
+                CUDA_CHECK(cudaFree(ctx.lru_stash_rec));
+            }
             CUDA_CHECK(cudaFree(ctx.lru_stash));
             ctx.lru_stash_rec = nullptr;
             ctx.lru_stash = nullptr;
@@ -2122,8 +2195,13 @@ static void ggml_cuda_lru_stash_pass(ggml_backend_cuda_context & ctx, int k) {
         const uint32_t cap = (uint32_t) std::min<size_t>(bytes / stride, (1u << 18) - 2);
         if (cap > 0) {
             CUDA_CHECK(cudaMalloc(&ctx.lru_stash, (size_t) cap * stride));
-            CUDA_CHECK(cudaMalloc(&ctx.lru_stash_rec, (size_t) cap * sizeof(lru_stash_rec)));
-            CUDA_CHECK(cudaMemset(ctx.lru_stash_rec, 0, (size_t) cap * sizeof(lru_stash_rec)));
+            if (ctx.lru_stash_hsnap != nullptr) {   // copy-engine mode: the host reads the records
+                CUDA_CHECK(cudaHostAlloc((void **) &ctx.lru_stash_rec, (size_t) cap * sizeof(lru_stash_rec), cudaHostAllocMapped | cudaHostAllocPortable));
+                memset((void *) ctx.lru_stash_rec, 0, (size_t) cap * sizeof(lru_stash_rec));
+            } else {
+                CUDA_CHECK(cudaMalloc(&ctx.lru_stash_rec, (size_t) cap * sizeof(lru_stash_rec)));
+                CUDA_CHECK(cudaMemset(ctx.lru_stash_rec, 0, (size_t) cap * sizeof(lru_stash_rec)));
+            }
         }
         ctx.lru_stash_stride = stride;
         ctx.lru_stash_cap = cap;
@@ -3449,7 +3527,7 @@ static void ggml_cuda_lru_fill_n(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_lru_wb_wait(ctx, ctx.stream());
         k_lru_fill<<<grid, block, 0, ctx.stream()>>>(fl, n_slot, descs, ctrl, layer, dev, ctx.lru_counter, st);
         static const int stash_chunk = [] { const char * e = getenv("GGML_CUDA_LRU_STASH_CHUNK"); return e && atoi(e) > 0 ? atoi(e) : 8; }();
-        if (ctx.lru_stash_armed && ctx.lru_stash_dirty && ++ctx.lru_stash_calls >= stash_chunk) {
+        if (ctx.lru_stash_armed && ctx.lru_stash_dirty && ctx.lru_stash_hsnap == nullptr && ++ctx.lru_stash_calls >= stash_chunk) {
             ggml_cuda_lru_stash_flush(ctx, false);   // takes the entries of the fills before this one (this decide's snapshot)
         }
         return;
