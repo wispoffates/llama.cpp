@@ -19,3 +19,11 @@ unsigned long long * ggml_cuda_pass_fill_counter(int device);
 bool ggml_cuda_ab_listed(const char * feature);
 // arm of the pass being issued: 0 = A (as built), 1 = B (listed features off)
 int  ggml_cuda_ab_arm();
+
+// GGML_CUDA_PASS_TIMER_OPS=1 (with the timer): marks around selected ops of every pass -> <prefix>.<pid>.ops.csv
+// kind: 0 = LRU_DECIDE, 1 = LRU_FILL (fill_count -> the device reads n_fill at the end mark; bytes = per fill, this device),
+//       2 = MUL_MAT_ID (expert matvecs, incl. fused gate/up), 3 = other
+bool ggml_cuda_pass_ops_on();
+// returns the op record index (-1: not recorded); the end mark must use the same stream
+int  ggml_cuda_pass_op_begin(int device, cudaStream_t stream, int kind, int layer, long long bytes, int ntok);
+void ggml_cuda_pass_op_end(int idx, cudaStream_t stream, const int32_t * fill_count);
