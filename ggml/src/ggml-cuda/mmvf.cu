@@ -867,8 +867,9 @@ void launch_mul_mat_vec_f_cuda(
                     ggml_cuda_mmvf_shortk_enabled()) {
                 // Pascal only (allocates per-stream scratch on first use, not capture-safe). HC5: wins only with few rows (hc inject
                 // 10240 -> 4: 11.2 -> 6.1 us at 4 columns) and 2+ columns; at 320 rows (hc down) or 1 column the block-per-row kernel
-                // is as fast or faster. GGML_CUDA_MMVF_SPLITK=0: block-per-row kernel below; _BLOCKS: target block count (2 per SM)
-                static const bool splitk_on = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK"); return e == nullptr || atoi(e) != 0; }();
+                // is as fast or faster. Opt-in (GGML_CUDA_MMVF_SPLITK=1): the per-pass A/B measured ~0 end to end (+0.016 ms of a ~55 ms
+                // Flash-Next verify pass) and it changes rounding; _BLOCKS: target block count (2 per SM)
+                static const bool splitk_on = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK"); return e != nullptr && atoi(e) != 0; }();
                 static const int  splitk_blocks = [] { const char * e = getenv("GGML_CUDA_MMVF_SPLITK_BLOCKS"); return e ? atoi(e) : 0; }();
                 static const bool splitk_ab = ggml_cuda_ab_listed("splitk");
                 if (splitk_on && !(splitk_ab && ggml_cuda_ab_arm() == 1) && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_PASCAL && nrows <= 32 && ncols_dst >= 2 && nchannels_dst == 1 && nsamples_or_ntokens == 1 && (stride_col_y*sizeof(float)) % 16 == 0) {
