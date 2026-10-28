@@ -123,9 +123,11 @@ static __device__ __forceinline__ void mmvq_h1_bfly(float * acc, const int lane)
     }
 }
 
-// grid (ceil(M/(WPB*RPW)), tokens*slots); ID: y = t*n_used + j -> expert ids[t*ids_s1 + j], activation row t*nxr + (nxr == 1 ? 0 : j),
-// dst row t*syt + j*sy (p100-series 10-28: several tokens in one launch, each (token, slot) computed exactly as a one-token launch)
-template <ggml_type type, int WPB, int U, int RPW, bool ID>
+// grid (ceil(M/(WPB*RPW)), slots[, tokens]); ID: slot y -> expert ids[y], activation row (nxr == 1 ? 0 : y), dst row y. MT (p100-series
+// 10-28): token z adds z*ids_s1 / z*nxr / z*syt, each (token, slot) computed exactly as a one-token launch. A compile-time flag: the
+// runtime version (y = t*n_used + j) put an integer division + 64-bit offsets into every one-token instance (+100 SASS instructions
+// per kernel) and cost gemma4 one-token decode 3 % (gate R33).
+template <ggml_type type, int WPB, int U, int RPW, bool ID, bool MT = false>
 static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
         const uint8_t * __restrict__ W, const int64_t row_bytes, const int64_t expert_bytes, const int32_t * __restrict__ ids,
         const __half * __restrict__ XH, const float * __restrict__ XS, const int nxr, float * __restrict__ Y, const int64_t sy,
@@ -139,11 +141,18 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
     if (r0 >= M) {
         return;   // no block-wide barriers below
     }
-    const int t = blockIdx.y / n_used, slot = blockIdx.y % n_used;
-    if (ID) {
-        W += (int64_t) ids[t*ids_s1 + slot]*expert_bytes;
+    const int slot = blockIdx.y;
+    if constexpr (MT) {
+        const int t = blockIdx.z;
+        ids += t*ids_s1;
+        XH  += (int64_t) t*nxr*K;
+        XS  += (int64_t) t*nxr*(K/H1_QK);
+        Y   += t*syt;
     }
-    const int xr = t*nxr + (nxr == 1 ? 0 : slot);
+    if (ID) {
+        W += (int64_t) ids[slot]*expert_bytes;
+    }
+    const int xr = nxr == 1 ? 0 : slot;
     XH += (int64_t) xr*K;
     XS += (int64_t) xr*(K/H1_QK);
     const int nb = K/H1_QK;
@@ -231,7 +240,7 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
     if constexpr (RPW >= 4)  { mmvq_h1_bfly<2>(acc, lane); }
     if constexpr (RPW >= 2)  { mmvq_h1_bfly<1>(acc, lane); }
     if (lane < RPW && r0 + lane < M) {
-        Y[t*syt + (int64_t) slot*sy + r0 + lane] = acc[0];
+        Y[(int64_t) slot*sy + r0 + lane] = acc[0];
     }
 }
 
@@ -639,7 +648,7 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             dst->nb[1] % sizeof(float) != 0 || src1->ne[0] != K || dst->ne[0] != M) {
         return false;
     }
-    int64_t nxr, slots, ntok = 1, n_used = 1, ids_s1 = 0, syt = 0, sxt = 0;
+    int64_t nxr, ntok = 1, n_used = 1, ids_s1 = 0, syt = 0, sxt = 0;
     if (ids) {
         // T tokens: ids [n_used, T], src1 [K, 1 (shared) or n_used, T], dst [M, n_used, T]; every (token, slot) is the one-token
         // computation (p100-series 10-28: concurrent decode = T sequences one token each kept its experts on the integer path)
@@ -654,7 +663,6 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             return false;
         }
         nxr    = src1->ne[1];
-        slots  = n_used*ntok;
         ids_s1 = (int64_t) (ids->nb[1]/sizeof(int32_t));
         syt    = (int64_t) (dst->nb[2]/sizeof(float));
         sxt    = (int64_t) (src1->nb[2]/sizeof(float));
@@ -667,7 +675,6 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
             return false;
         }
         nxr = ncols;
-        slots = 1;
     }
     cudaStream_t stream = ctx.stream();
     // flat activation rows: nxr per token x ntok tokens, row stride sx (one token: nxr rows at nb[1]; one shared row per token: nb[2])
@@ -724,11 +731,15 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
-    const dim3 grid((unsigned) ((M + RB - 1)/RB), (unsigned) slots);
+    const dim3 grid((unsigned) ((M + RB - 1)/RB), (unsigned) n_used, (unsigned) ntok);
     const int64_t sy = ids ? (int64_t) (dst->nb[1]/sizeof(float)) : 0;
     auto launch = [&](auto type_tag) {
         constexpr ggml_type T = decltype(type_tag)::value;
-        if (ids) {
+        if (ids && ntok > 1) {
+            mmvq_h1_q<T, MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW, true, true><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(
+                (const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2], (const int32_t *) ids->data, xh, xs, (int) nxr,
+                (float *) dst->data, sy, (int) M, (int) K, (int) n_used, ids_s1, syt);
+        } else if (ids) {
             mmvq_h1_q<T, MMVQ_H1_WPB, MMVQ_H1_U, MMVQ_H1_RPW, true><<<grid, MMVQ_H1_WPB*32, 0, stream>>>(
                 (const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2], (const int32_t *) ids->data, xh, xs, (int) nxr,
                 (float *) dst->data, sy, (int) M, (int) K, (int) n_used, ids_s1, syt);
@@ -1405,7 +1416,7 @@ bool ggml_cuda_mmvq_h1_reserve(ggml_backend_cuda_context & ctx, const ggml_tenso
 // its row. Optional GLU mode computes op(gate) * up on the fly from the two GLU operands, so the GLU node needs no launch.
 // GGML_CUDA_MMVQ_H1S=0 disables, GGML_CUDA_MMVQ_H1S_GLU=0 keeps the GLU launch, GGML_CUDA_MMVQ_H1S_RB=32|64|128 rows per chunk,
 // GGML_CUDA_MMVQ_H1S_CPB=1..8 chunks per block.
-template <int RB, int GLU>   // GLU: 0 = plain fp32 activation, 1 = GEGLU(gate, up), 2 = SWIGLU(gate, up)
+template <int RB, int GLU, bool MT = false>   // GLU: 0 = plain fp32 activation, 1 = GEGLU(gate, up), 2 = SWIGLU(gate, up); MT: see mmvq_h1_q
 static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
         const uint8_t * __restrict__ W, const int row_bytes, const int64_t nb2, const int32_t * __restrict__ ids,
         const float * __restrict__ X, const int64_t sx, const float * __restrict__ U, const int64_t su,
@@ -1417,11 +1428,13 @@ static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
     __half * xh = (__half *) (h1s_smem + 64);                  // K halfs (<= 512)
     uint8_t * ws = h1s_smem + 64 + 1024;                       // RB rows of weights (one chunk)
     const int tid = threadIdx.x, lane = tid % 32;
-    // y = t*n_used + slot: token t's slot (10-28: several tokens per launch, each (token, slot) = the one-token computation)
-    const int t = blockIdx.y / n_used, slot = blockIdx.y % n_used;
-    X += t*sxt; dst += t*syt; ids += t*ids_s1;
-    if constexpr (GLU != 0) {
-        U += t*sut;
+    const int slot = blockIdx.y;
+    if constexpr (MT) {   // token z (10-28: several tokens per launch, each (token, slot) = the one-token computation)
+        const int t = blockIdx.z;
+        X += t*sxt; dst += t*syt; ids += t*ids_s1;
+        if constexpr (GLU != 0) {
+            U += t*sut;
+        }
     }
     // this block: chunks blockIdx.x*cpb .. +cpb-1 (RB rows each) of the slot's expert; the activation is built once for all of them,
     // and chunk c+1's weights are loaded into registers while chunk c is computed from shared memory
@@ -1554,7 +1567,7 @@ static __global__ void __launch_bounds__(RB) mmvq_h1s_id(
 // activation half2 in registers, and computes it for G steps at once (G independent chains, h1's rows-per-warp trick). A warp streams NG
 // groups of G*RPS consecutive rows through a double-buffered staging buffer (next group loading while this one computes); row sums go through
 // a small scratch in block order (= v4's order). moebw: K 320 18.9 -> 13.2 us, K 384 20.8 -> 16.6 us (G 3, NG 4, WPB 4 best of 14).
-template <int NB, int GLU>
+template <int NB, int GLU, bool MT = false>
 static __global__ void __launch_bounds__(128) mmvq_h1s7_id(
         const uint8_t * __restrict__ W, const int64_t nb2, const int32_t * __restrict__ ids,
         const float * __restrict__ X, const int64_t sx, const float * __restrict__ U, const int64_t su,
@@ -1566,11 +1579,13 @@ static __global__ void __launch_bounds__(128) mmvq_h1s7_id(
     __shared__ __align__(16) __half xh[K];
     __shared__ float xs[NB];
     __shared__ float red[WPB][G][32];
-    const int tid = threadIdx.x, lane = tid % 32, wid = tid / 32;
-    const int t = blockIdx.y / n_used, slot = blockIdx.y % n_used;   // y = t*n_used + slot (see mmvq_h1s_id)
-    X += t*sxt; dst += t*syt; ids += t*ids_s1;
-    if constexpr (GLU != 0) {
-        U += t*sut;
+    const int tid = threadIdx.x, lane = tid % 32, wid = tid / 32, slot = blockIdx.y;
+    if constexpr (MT) {   // token z (see mmvq_h1s_id)
+        const int t = blockIdx.z;
+        X += t*sxt; dst += t*syt; ids += t*ids_s1;
+        if constexpr (GLU != 0) {
+            U += t*sut;
+        }
     }
     constexpr int NT = WPB*32, MAXK = (K + NT - 1)/NT;
 
@@ -1837,7 +1852,7 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // count (parallelism) beats reusing the activation and prefetching the next chunk; all variants sit near ~200 GB/s (open question)
     static const int cpb = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_CPB"); const int v = s ? atoi(s) : 1; return v >= 1 && v <= 8 ? v : 1; }();
     const int nchunks = (int) ((M + rb - 1)/rb);
-    const dim3 grid((unsigned) ((nchunks + cpb - 1)/cpb), (unsigned) (n_used*ntok));
+    const dim3 grid((unsigned) ((nchunks + cpb - 1)/cpb), (unsigned) n_used, (unsigned) ntok);
     const size_t smem = 64 + 1024 + (size_t) rb*row_bytes;
     cudaStream_t stream = ctx.stream();
     static const bool v7 = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1S_V7"); return !s || atoi(s) != 0; }();
@@ -1845,10 +1860,11 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     if (v7 && nb >= 8 && nb <= 16) {
         // rows per CTA = WPB 4 x NG 4 x G 3 x RPS (32/NB)
         const int rows_cta = 4*4*3*(32/nb);
-        const dim3 grid7((unsigned) ((M + rows_cta - 1)/rows_cta), (unsigned) (n_used*ntok));
+        const dim3 grid7((unsigned) ((M + rows_cta - 1)/rows_cta), (unsigned) n_used, (unsigned) ntok);
         auto go7 = [&](auto nb_tag, auto glu_tag) {
             constexpr int NBv = decltype(nb_tag)::value, Gv = decltype(glu_tag)::value;
-            mmvq_h1s7_id<NBv, Gv><<<grid7, 128, 0, stream>>>((const uint8_t *) src0->data, (int64_t) src0->nb[2],
+            auto k = ntok > 1 ? mmvq_h1s7_id<NBv, Gv, true> : mmvq_h1s7_id<NBv, Gv, false>;
+            k<<<grid7, 128, 0, stream>>>((const uint8_t *) src0->data, (int64_t) src0->nb[2],
                 (const int32_t *) ids->data, X, sx, Uv, su, (float *) dst->data, sy, (int) M, (int) n_used, ids_s1, sxt, sut, syt);
         };
         auto by_glu7 = [&](auto nb_tag) {
@@ -1874,7 +1890,8 @@ bool ggml_cuda_mmvq_h1s_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }
     auto go = [&](auto rb_tag, auto glu_tag) {
         constexpr int R = decltype(rb_tag)::value, G = decltype(glu_tag)::value;
-        mmvq_h1s_id<R, G><<<grid, R, smem, stream>>>((const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2],
+        auto k = ntok > 1 ? mmvq_h1s_id<R, G, true> : mmvq_h1s_id<R, G, false>;
+        k<<<grid, R, smem, stream>>>((const uint8_t *) src0->data, row_bytes, (int64_t) src0->nb[2],
             (const int32_t *) ids->data, X, sx, Uv, su, (float *) dst->data, sy, (int) M, (int) K, cpb, (int) n_used, ids_s1, sxt, sut, syt);
     };
     auto by_glu = [&](auto rb_tag) {
