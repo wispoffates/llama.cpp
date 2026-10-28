@@ -2,6 +2,7 @@
 #include "norm.cuh"
 #include "unary.cuh"
 #include "convert.cuh"
+#include "mmvq.cuh"
 #include "ggml-impl.h"
 
 #include <unordered_map>
@@ -238,6 +239,17 @@ static __global__ void __launch_bounds__(WPB*32) mmvq_h1_q(
 static bool mmvq_h1_mt_on() {
     static const bool on = [] { const char * s = getenv("GGML_CUDA_MMVQ_H1_MT"); return !s || atoi(s) != 0; }();
     return on;
+}
+
+// T tokens of a MUL_MAT_ID reach ggml_cuda_mul_mat_vec_q (and so h1 / h1s) only up to ggml_cuda_mul_mat_id's batch limit; the shape
+// checks must say no above it. h1s_ok also gates the GLU deferral, and a GLU deferred to a matvec that the dispatcher sends to the
+// tile GEMM is never computed (C1A 10-28: 1536-token prefill ubatches read an unwritten GLU -> every gemma4 answer lost its prompt).
+static bool mmvq_h1_mt_tokens_ok(const ggml_type type, const int64_t ntok) {
+    if (ntok == 1) {
+        return true;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return mmvq_h1_mt_on() && ntok <= MMVQ_MAX_BATCH_SIZE && ntok <= get_mmvq_mmid_max_batch(type, cc);
 }
 
 // p100-series 10-06: gate + up + GLU for one column in one launch (gemma4's dense q4_0 FFN: Pascal fuses gate/up only through the
@@ -633,7 +645,7 @@ bool ggml_cuda_mmvq_h1_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
         // computation (p100-series 10-28: concurrent decode = T sequences one token each kept its experts on the integer path)
         n_used = ids->ne[0];
         ntok   = ids->ne[1];
-        if (ids->type != GGML_TYPE_I32 || ntok < 1 || (ntok > 1 && !mmvq_h1_mt_on()) || n_used*ntok > 65535 ||
+        if (ids->type != GGML_TYPE_I32 || ntok < 1 || !mmvq_h1_mt_tokens_ok(type, ntok) || n_used*ntok > 65535 ||
                 src1->ne[2] != ntok || src1->ne[3] != 1 || dst->ne[1] != n_used || dst->ne[2] != ntok || dst->ne[3] != 1 ||
                 (src1->ne[1] != 1 && src1->ne[1] != n_used) || ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 ||
                 src1->nb[2] % sizeof(float) != 0 || dst->nb[2] % sizeof(float) != 0 ||
@@ -1753,7 +1765,7 @@ static bool mmvq_h1s_ok(const ggml_tensor * src0, const ggml_tensor * src1, cons
            // covered when the tensor owns its allocation and K is not a multiple of MATRIX_ROW_PADDING (last row padded), or when nothing
            // is ever misaligned
            ((row_bytes % 16 == 0 && (uintptr_t) src0->data % 16 == 0) || (src0->view_src == nullptr && K % MATRIX_ROW_PADDING != 0)) &&
-           ids->type == GGML_TYPE_I32 && ntok >= 1 && (ntok == 1 || mmvq_h1_mt_on()) && ids->nb[0] == sizeof(int32_t) &&
+           ids->type == GGML_TYPE_I32 && ntok >= 1 && mmvq_h1_mt_tokens_ok(src0->type, ntok) && ids->nb[0] == sizeof(int32_t) &&
            ids->nb[1] % sizeof(int32_t) == 0 && n_used*ntok <= 65535 &&
            src1->type == GGML_TYPE_F32 && src1->ne[0] == K && src1->nb[0] == sizeof(float) && src1->ne[2] == ntok && src1->ne[3] == 1 &&
            (src1->ne[1] == 1 || src1->ne[1] == n_used) && src1->nb[1] % sizeof(float) == 0 && src1->nb[2] % sizeof(float) == 0 &&
@@ -1773,7 +1785,7 @@ bool ggml_cuda_mmvq_h1s_glu_defer(ggml_backend_cuda_context & ctx, const ggml_cg
     if ((op != GGML_GLU_OP_GEGLU && op != GGML_GLU_OP_SWIGLU) || !a || !b || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
             glu->type != GGML_TYPE_F32 || a->nb[0] != sizeof(float) || b->nb[0] != sizeof(float) || a->ne[0] != glu->ne[0] ||
             b->ne[0] != glu->ne[0] || a->ne[1] != glu->ne[1] || b->ne[1] != glu->ne[1] || a->ne[2] != glu->ne[2] ||
-            b->ne[2] != glu->ne[2] || a->ne[3] != 1 || b->ne[3] != 1 || (glu->ne[2] > 1 && !mmvq_h1_mt_on()) ||
+            b->ne[2] != glu->ne[2] || a->ne[3] != 1 || b->ne[3] != 1 ||
             a->nb[1] % sizeof(float) != 0 || b->nb[1] % sizeof(float) != 0 || a->nb[2] % sizeof(float) != 0 ||
             b->nb[2] % sizeof(float) != 0 || ggml_node_get_use_count(cgraph, i) != 1 ||
             (glu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
