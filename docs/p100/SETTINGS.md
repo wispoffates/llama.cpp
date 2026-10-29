@@ -54,6 +54,10 @@ llama-server --model gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf --mmproj mmproj-gemm
   --dry-multiplier 0.8 --dry-base 1.75 --dry-allowed-length 2
 ```
 
+- Since v5.33, the fp16 expert matvecs (q4_0 / q8_0 gate/up, the short-K down and its deferred GLU) also take 2..8 tokens per
+  launch, so concurrent requests decode with the same numerics as a single one (2-stream decode KL divergence 0.0024 -> 0.0003) and
+  batched decode is ~8 % faster. `GGML_CUDA_MMVQ_H1_MT=0` restores the v5.32 routing (2..8 tokens on the integer q8_1 path).
+
 ### Swift 27B (dense), MTP + ngram-mod speculation
 
 - Model: `Swift-1.5-Qwen3.8-27B-Q6_K.gguf` (Q6_K; 23.86 GB) sha256 `cd2eb6597026ce4eb86100e830be24f01461f84b89d4708634c2ec3d43b67fa8`
