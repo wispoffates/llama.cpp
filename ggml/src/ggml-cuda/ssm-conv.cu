@@ -58,13 +58,15 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
 }
 
 // one sequence, conv window = cached state row ids[0] (d_conv - 1 columns) + the new tokens of x, then silu.
-// Same math as ssm_conv_f32 (b = 0 is passed at run time like its missing bias); also writes the last d_conv - 1
-// columns of the window to state_dst. x may alias dst and state_src may alias state_dst: each thread reads its
-// values before it writes them.
+// Same math as ssm_conv_f32 (b = 0 is passed at run time like its missing bias); also writes d_conv - 1 columns of the window to
+// each of the K rollback slots of the cache: slot s (at state_dst + s * slot_stride) gets the columns starting at max(0, n_t - s),
+// i.e. the state s tokens before the end ([TAG_RECURRENT_ROLLBACK_SPLITS]; K = 1 without rollback). x may alias dst and state_src
+// may alias the slot-0 row: each thread reads its values before it writes them.
 template <size_t split_d_inner, size_t d_conv>
 static __global__ void ssm_conv_state_f32(const float * x, const float * w_ptr, const float b,
                                           const float * state_src, const int32_t * ids, const int64_t state_stride,
-                                          float * state_dst, float * dst, const int x_nb1, const int w_nb1, const int dst_nb1,
+                                          float * state_dst, const int K, const int64_t slot_stride,
+                                          float * dst, const int x_nb1, const int w_nb1, const int dst_nb1,
                                           const int64_t n_t) {
     ggml_cuda_pdl_lc();
     const float * GGML_CUDA_RESTRICT w = w_ptr;
@@ -85,17 +87,21 @@ static __global__ void ssm_conv_state_f32(const float * x, const float * w_ptr, 
         wr[j] = w[ch * stride_w + j];
     }
 
+    // window column c sits in xr[c % d_conv]; columns 0 .. d_conv - 2 are the cached state
+    for (size_t j = 0; j < d_conv - 1; j++) {
+        xr[j] = s_row[j];
+    }
+    // slots that roll back past every new token keep the old state (start column 0)
+    for (int s = n_t; s < K; s++) {
+        for (size_t j = 0; j < d_conv - 1; j++) {
+            state_dst[s * slot_stride + ch * (d_conv - 1) + j] = xr[j];
+        }
+    }
+
     for (int64_t i = 0; i < n_t; i++) {
         float sumf = 0.0f;
 
-        if (i == 0) {
-            for (size_t j = 0; j < d_conv - 1; j++) {
-                xr[j] = s_row[j];
-            }
-            xr[d_conv - 1] = x[ch];
-        } else {
-            xr[(i - 1) % d_conv] = x[i * stride_x + ch];
-        }
+        xr[(i + d_conv - 1) % d_conv] = x[i * stride_x + ch];
 
 #pragma unroll
         for (size_t j = 0; j < d_conv; j++) {
@@ -103,10 +109,14 @@ static __global__ void ssm_conv_state_f32(const float * x, const float * w_ptr, 
         }
         sumf += b;
         dst[i * stride_y + ch] = ggml_cuda_op_silu_single(sumf);
-    }
 
-    for (size_t j = 0; j < d_conv - 1; j++) {
-        state_dst[ch * (d_conv - 1) + j] = xr[(n_t + j) % d_conv];
+        // the window now holds columns i .. i + d_conv - 1: slot s = n_t - 1 - i starts at column i + 1
+        const int s = (int) (n_t - 1 - i);
+        if (s < K) {
+            for (size_t j = 0; j < d_conv - 1; j++) {
+                state_dst[s * slot_stride + ch * (d_conv - 1) + j] = xr[(i + 1 + j) % d_conv];
+            }
+        }
     }
 }
 
@@ -260,7 +270,8 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 }
 
 void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * conv_w,
-                                 const ggml_tensor * states, const ggml_tensor * ids, float * state_dst, ggml_tensor * dst) {
+                                 const ggml_tensor * states, const ggml_tensor * ids, float * state_dst, int K, int64_t slot_stride,
+                                 ggml_tensor * dst) {
     const int64_t nc  = conv_w->ne[0]; // d_conv
     const int64_t nr  = x->ne[0];      // channels
     const int64_t n_t = x->ne[1];
@@ -269,7 +280,7 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32);
     GGML_ASSERT(x->nb[0] == sizeof(float) && conv_w->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
     GGML_ASSERT(conv_w->ne[1] == nr && dst->ne[0] == nr && dst->ne[1] == n_t);
-    GGML_ASSERT(x->ne[2] == 1 && dst->ne[2] == 1 && n_t <= 32 && nc == 4);
+    GGML_ASSERT(x->ne[2] == 1 && dst->ne[2] == 1 && n_t <= 32 && nc == 4 && K >= 1);
 
     const int threads = 128;
     GGML_ASSERT(nr % threads == 0);
@@ -284,5 +295,5 @@ void ggml_cuda_op_ssm_conv_state(ggml_backend_cuda_context & ctx, const ggml_ten
     const dim3 blocks(1, nr / threads, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, ctx.stream());
     ggml_cuda_kernel_launch(ssm_conv_state_f32<threads, 4>, launch_params, x_d, w_d, 0.0f,
-        s_d, id, s_stride, state_dst, dst_d, (int) x->nb[1], (int) conv_w->nb[1], (int) dst->nb[1], n_t);
+        s_d, id, s_stride, state_dst, K, slot_stride, dst_d, (int) x->nb[1], (int) conv_w->nb[1], (int) dst->nb[1], n_t);
 }
