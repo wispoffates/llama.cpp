@@ -6136,7 +6136,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_RMS_NORM) {
+    // p100-series: GGML_CUDA_GDN_FUSE=0 turns the GDN decode-chain fusions off (A/B in one binary)
+    static const bool gdn_fuse = [] { const char * e = getenv("GGML_CUDA_GDN_FUSE"); return !e || atoi(e) != 0; }();
+
+    if (gdn_fuse && node->op == GGML_OP_RMS_NORM) {
         int nodes_to_skip = ggml_cuda_try_gdn_fusion(cuda_ctx, cgraph, i);
         if (nodes_to_skip == 0) {
             nodes_to_skip = ggml_cuda_try_rms_norm_mul_gated_fusion(cuda_ctx, cgraph, i);
@@ -6146,7 +6149,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
-    if (node->op == GGML_OP_GET_ROWS) {
+    if (gdn_fuse && node->op == GGML_OP_GET_ROWS) {
         int nodes_to_skip = ggml_cuda_try_ssm_conv_state_fusion(cuda_ctx, cgraph, i);
         if (nodes_to_skip == 0) {
             nodes_to_skip = ggml_cuda_try_gdn_state_fusion(cuda_ctx, cgraph, i);
