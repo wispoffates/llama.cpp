@@ -5297,7 +5297,10 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 };
 
 // one gated delta net decode layer as qwen35 builds it (conv state, conv, l2 norms, gate, state read, gated norm),
-// in the same node order, so the CUDA backend can fuse the chain; both caches are read at row `row` and written at row `head`
+// in the same node order, so the CUDA backend can fuse the chain; both caches are read at row `row` and written at row `head`.
+// p100-series: K rollback slots (slot s at row s * n_cells + head, [TAG_RECURRENT_ROLLBACK_SPLITS]: the conv state copy of slot s
+// ends s tokens earlier, the delta net writes min(n_t, K) snapshots); q4 = qwen4exp's layout: merged qkv|z and beta|alpha matmul
+// outputs read through strided views, the conv slot copies as cont + cpy with slot 0 first (qwen35: slot K-1 first), sigmoid gate
 struct test_gdn_decode_fusion : public test_case {
     const int64_t H_k;
     const int64_t H_v;
@@ -5306,8 +5309,10 @@ struct test_gdn_decode_fusion : public test_case {
     const int64_t n_seqs;
     const int     row;
     const int     head;
+    const int     K;
+    const bool    q4;
 
-    ggml_tensor * conv_cpy  = nullptr;
+    std::vector<ggml_tensor *> conv_cpys;
     ggml_tensor * state_cpy = nullptr;
     ggml_tensor * out       = nullptr;
 
@@ -5320,51 +5325,79 @@ struct test_gdn_decode_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out, conv_cpy, state_cpy }; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> v = { out, state_cpy };
+        v.insert(v.end(), conv_cpys.begin(), conv_cpys.end());
+        return v;
+    }
 
     std::string vars() override {
-        return VARS_TO_STR7(H_k, H_v, S, n_t, n_seqs, row, head);
+        return VARS_TO_STR9(H_k, H_v, S, n_t, n_seqs, row, head, K, q4);
     }
 
     test_gdn_decode_fusion(int64_t H_k = 4, int64_t H_v = 12, int64_t S = 128, int64_t n_t = 1, int64_t n_seqs = 1,
-            int row = 1, int head = 1)
-        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head) {}
+            int row = 1, int head = 1, int K = 1, bool q4 = false)
+        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head), K(K), q4(q4) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t nr = 2*H_k*S + H_v*S; // conv channels
         const float eps = 1e-6f;
 
-        ggml_tensor * x          = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, n_seqs);
+        ggml_tensor * x;
+        ggml_tensor * z;
+        ggml_tensor * alpha;
+        ggml_tensor * b;
+        if (q4) {
+            ggml_tensor * xz = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr + S*H_v, n_t, n_seqs);
+            ggml_tensor * ba = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*H_v, n_t, n_seqs);
+            ggml_set_name(xz, "xz");
+            ggml_set_name(ba, "ba");
+            x     = ggml_view_3d(ctx, xz, nr, n_t, n_seqs, xz->nb[1], xz->nb[2], 0);
+            z     = ggml_view_4d(ctx, xz, S, H_v, n_t, n_seqs, ggml_row_size(xz->type, S), xz->nb[1], xz->nb[2],
+                    ggml_row_size(xz->type, nr));
+            b     = ggml_view_4d(ctx, ba, 1, H_v, n_t, n_seqs, ggml_element_size(ba), ba->nb[1], ba->nb[2], 0);
+            alpha = ggml_view_3d(ctx, ba, H_v, n_t, n_seqs, ba->nb[1], ba->nb[2], ggml_row_size(ba->type, H_v));
+        } else {
+            x     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, n_seqs);
+            z     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, n_t, n_seqs);
+            alpha = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_v, n_t, n_seqs);
+            b     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_t, n_seqs);
+            ggml_set_name(x, "x");
+            ggml_set_name(z, "z");
+            ggml_set_name(alpha, "alpha");
+            ggml_set_name(b, "b");
+        }
         ggml_tensor * conv_w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
-        ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*nr, n_cells);
-        ggml_tensor * ssm_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H_v, n_cells);
+        ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*nr, n_cells*K);
+        ggml_tensor * ssm_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H_v, n_cells*K);
         ggml_tensor * ids        = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
-        ggml_tensor * alpha      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_v, n_t, n_seqs);
-        ggml_tensor * b          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_t, n_seqs);
         ggml_tensor * dt         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
         ggml_tensor * A          = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
-        ggml_tensor * z          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, n_t, n_seqs);
         ggml_tensor * norm_w     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S);
-        ggml_set_name(x, "x");
         ggml_set_name(conv_w, "conv_w");
         ggml_set_name(conv_cache, "conv_cache");
         ggml_set_name(ssm_cache, "ssm_cache");
         ggml_set_name(ids, "ids");
-        ggml_set_name(alpha, "alpha");
-        ggml_set_name(b, "b");
         ggml_set_name(dt, "dt");
         ggml_set_name(A, "A");
-        ggml_set_name(z, "z");
         ggml_set_name(norm_w, "norm_w");
 
-        // conv state: gather, append the new tokens, store the last d_conv - 1 columns, conv + silu
+        // conv state: gather, append the new tokens, store d_conv - 1 columns per rollback slot, conv + silu
         ggml_tensor * conv_states = ggml_reshape_3d(ctx, ggml_get_rows(ctx, conv_cache, ids), d_conv - 1, nr, n_seqs);
         ggml_tensor * conv_input  = ggml_concat(ctx, conv_states, ggml_transpose(ctx, x), 0);
-        ggml_tensor * conv_last   = ggml_view_3d(ctx, conv_input, d_conv - 1, nr, n_seqs, conv_input->nb[1], conv_input->nb[2],
-                ggml_row_size(conv_input->type, n_t));
-        conv_cpy = ggml_cpy(ctx, conv_last, ggml_view_2d(ctx, conv_cache, (d_conv - 1)*nr, n_seqs, conv_cache->nb[1], head*conv_cache->nb[1]));
-        if (mode == MODE_TEST) {
-            ggml_build_forward_expand(gf, conv_cpy);
+        for (int k = 0; k < K; ++k) {
+            const int slot = q4 ? k : K - 1 - k;
+            ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, nr, n_seqs, conv_input->nb[1], conv_input->nb[2],
+                    ggml_row_size(conv_input->type, std::max<int64_t>(0, n_t - slot)));
+            if (q4) {
+                last = ggml_cont(ctx, last);
+            }
+            ggml_tensor * cpy = ggml_cpy(ctx, last, ggml_view_2d(ctx, conv_cache, (d_conv - 1)*nr, n_seqs, conv_cache->nb[1],
+                    (slot*n_cells + head)*conv_cache->nb[1]));
+            conv_cpys.push_back(cpy);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, cpy);
+            }
         }
         ggml_tensor * conv = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, conv_w));
         if (mode == MODE_TEST) {
@@ -5391,20 +5424,24 @@ struct test_gdn_decode_fusion : public test_case {
             ggml_build_forward_expand(gf, beta);
         }
 
-        // state read right before the delta net, new state stored back
+        // state read right before the delta net, new state (min(n_t, K) snapshots) stored back
+        const int64_t D         = S*S*H_v;
+        const int64_t n_written = std::min<int64_t>(n_t, K);
         ggml_tensor * s   = ggml_reshape_4d(ctx, ggml_get_rows(ctx, ssm_cache, ids), S, S, H_v, n_seqs);
-        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, s, 1);
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, s, K);
         ggml_tensor * o   = ggml_view_4d(ctx, gdn, S, H_v, n_t, n_seqs, ggml_row_size(gdn->type, S),
                 ggml_row_size(gdn->type, S*H_v), ggml_row_size(gdn->type, S*H_v*n_t), 0);
-        ggml_tensor * new_state = ggml_view_2d(ctx, gdn, S*S*H_v, n_seqs, ggml_row_size(gdn->type, S*S*H_v),
-                ggml_row_size(gdn->type, S*H_v*n_t*n_seqs));
-        state_cpy = ggml_cpy(ctx, new_state, ggml_view_2d(ctx, ssm_cache, S*S*H_v, n_seqs, ssm_cache->nb[1], head*ssm_cache->nb[1]));
+        ggml_tensor * new_state = ggml_view_3d(ctx, gdn, D, n_seqs, n_written, ggml_row_size(gdn->type, D),
+                ggml_row_size(gdn->type, D*n_seqs), ggml_row_size(gdn->type, S*H_v*n_t*n_seqs));
+        state_cpy = ggml_cpy(ctx, new_state, ggml_view_3d(ctx, ssm_cache, D, n_seqs, n_written, ssm_cache->nb[1],
+                n_cells*ssm_cache->nb[1], head*ssm_cache->nb[1]));
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, state_cpy);
         }
 
         // gated norm
-        out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), norm_w), ggml_silu(ctx, z));
+        ggml_tensor * gate = q4 ? ggml_sigmoid(ctx, z) : ggml_silu(ctx, z);
+        out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), norm_w), gate);
         ggml_set_name(out, "out");
         return out;
     }
@@ -12915,6 +12952,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_decode_fusion(4, 8, 64, 1));
     test_cases.emplace_back(new test_gdn_decode_fusion(4, 8, 64, 5));
     test_cases.emplace_back(new test_gdn_decode_fusion(8, 8, 32, 1));
+    // p100-series: rollback slots (MTP / speculative serving: K = n_rs_seq + 1) and qwen4exp's layout (Flash-Next, per GPU 8 / 24 heads)
+    for (int K : { 2, 4 }) {
+        for (int64_t n_t : { 1, 2, 4, 6 }) {
+            test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, n_t, 1, /*row=*/1, /*head=*/0, K, /*q4=*/false));
+            test_cases.emplace_back(new test_gdn_decode_fusion(8, 24, 128, n_t, 1, /*row=*/2, /*head=*/1, K, /*q4=*/true));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 1, 1, 0, 0, 1, /*q4=*/true));
+    test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 4, 1, 0, 2, 4, /*q4=*/true));
+    test_cases.emplace_back(new test_gdn_decode_fusion(8, 24, 128, 33, 1, 1, 1, 4, /*q4=*/true));
+    test_cases.emplace_back(new test_gdn_decode_fusion(8, 24, 128, 4, /*n_seqs=*/2, 1, 0, 4, /*q4=*/true));
     for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{128, 12, 1, 1}, {128, 48, 7, 1}, {64, 16, 3, 2}, {256, 4, 2, 1}, {1000, 3, 1, 1}, {128, 32, 512, 1} }) {
         test_cases.emplace_back(new test_rms_norm_mul_gated(ne));
     }
