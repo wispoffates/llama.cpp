@@ -12,6 +12,11 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
 - `GGML_CUDA_P2P=1` in every run (without it the two cards reduce through the host and tensor split is ~20 % slower).
 - Fans on automatic control; every run waits until both GPUs are at or below 65 °C; one warm-up run per model before measuring.
 - Steps are run forward and then in reverse order (mirrored), so slow drift cancels out; a result is the mean of both passes.
+- Since v5.34, the fused top-k MoE router always runs for prompt batches: when its outputs would overlap a live input it writes to
+  scratch buffers and copies them back, instead of falling back to the separate softmax / argsort / get_rows / norm kernels. The two
+  paths round differently, and which one ran depended on buffer placement, so output could depend on what a server had served before
+  (Flash-Next's first request after a load). MoE prompt processing changes slightly (KL divergence neutral, qwen36 / ornith pp512
+  +1.3-1.5 %); decode is unchanged. `GGML_CUDA_TOPK_MOE_STAGE=0` restores the old fallback.
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
