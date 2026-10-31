@@ -640,11 +640,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     if (kv_only && n_outputs == 0) {
         ggml_tensor * k_st = Kcur;
         ggml_tensor * v_st = Vcur;
-        if (inp_attn->self_k_rot) {
-            k_st = llama_mul_mat_hadamard(ctx0, k_st, inp_attn->self_k_rot);
+        if (inp_attn->self_k_rot[il]) {
+            k_st = llama_mul_mat_hadamard(ctx0, k_st, inp_attn->self_k_rot[il]);
         }
-        if (inp_attn->self_v_rot) {
-            v_st = llama_mul_mat_hadamard(ctx0, v_st, inp_attn->self_v_rot);
+        if (inp_attn->self_v_rot[il]) {
+            v_st = llama_mul_mat_hadamard(ctx0, v_st, inp_attn->self_v_rot[il]);
         }
         ggml_build_forward_expand(gf, v_st);
         ggml_build_forward_expand(gf, k_st);
