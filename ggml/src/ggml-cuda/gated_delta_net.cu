@@ -52,6 +52,9 @@ gated_delta_net_cuda(const float * q,
                                      int64_t       sb1,
                                      int64_t       sb2,
                                      int64_t       sb3,
+                                     int64_t       sg1,
+                                     int64_t       sg2,
+                                     int64_t       sg3,
                                      const uint3   neqk1_magic,
                                      const uint3   rq3_magic,
                                      float         scale,
@@ -111,7 +114,8 @@ gated_delta_net_cuda(const float * q,
 
         const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
         const float * beta_t = beta + gb_offset;
-        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
+        // g has its own strides (a strided view of a merged beta|alpha matmul with fuse_in; = beta's otherwise)
+        const float * g_t    = g    + (KDA ? gb_offset * S_v : sequence * sg3 + t * sg2 + h_idx * sg1);
 
         const float beta_val = fuse_in ? ggml_cuda_op_sigmoid_single(*beta_t) : *beta_t;
 
@@ -226,6 +230,7 @@ struct gdn_fused_in_args {
     float         l2_eps   = 0.0f;
     float         l2_scale = 0.0f;
     int           l2_ncols = 0;
+    int64_t       sg1 = 0, sg2 = 0, sg3 = 0; // g strides in floats (non-KDA)
 };
 
 template <bool KDA, bool keep_rs_t, bool fuse_in>
@@ -262,7 +267,7 @@ static void launch_gated_delta_net(
         ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, true>, launch_params,
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
+            sb1, sb2, sb3, fin.sg1, fin.sg2, fin.sg3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
             fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
         return;
     }
@@ -271,21 +276,21 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
+                sb1, sb2, sb3, fin.sg1, fin.sg2, fin.sg3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
                 fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
+                sb1, sb2, sb3, fin.sg1, fin.sg2, fin.sg3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
                 fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
+                sb1, sb2, sb3, fin.sg1, fin.sg2, fin.sg3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
                 fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
             break;
         }
@@ -293,7 +298,7 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
+                sb1, sb2, sb3, fin.sg1, fin.sg2, fin.sg3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, state_ids, state_row_stride,
                 fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
             break;
         }
@@ -382,9 +387,11 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     gdn_fused_in_args fin;
     if (fuse_in) {
+        // alpha [H, n_tokens, n_seqs] and b [1, H, n_tokens, n_seqs] may be strided views (qwen4exp's merged beta|alpha matmul)
         GGML_ASSERT(!kda && S_v == 128 && neq0 == 128);
-        GGML_ASSERT(ggml_nelements(cache->alpha) == ggml_nelements(src_g) && ggml_is_contiguous(cache->alpha));
-        GGML_ASSERT(ggml_are_same_shape(cache->b, src_beta) && ggml_is_contiguous(cache->b));
+        GGML_ASSERT(ggml_nelements(cache->alpha) == ggml_nelements(src_g) && cache->alpha->nb[0] == sizeof(float) &&
+                    cache->alpha->ne[0] == H && cache->alpha->ne[1] == n_tokens && ggml_nrows(cache->alpha) == n_tokens * n_seqs);
+        GGML_ASSERT(ggml_are_same_shape(cache->b, src_beta) && cache->b->nb[0] == sizeof(float));
         fin.dt       = cache->dt;
         fin.A        = cache->A;
         fin.l2_eps   = cache->l2_eps;
@@ -420,9 +427,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int64_t sv1 = nbv1 / sizeof(float);
     const int64_t sv2 = nbv2 / sizeof(float);
     const int64_t sv3 = nbv3 / sizeof(float);
-    const int64_t sb1 = nbb1 / sizeof(float);
-    const int64_t sb2 = nbb2 / sizeof(float);
-    const int64_t sb3 = nbb3 / sizeof(float);
+    // with fuse_in, beta comes from b (maybe strided) and g from alpha with its own strides
+    const ggml_tensor * src_b = fuse_in ? cache->b : src_beta;
+    const int64_t sb1 = src_b->nb[1] / sizeof(float);
+    const int64_t sb2 = src_b->nb[2] / sizeof(float);
+    const int64_t sb3 = src_b->nb[3] / sizeof(float);
+    fin.sg1 = fuse_in ? 1                                  : sb1;
+    fin.sg2 = fuse_in ? cache->alpha->nb[1] / sizeof(float) : sb2;
+    fin.sg3 = fuse_in ? cache->alpha->nb[2] / sizeof(float) : sb3;
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
