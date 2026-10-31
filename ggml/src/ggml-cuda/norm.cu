@@ -798,18 +798,24 @@ static void rms_norm_mul_f32_cuda(const float *  x,
 }
 
 // silu(z) * (rms_norm(x) * w) for contiguous rows of ncols < 1024 (gated norm of the delta net output);
-// same order of operations as rms_norm_f32<256, true> followed by the fused silu + mul
-template <int block_size>
+// same order of operations as rms_norm_f32<256, true> followed by the fused silu + mul.
+// p100-series: sigmoid_gate = sigmoid(z) (qwen4exp's build_norm_gated); z may be strided (rows of x = [ne1, ne2, ne3] of z)
+template <int block_size, bool sigmoid_gate>
 static __global__ void rms_norm_mul_gated_f32(
-        const float * x, const float * w, const float * z, float * dst, const int ncols, const float eps) {
+        const float * x, const float * w, const float * z, float * dst, const int ncols, const float eps,
+        const int z_ne1, const int z_ne2, const int64_t z_s1, const int64_t z_s2, const int64_t z_s3) {
     ggml_cuda_pdl_lc();
     const int64_t row = blockIdx.x;
     const int     tid = threadIdx.x;
 
     __shared__ float s_sum[32];
 
+    const int64_t i1 = row % z_ne1;
+    const int64_t i2 = (row / z_ne1) % z_ne2;
+    const int64_t i3 = row / ((int64_t) z_ne1 * z_ne2);
+
     const float * xr = x   + row*ncols;
-    const float * zr = z   + row*ncols;
+    const float * zr = z   + i1*z_s1 + i2*z_s2 + i3*z_s3;
     float       * dr = dst + row*ncols;
 
     ggml_cuda_pdl_sync();
@@ -824,23 +830,32 @@ static __global__ void rms_norm_mul_gated_f32(
     const float scale = rsqrtf(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dr[col] = ggml_cuda_op_silu_single(zr[col]) * (scale * xr[col] * w[col]);
+        const float g = sigmoid_gate ? ggml_cuda_op_sigmoid_single(zr[col]) : ggml_cuda_op_silu_single(zr[col]);
+        dr[col] = g * (scale * xr[col] * w[col]);
     }
 }
 
 void ggml_cuda_op_rms_norm_mul_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * w,
-                                     const ggml_tensor * z, ggml_tensor * dst) {
+                                     const ggml_tensor * z, ggml_tensor * dst, bool sigmoid_gate) {
     const ggml_tensor * x = rms_norm->src[0];
     const int ncols = x->ne[0];
-    GGML_ASSERT(ncols < 1024 && ggml_is_contiguous(x) && ggml_is_contiguous(z) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ncols < 1024 && ggml_is_contiguous(x) && z->nb[0] == sizeof(float) && ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_are_same_shape(x, z) && ggml_are_same_shape(x, dst) && ggml_nelements(w) == ncols);
 
     float eps;
     memcpy(&eps, rms_norm->op_params, sizeof(float));
 
+    const int64_t zs1 = z->nb[1] / sizeof(float), zs2 = z->nb[2] / sizeof(float), zs3 = z->nb[3] / sizeof(float);
     const ggml_cuda_kernel_launch_params launch_params = { dim3(ggml_nrows(x)), dim3(256), 0, ctx.stream() };
-    ggml_cuda_kernel_launch(rms_norm_mul_gated_f32<256>, launch_params,
-        (const float *) x->data, (const float *) w->data, (const float *) z->data, (float *) dst->data, ncols, eps);
+    if (sigmoid_gate) {
+        ggml_cuda_kernel_launch(rms_norm_mul_gated_f32<256, true>, launch_params,
+            (const float *) x->data, (const float *) w->data, (const float *) z->data, (float *) dst->data, ncols, eps,
+            (int) z->ne[1], (int) z->ne[2], zs1, zs2, zs3);
+    } else {
+        ggml_cuda_kernel_launch(rms_norm_mul_gated_f32<256, false>, launch_params,
+            (const float *) x->data, (const float *) w->data, (const float *) z->data, (float *) dst->data, ncols, eps,
+            (int) z->ne[1], (int) z->ne[2], zs1, zs2, zs3);
+    }
 }
 
 static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {

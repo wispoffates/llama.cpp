@@ -693,6 +693,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     if (model.layers[il].wqkv_z) {
         // qkv and z read the same input: one matmul, then the qkv rows and the z rows
         ggml_tensor * qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
+        ggml_build_forward_expand(gf, qkvz);
         cb(qkvz, "linear_attn_qkvz", il);
 
         const int64_t n_z   = hparams.ssm_d_state * hparams.ssm_dt_rank;
@@ -708,10 +709,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     }
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_build_forward_expand(gf, qkv_mixed);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    ggml_build_forward_expand(gf, z);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -1142,6 +1145,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     if (model.layers[il].ssm_beta_alpha_cat) {
         // beta and alpha read the same input: one matmul, then the beta rows and the alpha rows
         ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
+        ggml_build_forward_expand(gf, ba);
         cb(ba, "beta_alpha", il);
 
         beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
@@ -1150,9 +1154,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
                 ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
     } else {
         beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+        ggml_build_forward_expand(gf, beta);
         beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
 
         alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        ggml_build_forward_expand(gf, alpha);
         alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     }
     cb(beta, "beta", il);
@@ -1182,15 +1188,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+
+    // keep the conv next to the conv state ops (backends can fuse them)
+    ggml_build_forward_expand(gf, conv_output_silu);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
@@ -1235,6 +1240,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    // read the state right before the delta net (backends can fuse the read into it)
+    ggml_build_forward_expand(gf, q_conv);
+    ggml_build_forward_expand(gf, k_conv);
+    ggml_build_forward_expand(gf, gate);
+    ggml_build_forward_expand(gf, beta);
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
