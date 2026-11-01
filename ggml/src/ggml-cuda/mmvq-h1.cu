@@ -5,6 +5,7 @@
 #include "mmvq.cuh"
 #include "ggml-impl.h"
 
+#include <atomic>
 #include <unordered_map>
 
 // q4_0 / q8_0 x f32 matvec for ONE column on Pascal, in fp16 (decode: dense matmuls and the one-token MUL_MAT_ID of MoE experts).
@@ -1810,6 +1811,21 @@ bool ggml_cuda_mmvq_h1s_glu_defer(ggml_backend_cuda_context & ctx, const ggml_cg
         const ggml_tensor * t = cgraph->nodes[j];
         if (t->op == GGML_OP_MUL_MAT_ID && t->src[1] == glu) {
             if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE) || !mmvq_h1s_ok(t->src[0], glu, t->src[2], t)) {
+                return false;
+            }
+            // the graph allocator saw the GLU as the last reader of a and b, so the matvec's dst may be placed over them; the deferred
+            // matvec reads a / b while it writes dst (blocks starting later read overwritten operands) -> run the GLU then (VFY 11-01:
+            // gemma4 3..8-token ubatches at 8K context under -sm tensor, KLD 0.038 -> 0.0006)
+            const auto overlaps = [](const ggml_tensor * x, const ggml_tensor * y) {
+                const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
+                const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
+                return x0 < y1 && y0 < x1;
+            };
+            if (overlaps(t, a) || overlaps(t, b)) {
+                static std::atomic<bool> told{false};
+                if (!told.exchange(true)) {
+                    GGML_LOG_WARN("%s: GLU kept as a launch: %s overlaps its operands\n", __func__, t->name);
+                }
                 return false;
             }
             ctx.h1s_glu = glu;
