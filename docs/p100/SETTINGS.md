@@ -17,6 +17,11 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   paths round differently, and which one ran depended on buffer placement, so output could depend on what a server had served before
   (Flash-Next's first request after a load). MoE prompt processing changes slightly (KL divergence neutral, qwen36 / ornith pp512
   +1.3-1.5 %); decode is unchanged. `GGML_CUDA_TOPK_MOE_STAGE=0` restores the old fallback.
+- Since v5.35, the decode chain of a gated-delta-net layer (qwen36, ornith, Swift, Flash-Next) runs in fewer kernels: the recurrent
+  state is read inside the GDN kernel, and where the graph matches, the conv-state update + conv + silu and the gated output norm are
+  fused too (Flash-Next, including the extra state copies MTP keeps for rollback). Outputs are bit-identical; decode +2-5 % on
+  qwen36 / ornith, Flash-Next verify pass -10 %. `GGML_CUDA_GDN_FUSE=0` switches the fusions off. IQ-type matvecs (Flash-Next's
+  experts) use Kane's sm_60 tuning (bit-identical, IQ kernel time -6 %).
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
