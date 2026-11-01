@@ -586,6 +586,22 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     }
 }
 
+// p100-series: fold the fp16 VKQ accumulator into an fp32 running sum once per KV tile (Kmic-68 / Kaden edc7980bf). The half2
+// accumulator otherwise sums the whole KV range in an 11-bit mantissa (error ~ sqrt(context)); the fold bounds each fp16 chain to
+// nbatch_fa products and costs one conversion per tile. GGML_CUDA_FA_TILE_FOLD: 0 = off, 1 = multi-row tiles (prefill / verify,
+// ncols1 > 1), 2 = every tile. Tiles with np > 1 keep the fp16 accumulator: their cross-warp combine reduces VKQ, not the fold.
+#ifndef GGML_CUDA_FA_TILE_FOLD
+#define GGML_CUDA_FA_TILE_FOLD 1
+#endif // GGML_CUDA_FA_TILE_FOLD
+template <int ncols1, int np>
+static constexpr __device__ bool flash_attn_tile_fold() {
+#ifdef FAST_FP16_AVAILABLE
+    return np == 1 && (GGML_CUDA_FA_TILE_FOLD == 2 || (GGML_CUDA_FA_TILE_FOLD == 1 && ncols1 > 1));
+#else
+    return false; // the fp32 path already accumulates in fp32
+#endif // FAST_FP16_AVAILABLE
+}
+
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
     bool use_logit_softcap, bool oob_check, bool sparse, typename T_vec_dot, typename T_KQ, typename T_acc>
@@ -604,7 +620,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const int stride_mask,
         float * const KQ_max,
         float * const KQ_sum,
-        T_acc * const VKQ,
+        T_acc  * const VKQ,
+        float2 * const VKQ_f,
         const int k_VKQ_0,
         const int k_VKQ_max,
         const int col_Q_0,
@@ -615,6 +632,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int ncols = ncols1*ncols2;
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
+    constexpr bool fold = flash_attn_tile_fold<ncols1, np>();
 
     constexpr int DVp = (DV + 2*warp_size - 1) & ~(2*warp_size - 1); // DV padded to multiple of 2*warp_size.
 
@@ -725,6 +743,10 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
                 VKQ[jc*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                if constexpr (fold) {
+                    VKQ_f[jc*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
+                    VKQ_f[jc*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
+                }
             }
 #else
 #pragma unroll
@@ -849,6 +871,17 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
         __syncthreads();
     }
+
+    if constexpr (fold) {
+        // Fold this tile's half2 partial sums into the fp32 running sum and restart the fp16 chain.
+#pragma unroll
+        for (int i = 0; i < cpw*((DVp/2)/warp_size); ++i) {
+            const float2 p = __half22float2(VKQ[i]);
+            VKQ_f[i].x += p.x;
+            VKQ_f[i].y += p.y;
+            VKQ[i] = make_half2(0.0f, 0.0f);
+        }
+    }
 }
 
 // p100-series: true if every mask entry of the KV tile [k_VKQ_0, min(k_VKQ_0 + nbatch_fa, k_VKQ_sup)) is -inf for the ncols1
@@ -957,6 +990,7 @@ static __global__ void flash_attn_tile(
 
     constexpr int cpw = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp.
     constexpr int np  = nwarps > ncols ? nwarps/ncols : 1; // Number of parallel warps per Q column.
+    constexpr bool fold = flash_attn_tile_fold<ncols1, np>();
     static_assert(cpw == 1 || np == 1, "bad cpw / np");
     static_assert(nbatch_fa % (np*warp_size) == 0, "nbatch_fa % (np*warp_size) != 0");
 
@@ -973,11 +1007,13 @@ static __global__ void flash_attn_tile(
     __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
     __shared__ half  KQ[ncols * nbatch_fa];
     __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
+    __align__(16) float2 VKQ_f[fold ? cpw * ((DVp/2)/warp_size) : 1] = {{0.0f, 0.0f}}; // fp32 running sum (fold only)
 #else
     __shared__ float Q_tmp[ncols * DKQ];
     __shared__ float KV_tmp[nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV];
     __shared__ float KQ[ncols * nbatch_fa];
     __align__(16) float2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
+    float2 * const VKQ_f = VKQ; // unused: fold is off on the fp32 path
 #endif // FAST_FP16_AVAILABLE
 
     float KQ_max[cpw];
@@ -1063,7 +1099,7 @@ static __global__ void flash_attn_tile(
             if (!masked_out(k_VKQ_0)) {
                 flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, sparse>
                     (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, sidx);
+                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f, k_VKQ_0, k_VKQ_max, col_Q_0, sidx);
             }
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
@@ -1071,7 +1107,7 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, sparse>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, sidx);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f, k_VKQ_0, k_VKQ_max, col_Q_0, sidx);
         }
     } else {
         // Branch without out-of-bounds checks.
@@ -1082,7 +1118,7 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, sparse>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, sidx);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f, k_VKQ_0, k_VKQ_max, col_Q_0, sidx);
         }
     }
 
@@ -1172,10 +1208,18 @@ static __global__ void flash_attn_tile(
             KQ_sum[jc0] = KQ_sum[jc0]*KQ_max_scale + val;
 
 #ifdef FAST_FP16_AVAILABLE
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+            if constexpr (fold) { // the last tile was folded: VKQ is zero, the sum lives in VKQ_f
 #pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                    VKQ_f[jc0*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
+                    VKQ_f[jc0*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
+                }
+            } else {
+                const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
+#pragma unroll
+                for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+                    VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                }
             }
 #else
 #pragma unroll
@@ -1210,7 +1254,11 @@ static __global__ void flash_attn_tile(
             __align__(16) float2 tmp[cpy_ne_D];
 #pragma unroll
             for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
-                tmp[i1] = __half22float2(VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size + i1]);
+                if constexpr (fold) {
+                    tmp[i1] = VKQ_f[jc0*((DVp/2)/warp_size) + i0/warp_size + i1];
+                } else {
+                    tmp[i1] = __half22float2(VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size + i1]);
+                }
                 tmp[i1].x *= scale;
                 tmp[i1].y *= scale;
             }
