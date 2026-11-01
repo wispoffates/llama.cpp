@@ -12,6 +12,7 @@ Commits written by the maintainer with AI help carry an `Assisted-by:` trailer.
 | [Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp) `p100-optimizations` (Kaden) | the sm_60 matvec rebuild (staged activations, vdr/geometry, cached q8_1 activation), fp16 Q6_K verify matvecs, cuBLAS ALGO6 prefill, the sampler top-k prefilter, MTP catch-up and q4_0 draft head -- split into individual commits authored by Kaden, each linking its original | MIT |
 | [Keoian](https://github.com/Keoian), contributions to Kmic-68/llama.cpp (PRs #7, #8, #14, #16) | repetition penalties visiting only the window's tokens, LoRA adapters under `-sm tensor`, keeping the just-restored checkpoint, no prompt split at the last user message (cherry-picked with their authorship), and the MTP hidden-row-by-position fix (ported to upstream's drafter, co-authored) | MIT |
 | [qr0n/p100-llama-cpp](https://github.com/qr0n/p100-llama-cpp) | GP100 fp16 matvec (patches 0007, 0008), recurrent-state clear with fill (0014), activation buffer sizing (0017) | MIT |
+| [KaneQuah/p100-optimization-q8](https://github.com/KaneQuah/p100-optimization-q8) (Kane) | the fused gated-delta-net decode chain (extended here to Flash-Next and MTP rollback slots) and the sm_60 IQ matvec tuning, cherry-picked with their authorship | MIT |
 | [lich-77/llama.cpp](https://github.com/lich-77/llama.cpp) | GPU-resident MoE expert LRU cache and its tensor-split support (the base of our expert cache) | MIT |
 | [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp) | meta-backend offload of host-weight ops and split-aware expert copies | MIT |
 | drrros, [ggml-org/llama.cpp#29963](https://github.com/ggml-org/llama.cpp/pull/29963) | pipeline parallelism with MoE experts in host memory | MIT |
@@ -30,7 +31,7 @@ Commits written by the maintainer with AI help carry an `Assisted-by:` trailer.
 ## Projects we watch
 
 Checked at every upstream sync for patches worth testing on Pascal:
-[Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp), [qr0n/p100-llama-cpp](https://github.com/qr0n/p100-llama-cpp),
+[Kmic-68/llama.cpp](https://github.com/Kmic-68/llama.cpp), [KaneQuah/p100-optimization-q8](https://github.com/KaneQuah/p100-optimization-q8), [qr0n/p100-llama-cpp](https://github.com/qr0n/p100-llama-cpp),
 [shinbunbun/llama-cpp-p100-patches](https://github.com/shinbunbun/llama-cpp-p100-patches), [poisonxa16/pxa](https://github.com/poisonxa16/pxa),
 [ikawrakow/ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), [spiritbuun/buun-llama-cpp](https://github.com/spiritbuun/buun-llama-cpp),
 [ifm-ai/llama.cpp](https://github.com/ifm-ai/llama.cpp) (K2 Horizon), [thefallentree/llama.cpp-gp100](https://github.com/thefallentree/llama.cpp-gp100),
