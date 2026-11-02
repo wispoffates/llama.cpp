@@ -1821,7 +1821,9 @@ bool ggml_cuda_mmvq_h1s_glu_defer(ggml_backend_cuda_context & ctx, const ggml_cg
                 const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
                 return x0 < y1 && y0 < x1;
             };
-            if (overlaps(t, a) || overlaps(t, b)) {
+            // GGML_CUDA_H1S_GUARD=0 (debug only): skip the check -- reproduces the v5.33-v5.35 bug to validate GGML_ALLOC_NO_REUSE audits
+            static const bool guard = [] { const char * e = getenv("GGML_CUDA_H1S_GUARD"); return !e || atoi(e) != 0; }();
+            if (guard && (overlaps(t, a) || overlaps(t, b))) {
                 static std::atomic<bool> told{false};
                 if (!told.exchange(true)) {
                     GGML_LOG_WARN("%s: GLU kept as a launch: %s overlaps its operands\n", __func__, t->name);
