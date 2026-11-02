@@ -30,6 +30,15 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   the graph allocator placed the matvec's output over the GLU's inputs; before, 2..8-token batches at long context could read
   overwritten activations (gemma4 8K `-ub 4` KL divergence 0.038 -> 0.0006). The server log names the node once
   (`GLU kept as a launch: ... overlaps its operands`). `GGML_CUDA_MMVQ_H1S_GLU=0` disables the deferral entirely.
+- Since v5.37, dense q6_K matvecs with 6..8 columns (Swift / glimmer verify batches of 6..8 tokens, n-gram drafts) run on the fp16
+  path like 1..5 columns, instead of the integer path with 8-bit activations: KL divergence of those batches 0.00028 -> 0.000002
+  against full precision, speed equal or better. `GGML_CUDA_MMVQ_F16_MAXCOLS=5` restores the old routing.
+- Since v5.37, MoE matmuls that go through MMQ (nemotron) size their tile by the tokens each expert sees, not the whole batch (Kane's
+  change, as RDNA3/4 already did): nemotron prompt processing +28 %, outputs identical. `GGML_CUDA_MMQ_MOE_TPE=0` switches it off.
+- Debugging aid since v5.37: `GGML_ALLOC_NO_REUSE=2` makes the graph allocator free nothing (`=1` also skips in-place reuse). A
+  correct backend gives the same logits either way; a fused or deferred kernel that reads memory the allocator already handed to
+  another tensor does not. It costs memory -- for tests, not serving. `GGML_CUDA_H1S_GUARD=0` turns off the v5.36 overlap check, to
+  reproduce that bug.
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
