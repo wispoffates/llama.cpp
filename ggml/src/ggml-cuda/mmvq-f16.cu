@@ -2,7 +2,7 @@
 
 #include <unordered_map>
 
-// q6_K x f32 matvec for 1..5 columns on Pascal, in fp16 with short chains folded into fp32.
+// q6_K x f32 matvec for 1..8 columns on Pascal, in fp16 with short chains folded into fp32.
 //
 // The integer path (mmvq.cu) is ALU-bound here: sm_60 has no DP4A, and its emulation costs ~2.2
 // instructions per multiply-add. This path converts each weight pair to fp16 once (PRMT, HSUB2,
@@ -331,13 +331,16 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // serving (Swift MTP, ornith), decode KLD vs the F32 reference: Swift 0.000236 -> 0.000004, ornith (12 chunks) 0.00961 -> 0.00630.
     // GGML_CUDA_MMVQ_F16_1COL=0 restores the integer path for one column.
     static const bool one_col = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_1COL"); return !s || atoi(s) != 0; }();
+    // 6..8 columns (p100-series 11-02, phase SWB): Swift's 6..8-token verify batches went to the integer path (q8_1 activations):
+    // KLD 0.00028 vs the F32 reference at 1K where 4 tokens give 0.000002. GGML_CUDA_MMVQ_F16_MAXCOLS=5 restores that routing.
+    static const int max_cols = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_MAXCOLS"); return s ? std::max(1, std::min(atoi(s), 8)) : 8; }();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int64_t K = src0->ne[0], rows = src0->ne[1];
     // Where it measured faster than the integer path (OPTLOG 206), test-backend-ops at 5 columns, rows x K:
     // 8704x5120 154 -> 133 us, 6144x5120 115 -> 97, 5120x5120 98 -> 89, 3072x5120 67 -> 61,
     // 5120x8704 161 -> 146, 5120x3072 61 -> 57. K must hold an even number of q6_K blocks.
     if (!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || src0->type != GGML_TYPE_Q6_K ||
-            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < (one_col ? 1 : 2) || ncols > 5 ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < (one_col ? 1 : 2) || ncols > max_cols ||
             K % 256 != 0 || rows < min_rows || ((K/256) % 2 != 0 && rows < 256) || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src0->nb[1] != (size_t) (K/256)*210 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
             (src1->nb[1] % 16) != 0 || ((uintptr_t) src1->data % 16) != 0 || ((uintptr_t) src0->data % 4) != 0) {
@@ -394,12 +397,25 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
         const int g = KS ? (int) ((rows + RPW - 1)/RPW) : (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
         auto go = [&](auto odd_tag) {
             constexpr bool O = decltype(odd_tag)::value && !KS && RPW % 2 == 0;
+            // the 2 warps x 4 rows shapes only ever see 1..5 columns (6..8 launch 1 warp x 2 rows, below): no 6..8 instances there
+            constexpr bool WIDE = !(NWT == MMVQ_F16_NW && RPW == MMVQ_F16_RPW);
             switch (ncols) {
                 case 1:  mmvq_f16_q6_K<1, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                 case 2:  mmvq_f16_q6_K<2, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                 case 3:  mmvq_f16_q6_K<3, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
                 case 4:  mmvq_f16_q6_K<4, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
-                default: mmvq_f16_q6_K<5, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                case 5:  mmvq_f16_q6_K<5, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                default:
+                    if constexpr (WIDE) {
+                        switch (ncols) {
+                            case 6:  mmvq_f16_q6_K<6, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                            case 7:  mmvq_f16_q6_K<7, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                            default: mmvq_f16_q6_K<8, RPW, NWT, KS, MINB, O><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr, sc_ptr, Y, sy, (int) rows, (int) K); break;
+                        }
+                    } else {
+                        GGML_ABORT("mmvq_f16: %d columns in the 2 x 4 shape", (int) ncols);
+                    }
+                    break;
             }
         };
         if (odd) {
@@ -415,7 +431,9 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // block, wins the same way in the model only). Per-row arithmetic is unchanged: bit-identical. GGML_CUDA_MMVQ_F16_BIG1=0 restores
     // 2 warps x 4 rows.
     static const bool big1 = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_BIG1"); return !s || atoi(s) != 0; }();
-    if (rows >= 3072 && ncols == 1 && big1) {
+    // 6..8 columns at >= 3072 rows: the 2 warps x 4 rows shapes spill (cuobjdump: 24..232 bytes of stack at 6..8 columns under
+    // MINB 6 / 7); one warp of 2 rows per block (MINB 16) holds 6..8 columns in 128 registers without spilling.
+    if (rows >= 3072 && (ncols >= 6 || (ncols == 1 && big1))) {
         launch(std::integral_constant<int, 2>{}, I{}, std::false_type{}, std::integral_constant<int, 16>{});
         CUDA_CHECK(cudaGetLastError());
         return true;
