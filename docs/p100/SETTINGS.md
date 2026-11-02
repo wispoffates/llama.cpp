@@ -22,6 +22,14 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   fused too (Flash-Next, including the extra state copies MTP keeps for rollback). Outputs are bit-identical; decode +2-5 % on
   qwen36 / ornith, Flash-Next verify pass -10 %. `GGML_CUDA_GDN_FUSE=0` switches the fusions off. IQ-type matvecs (Flash-Next's
   experts) use Kane's sm_60 tuning (bit-identical, IQ kernel time -6 %).
+- Since v5.36, the tile flash-attention kernel adds its fp16 output accumulator into an fp32 sum after every KV tile (Kaden's fold
+  from Kmic-68's fork) for multi-row tiles, i.e. prompt processing. Prefill is closer to full precision (gemma4 KL divergence -20 %
+  at 16 x 1K, -35 % at 8K, `-ub 1536`); decode and verify are bit-identical; prefill speed -0.3 % (-0.9 % at 16K depth). Long-prompt
+  outputs change slightly. Build switch `GGML_CUDA_FA_TILE_FOLD` (0 off, 1 multi-row tiles = default, 2 every tile).
+- Since v5.36, the deferred GLU of gemma4's short expert matvecs (v5.19, multi-token since v5.33) is kept as a separate launch when
+  the graph allocator placed the matvec's output over the GLU's inputs; before, 2..8-token batches at long context could read
+  overwritten activations (gemma4 8K `-ub 4` KL divergence 0.038 -> 0.0006). The server log names the node once
+  (`GLU kept as a launch: ... overlaps its operands`). `GGML_CUDA_MMVQ_H1S_GLU=0` disables the deferral entirely.
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
