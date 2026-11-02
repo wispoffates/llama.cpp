@@ -597,7 +597,26 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor 
 }
 
 // free the extra space at the end if the new tensor is smaller
+// p100-series (11-02): GGML_ALLOC_NO_REUSE is an audit mode. 2 = no frees (in-place reuse of a parent stays), 1 = no frees and no
+// in-place reuse. Either way no tensor gets bytes the allocator freed from a dead tensor, so a correct backend matches the normal
+// run; a fused or deferred kernel that still reads an operand the graph says is dead (the v5.33-v5.35 h1s GLU bug) differs.
+// Mode 2 keeps the exact op paths (in-place ops can take different kernels -> mode 1 differs by rounding). Costs memory.
+static int ggml_gallocr_no_reuse(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("GGML_ALLOC_NO_REUSE");
+        v = e ? atoi(e) : 0;
+        if (v) {
+            GGML_LOG_WARN("%s: GGML_ALLOC_NO_REUSE=%d: graph allocator audit mode (no frees%s)\n", __func__, v, v == 1 ? ", no in-place reuse" : "");
+        }
+    }
+    return v;
+}
+
 static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
+    if (ggml_gallocr_no_reuse() != 0) {
+        return; // audit modes free nothing
+    }
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
     struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
 
@@ -620,21 +639,6 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
     }
 }
 
-// p100-series (11-02): GGML_ALLOC_NO_REUSE=1 is an audit mode: no in-place reuse of a parent and no freeing, so no tensor ever
-// shares bytes with a tensor the allocator considers dead. A correct backend gives bit-identical results either way; a fused or
-// deferred kernel that still reads an operand the graph says is dead (the v5.33-v5.35 h1s GLU bug) differs. Costs memory.
-static bool ggml_gallocr_no_reuse(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char * e = getenv("GGML_ALLOC_NO_REUSE");
-        v = e && atoi(e) != 0;
-        if (v) {
-            GGML_LOG_WARN("%s: GGML_ALLOC_NO_REUSE=1: graph allocator audit mode (no reuse, no free)\n", __func__);
-        }
-    }
-    return v != 0;
-}
-
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
@@ -644,7 +648,7 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         assert(hn->addr.offset == 0);
 
         // try to reuse a parent's buffer (inplace)
-        if (ggml_op_can_inplace(node->op) && !ggml_gallocr_no_reuse()) {
+        if (ggml_op_can_inplace(node->op) && ggml_gallocr_no_reuse() != 1) {
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 struct ggml_tensor * parent = node->src[i];
                 if (parent == NULL) {
@@ -704,8 +708,8 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
 }
 
 static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * node) {
-    // graph outputs are never freed; nothing is in the GGML_ALLOC_NO_REUSE audit mode
-    if (node->flags & GGML_TENSOR_FLAG_OUTPUT || ggml_gallocr_no_reuse()) {
+    // graph outputs are never freed; nothing is in the GGML_ALLOC_NO_REUSE audit modes
+    if (node->flags & GGML_TENSOR_FLAG_OUTPUT || ggml_gallocr_no_reuse() != 0) {
         AT_PRINTF("not freeing output %s\n", node->name);
         return;
     }
