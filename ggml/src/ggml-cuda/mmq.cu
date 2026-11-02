@@ -248,8 +248,10 @@ void ggml_cuda_mul_mat_q(
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
             // On RDNA3, RDNA4 and NVIDIA without dp4a (sm_60) it is faster to pick the tile size against this value instead of ne12.
+            // p100-series: GGML_CUDA_MMQ_MOE_TPE=0 sizes the sm_60 tile against ne12 again (A/B in one binary)
+            static const bool tpe_sm60 = [] { const char * e = getenv("GGML_CUDA_MMQ_MOE_TPE"); return !e || atoi(e) != 0; }();
             if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4_M(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
-                    (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A)) {
+                    (tpe_sm60 && GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
             }
         }
