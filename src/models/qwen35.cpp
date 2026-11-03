@@ -247,8 +247,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
+    // p100-series: the input matmuls go into the graph first, so the conv-state, GDN pre-op and gated-norm chains stay adjacent
+    // (backends fuse them; as in qwen4exp)
     if (model.layers[il].wqkv_z) {
         ggml_tensor * qkvz = build_lora_mm(model.layers[il].wqkv_z, input);
+        ggml_build_forward_expand(gf, qkvz);
         cb(qkvz, "linear_attn_qkvz", il);
 
         const int64_t n_z   = hparams.ssm_d_state * hparams.ssm_dt_rank;
@@ -264,10 +267,12 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     }
 
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_build_forward_expand(gf, qkv_mixed);
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
 
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    ggml_build_forward_expand(gf, z);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -382,6 +387,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * alpha = nullptr;
     if (model.layers[il].ssm_beta_alpha_cat) {
         ggml_tensor * ba = build_lora_mm(model.layers[il].ssm_beta_alpha_cat, cur);
+        ggml_build_forward_expand(gf, ba);
         cb(ba, "beta_alpha", il);
 
         beta  = ggml_view_4d(ctx0, ba, 1, num_v_heads, n_seq_tokens, n_seqs,
@@ -390,9 +396,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
                 ba->nb[1], ba->nb[1] * n_seq_tokens, ggml_row_size(ba->type, num_v_heads));
     } else {
         beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+        ggml_build_forward_expand(gf, beta);
         beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
 
         alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+        ggml_build_forward_expand(gf, alpha);
         alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     }
     cb(beta, "beta", il);
