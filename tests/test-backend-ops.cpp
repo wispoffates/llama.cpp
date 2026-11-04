@@ -5300,7 +5300,8 @@ struct test_gated_delta_net_cache_fusion : public test_case {
 // in the same node order, so the CUDA backend can fuse the chain; both caches are read at row `row` and written at row `head`.
 // p100-series: K rollback slots (slot s at row s * n_cells + head, [TAG_RECURRENT_ROLLBACK_SPLITS]: the conv state copy of slot s
 // ends s tokens earlier, the delta net writes min(n_t, K) snapshots); q4 = qwen4exp's layout: merged qkv|z and beta|alpha matmul
-// outputs read through strided views, the conv slot copies as cont + cpy with slot 0 first (qwen35: slot K-1 first), sigmoid gate
+// outputs read through strided views, the conv slot copies as cont + cpy with slot 0 first (qwen35: slot K-1 first), sigmoid gate;
+// sr = delta_net_base's store since #30878: one set_rows of min(n_t + 1, K) overlapping windows through rs_s_slot_rev
 struct test_gdn_decode_fusion : public test_case {
     const int64_t H_k;
     const int64_t H_v;
@@ -5311,6 +5312,7 @@ struct test_gdn_decode_fusion : public test_case {
     const int     head;
     const int     K;
     const bool    q4;
+    const bool    sr;
 
     std::vector<ggml_tensor *> conv_cpys;
     ggml_tensor * state_cpy = nullptr;
@@ -5332,12 +5334,12 @@ struct test_gdn_decode_fusion : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR9(H_k, H_v, S, n_t, n_seqs, row, head, K, q4);
+        return VARS_TO_STR10(H_k, H_v, S, n_t, n_seqs, row, head, K, q4, sr);
     }
 
     test_gdn_decode_fusion(int64_t H_k = 4, int64_t H_v = 12, int64_t S = 128, int64_t n_t = 1, int64_t n_seqs = 1,
-            int row = 1, int head = 1, int K = 1, bool q4 = false)
-        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head), K(K), q4(q4) {}
+            int row = 1, int head = 1, int K = 1, bool q4 = false, bool sr = false)
+        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head), K(K), q4(q4), sr(sr) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t nr = 2*H_k*S + H_v*S; // conv channels
@@ -5385,7 +5387,22 @@ struct test_gdn_decode_fusion : public test_case {
         // conv state: gather, append the new tokens, store d_conv - 1 columns per rollback slot, conv + silu
         ggml_tensor * conv_states = ggml_reshape_3d(ctx, ggml_get_rows(ctx, conv_cache, ids), d_conv - 1, nr, n_seqs);
         ggml_tensor * conv_input  = ggml_concat(ctx, conv_states, ggml_transpose(ctx, x), 0);
-        for (int k = 0; k < K; ++k) {
+        if (sr) {
+            const int64_t Kw = std::min<int64_t>(n_t + 1, K);
+            ggml_tensor * rev = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, Kw);
+            // K = 4 cases carry the scheduler's name for a host input copied to the backend (as in llama-server)
+            ggml_set_name(rev, K == 4 ? "CUDA0#rs_s_slot_rev#0" : "rs_s_slot_rev");
+            ggml_tensor * windows = ggml_view_4d(ctx, conv_input, d_conv - 1, Kw, nr, n_seqs,
+                    ggml_element_size(conv_input), conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, n_t - (Kw - 1)));
+            ggml_tensor * slots = ggml_view_4d(ctx, conv_cache, d_conv - 1, K, nr, n_seqs,
+                    n_cells*conv_cache->nb[1], ggml_row_size(conv_cache->type, d_conv - 1), conv_cache->nb[1], head*conv_cache->nb[1]);
+            ggml_tensor * set = ggml_set_rows(ctx, slots, windows, rev);
+            conv_cpys.push_back(set);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, set);
+            }
+        }
+        for (int k = 0; k < (sr ? 0 : K); ++k) {
             const int slot = q4 ? k : K - 1 - k;
             ggml_tensor * last = ggml_view_3d(ctx, conv_input, d_conv - 1, nr, n_seqs, conv_input->nb[1], conv_input->nb[2],
                     ggml_row_size(conv_input->type, std::max<int64_t>(0, n_t - slot)));
@@ -5455,6 +5472,12 @@ struct test_gdn_decode_fusion : public test_case {
                     data[i] = (row + i) % n_cells;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, n_seqs * sizeof(int32_t));
+            } else if (strstr(t->name, "rs_s_slot_rev") != nullptr) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int64_t i = 0; i < t->ne[0]; i++) {
+                    data[i] = (int32_t) (t->ne[0] - 1 - i);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
             } else if (strcmp(t->name, "A") == 0) {
                 init_tensor_uniform(t, -2.0f, -0.1f);
             } else if (strcmp(t->name, "ssm_cache") == 0) {
@@ -13265,6 +13288,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 4, 1, 0, 2, 4, /*q4=*/true));
     test_cases.emplace_back(new test_gdn_decode_fusion(8, 24, 128, 33, 1, 1, 1, 4, /*q4=*/true));
     test_cases.emplace_back(new test_gdn_decode_fusion(8, 24, 128, 4, /*n_seqs=*/2, 1, 0, 4, /*q4=*/true));
+    // qwen35 / qwen35moe rollback slots as delta_net_base stores them since #30878 (one set_rows): 1..5 tokens, K 2 / 4 (Swift MTP
+    // n_rs_seq 3), 2 sequences (not fused)
+    for (int K : {2, 4}) {
+        for (int n_t : {1, 2, 3, 4, 5}) {
+            test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, n_t, 1, /*row=*/1, /*head=*/0, K, /*q4=*/false, /*sr=*/true));
+        }
+    }
+    test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 1, 1, 2, 1, 4, false, true));
+    test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, 2, /*n_seqs=*/2, 1, 0, 4, false, true));
     for (std::array<int64_t, 4> ne : { std::array<int64_t, 4>{128, 12, 1, 1}, {128, 48, 7, 1}, {64, 16, 3, 2}, {256, 4, 2, 1}, {1000, 3, 1, 1}, {128, 32, 512, 1} }) {
         test_cases.emplace_back(new test_rms_norm_mul_gated(ne));
     }
