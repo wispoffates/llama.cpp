@@ -39,6 +39,10 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   correct backend gives the same logits either way; a fused or deferred kernel that reads memory the allocator already handed to
   another tensor does not. It costs memory -- for tests, not serving. `GGML_CUDA_H1S_GUARD=0` turns off the v5.36 overlap check, to
   reproduce that bug.
+- Since v5.38, the qwen35 / qwen35moe graphs (qwen36, ornith, Swift) add their q/k/v, gate, alpha and beta matmuls to the graph
+  right after building them, as qwen4exp already did. Before, ggml placed each matmul inside a chain the CUDA backend fuses, so the
+  conv-state, gated-delta-net input and gated-norm fusions never fired on these models. Same ops, outputs identical; decode qwen36
+  +8 %, ornith +10 %, Swift +3.4 %. `GGML_CUDA_GDN_FUSE=0` still switches the fusions off (and then matches v5.37 exactly).
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
