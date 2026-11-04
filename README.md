@@ -5,18 +5,18 @@
 > upstream commits and gated on real P100s (correctness, KL divergence, speed, serving) before each `p100-series-vX.Y` tag.
 > Other GPUs keep upstream's code paths.
 >
-> **Current release: [`p100-series-v5.37`](https://github.com/wispoffates/llama.cpp/releases/tag/p100-series-v5.37)** (on upstream [`3c809f443`](https://github.com/ggml-org/llama.cpp/commit/3c809f443), 2026-11-02).
+> **Current release: [`p100-series-v5.38`](https://github.com/wispoffates/llama.cpp/releases/tag/p100-series-v5.38)** (on upstream [`3c809f443`](https://github.com/ggml-org/llama.cpp/commit/3c809f443), 2026-11-04).
 >
 > - What's in it and how to build: [P100-SERIES.md](P100-SERIES.md)
 > - Measured gains, step by step vs stock llama.cpp (decode up to 1.7x, plus better accuracy): [docs/p100/PERFORMANCE.md](docs/p100/PERFORMANCE.md)
 > - Much of this builds on other people's work: [CREDITS.md](CREDITS.md)
 > - Contributing (AI-written PRs welcome here): [CONTRIBUTING.md](CONTRIBUTING.md)
 >
-> Who wrote the 220 code patches in `p100-series-v5.37` (git authorship; carried commits link their originals):
+> Who wrote the 221 code patches in `p100-series-v5.38` (git authorship; carried commits link their originals):
 >
 > | Author | Patches | What |
 > |---|---|---|
-> | [wispoffates](https://github.com/wispoffates) (maintainer, with Claude Code) | 172 | Pascal kernels, two-GPU tensor-split engine, expert cache, Flash-Next, checkpoint staging; 5 of them also credit [qr0n](https://github.com/qr0n/p100-llama-cpp), [buun](https://github.com/spiritbuun/buun-llama-cpp) or [Keoian](https://github.com/Keoian) as co-author / source |
+> | [wispoffates](https://github.com/wispoffates) (maintainer, with Claude Code) | 173 | Pascal kernels, two-GPU tensor-split engine, expert cache, Flash-Next, checkpoint staging; 5 of them also credit [qr0n](https://github.com/qr0n/p100-llama-cpp), [buun](https://github.com/spiritbuun/buun-llama-cpp) or [Keoian](https://github.com/Keoian) as co-author / source |
 > | Kaden ([Kmic-68](https://github.com/Kmic-68/llama.cpp)) | 33 | the original sm_60 matvec rebuild, fp16 Q6_K verify matvecs, cuBLAS ALGO6, sampler prefilter, fp32 fold of the tile-FA accumulator |
 > | [drrros](https://github.com/ggml-org/llama.cpp/pull/29963) | 5 | pipeline parallelism with MoE experts in host memory (upstream PR #29963) |
 > | [Keoian](https://github.com/Keoian) (via Kmic-68) | 4 | faster repetition penalties, LoRA under tensor split, cheaper chat-turn checkpoints |
