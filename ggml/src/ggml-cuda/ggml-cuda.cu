@@ -5078,7 +5078,18 @@ static bool ggml_cuda_same_or_disjoint(const ggml_tensor * a, const ggml_tensor 
 // one sequence: get_rows(conv state) -> concat(state, x^T) -> K x cpy(last columns -> cache slot) -> ssm_conv -> silu
 // runs as one kernel that reads and writes the cache rows directly (ggml_cuda_op_ssm_conv_state).
 // p100-series: K = n_rs_seq + 1 rollback slots (slot s ends s tokens earlier, [TAG_RECURRENT_ROLLBACK_SPLITS]); each slot copy may
-// go through a cont of its view (qwen4exp's build_conv_state_at); x may be a strided view (qwen4exp's merged qkv|z matmul)
+// go through a cont of its view (qwen4exp's build_conv_state_at); x may be a strided view (qwen4exp's merged qkv|z matmul); since #30878 qwen35's
+// slots arrive as one set_rows over overlapping windows instead (matched below)
+// rs_s_slot_rev is a host input: the scheduler hands the CUDA graph its copy, named "<backend>#rs_s_slot_rev#<n>"
+static bool ggml_cuda_is_slot_rev(const ggml_tensor * t) {
+    const char * p = strstr(t->name, "rs_s_slot_rev");
+    if (p == nullptr) {
+        return false;
+    }
+    const char e = p[strlen("rs_s_slot_rev")];
+    return (p == t->name && e == '\0') || (p > t->name && p[-1] == '#' && e == '#');
+}
+
 static int ggml_cuda_try_ssm_conv_state_fusion(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     constexpr int max_slots = 8;
     const ggml_tensor * rows = cgraph->nodes[i];
@@ -5148,6 +5159,33 @@ static int ggml_cuda_try_ssm_conv_state_fusion(ggml_backend_cuda_context * cuda_
         K++;
         j += cont ? 2 : 1;
     }
+    // delta_net_base's build_conv_state with rollback slots (#30878): one set_rows(slots, windows, rs_s_slot_rev) instead of the
+    // copies. windows = Kw overlapping (one element apart) views of concat starting at column n_t - (Kw - 1), Kw = min(n_t + 1, K);
+    // rs_s_slot_rev = {Kw - 1, ..., 0} (filled on the host; the graph sees the scheduler's copy), so slot s gets the columns starting
+    // at n_t - s; slots >= Kw are not written. Matched as Kw slots, which the kernel writes the same way.
+    if (K == 0 && j < n_idx && cgraph->nodes[idx[j]]->op == GGML_OP_SET_ROWS) {
+        const ggml_tensor * sr   = cgraph->nodes[idx[j]];
+        const ggml_tensor * win  = sr->src[0];
+        const ggml_tensor * rev  = sr->src[1];
+        const int64_t       Kw   = win->ne[1];
+        const size_t        rowb = (size_t) (nc - 1) * nr * sizeof(float);
+        if (sr->type != GGML_TYPE_F32 || sr->view_src != cache || sr->ne[0] != nc - 1 || sr->ne[1] < Kw || sr->ne[2] != nr ||
+            sr->ne[3] != 1 || sr->nb[0] != sizeof(float) || sr->nb[2] != (size_t) (nc - 1) * sizeof(float) ||
+            sr->nb[1] % sizeof(float) != 0 || sr->nb[1] < rowb ||
+            win->view_src != concat || win->type != GGML_TYPE_F32 || win->ne[0] != nc - 1 || win->ne[2] != nr || win->ne[3] != 1 ||
+            win->nb[0] != sizeof(float) || win->nb[1] != sizeof(float) || win->nb[2] != concat->nb[1] ||
+            Kw < 1 || Kw > max_slots || Kw != std::min<int64_t>(n_t + 1, sr->ne[1]) ||
+            win->view_offs != (size_t) (n_t - (Kw - 1)) * sizeof(float) ||
+            rev->type != GGML_TYPE_I32 || ggml_nelements(rev) != Kw || !ggml_cuda_is_slot_rev(rev)) {
+            return 0;
+        }
+        for (int k = 0; k < Kw; ++k) {
+            offs[k] = (size_t) (n_t - k) * sizeof(float);
+            dsts[k] = (float *) ((char *) sr->data + k * sr->nb[1]);
+        }
+        K = (int) Kw;
+        j += 1;
+    }
     if (K == 0 || j + 1 >= n_idx) {
         return 0;
     }
@@ -5190,9 +5228,9 @@ static int ggml_cuda_try_ssm_conv_state_fusion(ggml_backend_cuda_context * cuda_
         return 0;
     }
 
-    // the skipped nodes must not be used outside of the matched nodes (the cpys write the cache and have no users)
+    // the skipped nodes must not be used outside of the matched nodes (the cpys / set_rows write the cache and have no users)
     for (int jj = i; jj < last_idx; ++jj) {
-        if (cgraph->nodes[jj]->op == GGML_OP_CPY) {
+        if (cgraph->nodes[jj]->op == GGML_OP_CPY || cgraph->nodes[jj]->op == GGML_OP_SET_ROWS) {
             continue;
         }
         if (!ggml_cuda_uses_within(cgraph, jj, i + 1, last_idx)) {
