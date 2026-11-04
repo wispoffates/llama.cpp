@@ -43,6 +43,10 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   right after building them, as qwen4exp already did. Before, ggml placed each matmul inside a chain the CUDA backend fuses, so the
   conv-state, gated-delta-net input and gated-norm fusions never fired on these models. Same ops, outputs identical; decode qwen36
   +8 %, ornith +10 %, Swift +3.4 %. `GGML_CUDA_GDN_FUSE=0` still switches the fusions off (and then matches v5.37 exactly).
+- Since v5.39 (upstream `bbb02c93e`), qwen35 / qwen35moe servers that draft (MTP or n-gram: all Swift entries) save the conv
+  state's rollback slots with one `set_rows`; the conv-state fusion matches that form too, so it still fires. Upstream's Q8_1
+  quantization now stores the block sum of the rounded values (#31247): nemotron's KL divergence against full-F32 references drops
+  25-37 % and its outputs change; every other production model gives identical outputs.
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
