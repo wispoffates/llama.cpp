@@ -13354,9 +13354,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 8704, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 5120, n, 6144, {1, 1}, {1, 1}));
         }
-
-    for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
-        test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
     }
 
     // Swift (27B dense, tensor split) MTP verify = 4 columns (3 drafts + 1), also 1/2/3/8. Per-GPU shapes: ffn_gate/up 5120 -> 8704,
@@ -13412,6 +13409,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 256, 8, true, false, true, false, {1, 1}));
     }
+
+
+    for (float n : {128.0f, 4096.0f, 32768.0f, 1048576.0f}) {
+        test_cases.emplace_back(new test_arange(GGML_TYPE_F32, 0.0f, n, 1.0f));
+    }
+
+    // delta-net conv input: conv state followed by the transposed qkv of the ubatch
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 8192, 1, 1}, 512, 0, 16));
 
     // LoRA at prefill: B is [rank, n_out], so K = rank
     for (int64_t k : {16, 32, 48, 64}) {
