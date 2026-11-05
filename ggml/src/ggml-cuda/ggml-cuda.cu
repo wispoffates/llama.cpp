@@ -5138,6 +5138,32 @@ static bool ggml_cuda_is_slot_rev(const ggml_tensor * t) {
     return (p == t->name && e == '\0') || (p > t->name && p[-1] == '#' && e == '#');
 }
 
+// since #31660 build_conv_state_store builds the slot order in the graph, per conv layer:
+// rev = view_1d(cast_i32(scale_bias(arange(0, K, 1), -1, K - 1)), Kw at offset K - Kw) = {Kw - 1, ..., 0}.
+// On a match, chain = the arange / scale / cast nodes behind rev.
+static bool ggml_cuda_is_slot_order(const ggml_tensor * rev, int64_t K, int64_t Kw, const ggml_tensor * chain[3]) {
+    const ggml_tensor * cast = rev->view_src;
+    if (rev->op != GGML_OP_VIEW || cast == nullptr || rev->src[0] != cast || rev->type != GGML_TYPE_I32 || ggml_nelements(rev) != Kw ||
+        rev->view_offs != (size_t) (K - Kw) * sizeof(int32_t) ||
+        cast->op != GGML_OP_CPY || cast->type != GGML_TYPE_I32 || !ggml_is_contiguous(cast) || ggml_nelements(cast) != K) {
+        return false;
+    }
+    const ggml_tensor * scale = cast->src[0];
+    if (scale->op != GGML_OP_SCALE || scale->type != GGML_TYPE_F32 || ggml_nelements(scale) != K ||
+        ggml_get_op_params_f32(scale, 0) != -1.0f || ggml_get_op_params_f32(scale, 1) != (float) (K - 1)) {
+        return false;
+    }
+    const ggml_tensor * ar = scale->src[0];
+    if (ar->op != GGML_OP_ARANGE || ar->type != GGML_TYPE_F32 || ggml_nelements(ar) != K ||
+        ggml_get_op_params_f32(ar, 0) != 0.0f || ggml_get_op_params_f32(ar, 1) != (float) K || ggml_get_op_params_f32(ar, 2) != 1.0f) {
+        return false;
+    }
+    chain[0] = ar;
+    chain[1] = scale;
+    chain[2] = cast;
+    return true;
+}
+
 static int ggml_cuda_try_ssm_conv_state_fusion(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     constexpr int max_slots = 8;
     const ggml_tensor * rows = cgraph->nodes[i];
@@ -5211,8 +5237,15 @@ static int ggml_cuda_try_ssm_conv_state_fusion(ggml_backend_cuda_context * cuda_
     // copies. windows = Kw overlapping (one element apart) views of concat starting at column n_t - (Kw - 1), Kw = min(n_t + 1, K);
     // rs_s_slot_rev = {Kw - 1, ..., 0} (filled on the host; the graph sees the scheduler's copy), so slot s gets the columns starting
     // at n_t - s; slots >= Kw are not written. Matched as Kw slots, which the kernel writes the same way.
-    if (K == 0 && j < n_idx && cgraph->nodes[idx[j]]->op == GGML_OP_SET_ROWS) {
-        const ggml_tensor * sr   = cgraph->nodes[idx[j]];
+    // Since #31660 every rollback arch (qwen4exp too) stores this way with Kw = min(n_t, K), and rev is built in the graph right
+    // before the set_rows (arange -> scale_bias -> cast, see ggml_cuda_is_slot_order); those nodes only feed rev and are skipped.
+    const ggml_tensor * chain[3] = { nullptr, nullptr, nullptr };
+    int n_chain = 0;
+    if (K == 0 && j + 3 < n_idx && cgraph->nodes[idx[j]]->op == GGML_OP_ARANGE && cgraph->nodes[idx[j + 3]]->op == GGML_OP_SET_ROWS) {
+        n_chain = 3;
+    }
+    if (K == 0 && j + n_chain < n_idx && cgraph->nodes[idx[j + n_chain]]->op == GGML_OP_SET_ROWS) {
+        const ggml_tensor * sr   = cgraph->nodes[idx[j + n_chain]];
         const ggml_tensor * win  = sr->src[0];
         const ggml_tensor * rev  = sr->src[1];
         const int64_t       Kw   = win->ne[1];
@@ -5222,9 +5255,18 @@ static int ggml_cuda_try_ssm_conv_state_fusion(ggml_backend_cuda_context * cuda_
             sr->nb[1] % sizeof(float) != 0 || sr->nb[1] < rowb ||
             win->view_src != concat || win->type != GGML_TYPE_F32 || win->ne[0] != nc - 1 || win->ne[2] != nr || win->ne[3] != 1 ||
             win->nb[0] != sizeof(float) || win->nb[1] != sizeof(float) || win->nb[2] != concat->nb[1] ||
-            Kw < 1 || Kw > max_slots || Kw != std::min<int64_t>(n_t + 1, sr->ne[1]) ||
-            win->view_offs != (size_t) (n_t - (Kw - 1)) * sizeof(float) ||
-            rev->type != GGML_TYPE_I32 || ggml_nelements(rev) != Kw || !ggml_cuda_is_slot_rev(rev)) {
+            Kw < 1 || Kw > max_slots || win->view_offs != (size_t) (n_t - (Kw - 1)) * sizeof(float) ||
+            rev->type != GGML_TYPE_I32 || ggml_nelements(rev) != Kw) {
+            return 0;
+        }
+        const bool host_rev  = ggml_cuda_is_slot_rev(rev) && Kw == std::min<int64_t>(n_t + 1, sr->ne[1]);
+        const bool graph_rev = !host_rev && Kw == std::min<int64_t>(n_t, sr->ne[1]) && ggml_cuda_is_slot_order(rev, sr->ne[1], Kw, chain);
+        if (!host_rev && !graph_rev) {
+            return 0;
+        }
+        // the chain is either exactly the nodes between concat and the set_rows (skipped), or outside this window (runs as usual)
+        if (n_chain == 3 && (!graph_rev || cgraph->nodes[idx[j]] != chain[0] || cgraph->nodes[idx[j + 1]] != chain[1] ||
+                cgraph->nodes[idx[j + 2]] != chain[2])) {
             return 0;
         }
         for (int k = 0; k < Kw; ++k) {
@@ -5232,7 +5274,7 @@ static int ggml_cuda_try_ssm_conv_state_fusion(ggml_backend_cuda_context * cuda_
             dsts[k] = (float *) ((char *) sr->data + k * sr->nb[1]);
         }
         K = (int) Kw;
-        j += 1;
+        j += n_chain + 1;
     }
     if (K == 0 || j + 1 >= n_idx) {
         return 0;
@@ -5276,9 +5318,10 @@ static int ggml_cuda_try_ssm_conv_state_fusion(ggml_backend_cuda_context * cuda_
         return 0;
     }
 
-    // the skipped nodes must not be used outside of the matched nodes (the cpys / set_rows write the cache and have no users)
+    // the skipped nodes must not be used outside of the matched nodes (the cpys / set_rows write the cache and have no users;
+    // the slot-order cast is checked like any other node)
     for (int jj = i; jj < last_idx; ++jj) {
-        if (cgraph->nodes[jj]->op == GGML_OP_CPY || cgraph->nodes[jj]->op == GGML_OP_SET_ROWS) {
+        if ((cgraph->nodes[jj]->op == GGML_OP_CPY && cgraph->nodes[jj] != chain[2]) || cgraph->nodes[jj]->op == GGML_OP_SET_ROWS) {
             continue;
         }
         if (!ggml_cuda_uses_within(cgraph, jj, i + 1, last_idx)) {
