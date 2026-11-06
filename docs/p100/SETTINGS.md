@@ -47,6 +47,10 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   state's rollback slots with one `set_rows`; the conv-state fusion matches that form too, so it still fires. Upstream's Q8_1
   quantization now stores the block sum of the rounded values (#31247): nemotron's KL divergence against full-F32 references drops
   25-37 % and its outputs change; every other production model gives identical outputs.
+- Since v5.40 (upstream `9c9074e14`), every drafting server (all Swift entries and Flash-Next MTP) builds the conv-state slot order
+  in the graph (#31660) instead of reading it from a host input; the conv-state fusion matches that form too and skips the three
+  index nodes on decode, so decode runs the same kernels as v5.39. Prefill batches run the three small index kernels (+0.7 %
+  launches on Swift). Outputs identical on every production model.
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
