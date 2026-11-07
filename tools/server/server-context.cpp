@@ -272,6 +272,9 @@ struct server_slot {
     // again (~150 MiB for Qwen3.8 under -sm tensor, ~0.2 s), so create_checkpoint keeps the existing one.
     // LLAMA_CKPT_SKIP_CURRENT=0 copies it again.
     int64_t ckpt_current = -1;
+    // the kept current checkpoint, claimed by this task (checkpoints are shared and immutable since #30137, so the claim lives here)
+    const common_prompt_checkpoint * ckpt_claimed      = nullptr;
+    int                              ckpt_claimed_task = -1;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -2681,7 +2684,8 @@ private:
                 slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             const auto & cur = **it;
-            if (cur.id_task != id_task && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
+            const bool own = cur.id_task == id_task || (&cur == slot.ckpt_claimed && slot.ckpt_claimed_task == id_task);
+            if (!own && last >= 0 && cur.n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                         cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
@@ -2710,9 +2714,10 @@ private:
             const int64_t current = slot.ckpt_current;
             slot.ckpt_current = -1;
             if (skip_current && current == n_tokens_new) {
-                for (auto & ck : slot.prompt.checkpoints) {
-                    if (ck.n_tokens == n_tokens_new) {
-                        ck.id_task = id_task;
+                for (const auto & ck : slot.prompt.checkpoints) {
+                    if (ck->n_tokens == n_tokens_new) {
+                        slot.ckpt_claimed      = ck.get();
+                        slot.ckpt_claimed_task = id_task;
                         SLT_TRC(slot, "context checkpoint at n_tokens = %" PRId64 " is current (just restored), kept\n", n_tokens_new);
                         return;
                     }
