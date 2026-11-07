@@ -2402,7 +2402,7 @@ struct common_ckpt_pool {
 
     std::mutex                        mtx;
     std::condition_variable           cv;
-    std::vector<std::vector<uint8_t>> bufs;
+    std::vector<common_state_data>    bufs;
     size_t                            want    = 0; // size of the next spare to pre-fault (0: none)
     size_t                            cap     = 0;
     bool                              started = false;
@@ -2427,7 +2427,7 @@ struct common_ckpt_pool {
     }
 
     // swap a fitting pooled buffer into out (out.size() >= n afterwards); always schedules the next spare
-    bool take(size_t n, std::vector<uint8_t> & out) {
+    bool take(size_t n, common_state_data & out) {
         if (n < MIN_BYTES) {
             return false;
         }
@@ -2452,12 +2452,12 @@ struct common_ckpt_pool {
         return true;
     }
 
-    void give(std::vector<uint8_t> && v) {
+    void give(common_state_data && v) {
         if (v.capacity() < MIN_BYTES) {
             return;
         }
         v.resize(v.capacity()); // pooled buffers keep their full length (a no-op for an exact-size buffer)
-        std::vector<uint8_t> drop;
+        common_state_data drop;
         {
             std::lock_guard<std::mutex> lk(mtx);
             if (cap == 0 && started) {
@@ -2484,14 +2484,15 @@ struct common_ckpt_pool {
             if (have) {
                 continue;
             }
-            std::vector<uint8_t> evicted;
+            common_state_data evicted;
             if (bufs.size() >= cap) {
                 evicted = std::move(bufs.front()); // none of them fits the size in use
                 bufs.erase(bufs.begin());
             }
             lk.unlock();
-            evicted = std::vector<uint8_t>();
-            std::vector<uint8_t> spare(n); // page faults + zero fill, off the request thread
+            evicted = common_state_data();
+            common_state_data spare(n);
+            std::memset(spare.data(), 0, n); // page faults off the request thread (common_state_data does not fill)
             lk.lock();
             if (bufs.size() < cap) {
                 bufs.push_back(std::move(spare));
@@ -2550,7 +2551,7 @@ void common_prompt_checkpoint::update_tgt(
 
     // a fresh 150-200 MiB buffer costs ~50-65 ms in page faults: take a pre-faulted / recycled one when this one would grow
     if (data_tgt.capacity() < ckpt_size) {
-        std::vector<uint8_t> pooled;
+        common_state_data pooled;
         if (common_ckpt_pool::get().take(ckpt_size, pooled)) {
             data_tgt.swap(pooled);
         }
