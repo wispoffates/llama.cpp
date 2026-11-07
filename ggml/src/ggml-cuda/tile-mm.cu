@@ -451,18 +451,37 @@ static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const til
     }
 }
 
-// MUL_MAT_ID: build the tile list (expert, first column) from the expert bounds; one thread, n_experts is small
-static __global__ void tile_mm_id_tiles(const int * __restrict__ bounds, const int n_experts, const int bn, int * __restrict__ tiles,
+// MUL_MAT_ID: expert bounds from the ids (bounds[e] = selections with a lower expert id, the compact layout of mm_ids_helper,
+// which since #31047 emits tile specs instead of bounds), then the tile list (expert, first column); one block, n_experts is small
+static __global__ void tile_mm_id_tiles(const int32_t * __restrict__ ids, const int si1, const int n_tokens, const int n_used,
+                                        const int n_experts, const int bn, int * __restrict__ bounds, int * __restrict__ tiles,
                                         int * __restrict__ ntiles) {
+    extern __shared__ int tmm_cnt[]; // [n_experts], then the count of ids below 0
+    for (int e = threadIdx.x; e <= n_experts; e += blockDim.x) {
+        tmm_cnt[e] = 0;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_tokens*n_used; i += blockDim.x) {
+        const int e = ids[(i / n_used)*si1 + i % n_used];
+        atomicAdd(&tmm_cnt[e < 0 ? n_experts : e], 1);
+    }
+    __syncthreads();
+    if (threadIdx.x != 0) {
+        return;
+    }
+    int run = tmm_cnt[n_experts];
     int k = 0;
     for (int e = 0; e < n_experts; ++e) {
-        const int n = bounds[e + 1] - bounds[e];
+        bounds[e] = run;
+        const int n = tmm_cnt[e];
+        run += n;
         for (int c = 0; c < n; c += bn) {
             tiles[2*k]     = e;
             tiles[2*k + 1] = c;
             ++k;
         }
     }
+    bounds[n_experts] = run;
     *ntiles = k;
 }
 
@@ -712,13 +731,15 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), total);
     ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
     ggml_cuda_pool_alloc<int32_t> tiles(ctx.pool(), 2*max_tiles + 1);
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), max_tiles); // filled by the helper, unused here
     ggml_cuda_pool_alloc<__half>  xs(ctx.pool(), total*K);
     ggml_cuda_pool_alloc<float>   sc(ctx.pool(), total*nwin);
     const int si1  = (int) (ids->nb[1]/sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2]/src1->nb[1]);
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), (int) n_experts, (int) n_tokens,
-                                   (int) n_used, (int) nch, si1, sis1, /*write_inverse =*/ false, stream);
-    tile_mm_id_tiles<<<1, 1, 0, stream>>>(bounds.get(), (int) n_experts, bn, tiles.get() + 1, tiles.get());
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(), (int) n_experts, (int) n_tokens,
+                                   (int) n_used, (int) nch, bn, si1, sis1, /*write_inverse =*/ false, stream);
+    tile_mm_id_tiles<<<1, 256, (n_experts + 1)*sizeof(int), stream>>>((const int32_t *) ids->data, si1, (int) n_tokens, (int) n_used,
+                                   (int) n_experts, bn, bounds.get(), tiles.get() + 1, tiles.get());
     {
         const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) total);
         tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), ids_src1.get(), xs.get(),
