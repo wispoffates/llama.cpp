@@ -247,7 +247,12 @@ void ggml_cuda_mul_mat_q(
             ncols_opt = ne12;
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            // p100-series: GGML_CUDA_MMQ_MOE_TPE=0 sizes the tile against ne12 again (A/B in one binary; upstream #31047 made
+            // tokens per expert the default on every GPU, which Kane's sm_60 tile did before)
+            static const bool tpe = [] { const char * e = getenv("GGML_CUDA_MMQ_MOE_TPE"); return !e || atoi(e) != 0; }();
+            if (tpe) {
+                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            }
         }
 
         J_best = ggml_cuda_mmq_get_J_best(src0->type, ncols_opt, fallback, cc, smpbo, prec_src1, &nthreads_best);
