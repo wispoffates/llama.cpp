@@ -35,6 +35,7 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   against full precision, speed equal or better. `GGML_CUDA_MMVQ_F16_MAXCOLS=5` restores the old routing.
 - Since v5.37, MoE matmuls that go through MMQ (nemotron) size their tile by the tokens each expert sees, not the whole batch (Kane's
   change, as RDNA3/4 already did): nemotron prompt processing +28 %, outputs identical. `GGML_CUDA_MMQ_MOE_TPE=0` switches it off.
+  Since v5.41 upstream does this on every GPU (#31047) and the series carries only the switch.
 - Debugging aid since v5.37: `GGML_ALLOC_NO_REUSE=2` makes the graph allocator free nothing (`=1` also skips in-place reuse). A
   correct backend gives the same logits either way; a fused or deferred kernel that reads memory the allocator already handed to
   another tensor does not. It costs memory -- for tests, not serving. `GGML_CUDA_H1S_GUARD=0` turns off the v5.36 overlap check, to
@@ -51,6 +52,10 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   in the graph (#31660) instead of reading it from a host input; the conv-state fusion matches that form too and skips the three
   index nodes on decode, so decode runs the same kernels as v5.39. Prefill batches run the three small index kernels (+0.7 %
   launches on Swift). Outputs identical on every production model.
+- Since v5.41 (upstream `cf659f240`), upstream lays out MoE MMQ batches per expert itself (#31047), so Kane's tile is dropped and
+  the tile GEMM builds its own expert bounds; context checkpoints are shared immutable buffers (#30137), which the checkpoint pool
+  now holds. Outputs identical on every production model, same kernels launched; nemotron prompt processing +0.8 %. llama-bench
+  decode reads 0.6-0.8 % lower on gemma4 / qwen36 (not host work, cause not identified); serving decode shows no change.
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
