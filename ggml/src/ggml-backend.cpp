@@ -2193,7 +2193,8 @@ static void ggml_backend_sched_upload_user_inputs(ggml_backend_sched_t sched) {
         struct ggml_backend_sched_split * split = &sched->splits[split_id];
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             struct ggml_tensor * input = split->inputs[input_id];
-            if (!ggml_backend_sched_is_user_input(input)) {
+            // as in compute_splits: an input that no computed node reads is not uploaded
+            if (!ggml_backend_sched_is_user_input(input) || !sched->hv_tensor_requires_copy[hash_id(input)]) {
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
