@@ -56,6 +56,12 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   the tile GEMM builds its own expert bounds; context checkpoints are shared immutable buffers (#30137), which the checkpoint pool
   now holds. Outputs identical on every production model, same kernels launched; nemotron prompt processing +0.8 %. llama-bench
   decode reads 0.6-0.8 % lower on gemma4 / qwen36 (not host work, cause not identified); serving decode shows no change.
+- Since v5.42 (upstream `cd4ed902e`): upstream's MTP draft rows on the device (#31927) are switched off in the series for now -- that
+  path skips the series' draft position pairing -- so Swift and Flash-Next drafting run exactly as in v5.41. The radix top-k picks ties
+  deterministically (#31084; one kernel fewer per sampled step on the Swift MTP entries), and the user-input pre-upload skips inputs no
+  computed node reads (#31419). Outputs and draft acceptance identical on every production model; speed equal or up to +1.6 %. Vision
+  encoders kept on the CPU (`--no-mmproj-offload`) give slightly different answers, because the CPU backend now keeps F16 matmul
+  inputs in F32 (#31854).
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
