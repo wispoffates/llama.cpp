@@ -13412,19 +13412,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 4, b, 256, 1, 1024, 1e5f));
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 6, b, 40, 1, 512));  // short K, partial row sets
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 6, b, 72, 1, 256));
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 32, 8, b, false, true, false, {1, 1}));
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 40, 768, true, 16, 6, b, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 32, 8, b, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, 1, 40, 768, true, 16, 6, b, false, true, false, {1, 1}));
         }
-        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, false, 1, 1, false, false, true, false, {1, 1}));
-        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 3072, 2304, false, 1, 1, false, false, true, false, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, false, 1, 1, false, false, true, false, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, 1, 3072, 2304, false, 1, 1, false, false, true, false, {1, 1}));
     }
 
     // Flash-Next routed experts (512 x top-10; gate/up 2560 -> 640, the tensor-split half 320) as the fused gate/up/SWIGLU MoE matvec
     // at 1 token and the speculative-verify widths (GGML_CUDA_PASCAL_MOE_GLU=1/2 takes the fused path on Pascal; default = unfused)
     for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ1_M}) {
         for (int64_t ntok : {1, 2, 4, 8}) {
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, ntok, 320, 2560, true, 32, 10, false, false, true, false, {1, 1}));
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, ntok, 640, 2560, true, 16, 8, true, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, ntok, 320, 2560, true, 32, 10, false, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, ntok, 640, 2560, true, 16, 8, true, false, true, false, {1, 1}));
         }
     }
 
@@ -13463,7 +13463,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 5, 8704, {1, 1}, {1, 1}));
-        }
     }
     for (int hs : {64, 128, 256}) {
         for (ggml_type type_K : {GGML_TYPE_F16, GGML_TYPE_F8_E4M3}) {
@@ -14157,7 +14156,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 256, 8, false, 2048, 1, 512));
     }
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 256, 8, true, false, true, false, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_fusion(type, GGML_GLU_OP_SWIGLU, 1, 512, 2048, true, 256, 8, true, false, true, false, {1, 1}));
     }
 
 
