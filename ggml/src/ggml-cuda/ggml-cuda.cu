@@ -6284,7 +6284,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         // the mul operand is a norm weight, which model files store as F32;
         // the add operand is an F32 bias or a residual with the type of x
         const ggml_type type = rms_norm->type;
-        if ((type != GGML_TYPE_F32 && type != GGML_TYPE_BF16) || rms_norm->src[0]->type != type) {
+        // p100-series: our rms_norm kernels (norm.cu) are F32 only
+        if (type != GGML_TYPE_F32 || rms_norm->src[0]->type != type) {
             return false;
         }
 
@@ -8955,7 +8956,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_L2_NORM:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_RMS_NORM:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16) && op->type == op->src[0]->type &&
+            // p100-series: our rms_norm kernels (norm.cu) are F32 only
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == op->src[0]->type &&
                    ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_RMS_NORM_BACK:
             return ggml_is_contiguous(op->src[0]);
