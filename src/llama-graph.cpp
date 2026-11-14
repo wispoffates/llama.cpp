@@ -2489,7 +2489,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // lookahead measurement (LLAMA_MOE_LOOKAHEAD_TRACE=1, with LLAMA_MOE_TRACE): predict the next pooled layer's experts by
     // applying its router to this layer's MoE input; the node "ffn_moe_pred-<next layer>" is dumped by the trace hook
     static const bool la_trace = [] { const char * e = getenv("LLAMA_MOE_LOOKAHEAD_TRACE"); return e && atoi(e) != 0; }();
-    if (la_trace && lru != nullptr && lru->pooled(il) && !cparams.warmup && n_tokens > 0) {
+    if (la_trace && lru != nullptr && lru->pooled(il) && n_tokens > 0) {
         const int nx = lru->next_pooled(il);
         if (nx >= 0 && lru->router_get(nx, 0) != nullptr) {
             ggml_tensor * pl = ggml_mul_mat(ctx0, lru->router_get(nx, 0), cur);   // [n_expert, n_tokens]
@@ -2507,7 +2507,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
-    if (lru != nullptr && lru->pooled(il) && !cparams.warmup &&
+    if (lru != nullptr && lru->pooled(il) &&
         n_tokens > 0 && (int64_t) n_tokens * n_expert_used <= lru->n_slots_min()) {
         GGML_ASSERT(gate_up_exps == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr &&
                     down_exps_b == nullptr && gate_up_exps_b == nullptr &&
