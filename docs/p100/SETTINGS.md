@@ -62,6 +62,10 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   computed node reads (#31419). Outputs and draft acceptance identical on every production model; speed equal or up to +1.6 %. Vision
   encoders kept on the CPU (`--no-mmproj-offload`) give slightly different answers, because the CPU backend now keeps F16 matmul
   inputs in F32 (#31854).
+- Since v5.43 (upstream `32bdc3a89`, ggml 1.0.0): RMS_NORM stays F32 on the series' norm kernels (upstream's BF16 RMS_NORM, #32135,
+  is not carried over to them), the expert cache no longer checks a warmup flag upstream removed (#30565), and upstream's removal of the
+  unfused GDN path (#32078) changes nothing at runtime because the series already ran the fused one. #31927's MTP device rows stay off.
+  Outputs, draft acceptance and the kernels launched are identical to v5.42 on every production model; speed equal (within 0.4 %).
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
