@@ -7566,12 +7566,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
-    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+    // p100-series: GGML_CUDA_NORM_MUL_FUSE=0 turns the #32454 LayerNorm fusion off (in-model A/B in one binary)
+    static const bool norm_mul_fuse = [] { const char * e = getenv("GGML_CUDA_NORM_MUL_FUSE"); return !(e && atoi(e) == 0); }();
+    if (norm_mul_fuse && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_norm(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
 
-    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
+    if (norm_mul_fuse && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_norm(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }

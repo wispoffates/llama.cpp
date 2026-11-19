@@ -14061,6 +14061,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // p100-series: vision-encoder LayerNorm * w + b (#32454 fusion) at our mmproj shapes (n_embd, patches): qwen3vl (qwen36 / Swift /
+    // ornith) 1152 x 1024 / 2304, glimmer 1536 x 4096, nemotron 1280 x 1024; affine = 1-D weight and bias as in the encoders
+    for (auto sh : std::vector<std::pair<int64_t, int64_t>>{{1152, 1024}, {1152, 2304}, {1536, 4096}, {1280, 1024}}) {
+        test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, {sh.first, sh.second, 1, 1}, 1e-6f, false, true, true));
+        test_cases.emplace_back(new test_norm(GGML_TYPE_F32, {sh.first, sh.second, 1, 1}, false, 1e-6f));
+    }
+
     // p100-series (exp/hcperf): Flash-Next hyper-connection matmuls (qwen4exp hc_mix, hc = 4 x n_embd 2560 = 10240, low rank 320), both
     // GPUs compute them in full (mirrored): down 10240 -> 320, inject 10240 -> 4, up 320 -> 10240; BF16 as shipped vs F16 / Q8_0, at
     // 1 token (decode), 4 (MTP n3 verify) and 2 / 5 around it
