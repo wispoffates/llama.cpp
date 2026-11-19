@@ -11901,6 +11901,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // p100-series: vision-encoder LayerNorm * w + b at our mmproj shapes (whole-graph eval: nvprof sees the fused vs unfused kernels;
+    // perf mode only times the graph's last node)
+    for (auto sh : std::vector<std::pair<int64_t, int64_t>>{{1152, 1024}, {1152, 2304}, {1536, 4096}, {1280, 1024}}) {
+        test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, {sh.first, sh.second, 1, 1}, 1e-6f, false, true, true));
+    }
+
     for (float eps : { 0.0f, 1e-6f, 1e-4f, 1e-1f, 1.0f }) {
         for (uint32_t n : { 64, 1025 }) {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
