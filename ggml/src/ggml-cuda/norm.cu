@@ -1428,6 +1428,95 @@ static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_f32(const 
     }
 }
 
+// float4 form of add_rms_norm_mul_f32 (residual ADD or GATED shared-expert tail -> RMS_NORM -> MUL(w)), for when the unfused norm
+// would take rms_norm_f32's vec path (#29720 port): same block size and float4-per-thread choice by n4, the same per-thread sum
+// expression and block reduction, so fused == unfused bit for bit again (the scalar kernel above matches the scalar norm path).
+template <int block_size, int vpt, bool GATED>
+static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_vec(const float * a, const float * b, float * sum_out,
+        const float * mul, float * dst, const int ncols, const int64_t sa, const int64_t sb, const int64_t ss, const int64_t sd,
+        const float eps, const float * c, const float * g, const int64_t sc, const int64_t sg) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const float4 * a4 = (const float4 *) (a + row*sa);
+    const float4 * b4 = (const float4 *) (b + row*sb);
+    float4       * o4 = (float4 *) (sum_out + row*ss);
+    float4       * d4 = (float4 *) (dst + row*sd);
+    const float4 * m4 = (const float4 *) mul;
+    const float4 * c4 = nullptr;
+    float sig = 0.0f;
+    if constexpr (GATED) {
+        c4  = (const float4 *) (c + row*sc);
+        sig = ggml_cuda_op_sigmoid_single(g[row*sg]);
+    }
+    __shared__ float s_sum[32];
+    const int ncols4 = ncols / 4;
+    float4 xs[vpt];
+    float  tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            const float4 av = a4[i];
+            const float4 bv = b4[i];
+            if constexpr (GATED) {
+                const float4 cv = c4[i];
+                xs[k] = make_float4(shexp_gate_x(av.x, bv.x, sig, cv.x), shexp_gate_x(av.y, bv.y, sig, cv.y),
+                                    shexp_gate_x(av.z, bv.z, sig, cv.z), shexp_gate_x(av.w, bv.w, sig, cv.w));
+            } else {
+                xs[k] = make_float4(av.x + bv.x, av.y + bv.y, av.z + bv.z, av.w + bv.w);
+            }
+            o4[i] = xs[k];
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*block_size;
+        if (i < ncols4) {
+            float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+            const float4 m = m4[i];
+            r.x *= m.x; r.y *= m.y; r.z *= m.z; r.w *= m.w;
+            d4[i] = r;
+        }
+    }
+}
+
+// false: vec off (GGML_CUDA_RMS_NORM_VEC=0) or shapes / alignment do not allow it -> the scalar kernel
+template <bool GATED>
+static bool add_rms_norm_mul_try_vec(cudaStream_t stream, const int nrows, const float * a, const float * b, float * sum_out,
+        const float * mul, float * dst, const int ncols, const int64_t sa, const int64_t sb, const int64_t ss, const int64_t sd,
+        const float eps, const float * c = nullptr, const float * g = nullptr, const int64_t sc = 0, const int64_t sg = 0) {
+    auto al = [](const void * p, const int64_t st) { return p != nullptr && ((uintptr_t) p % 16) == 0 && st % 4 == 0; };
+    if (!rms_norm_vec_enabled() || ncols % 4 != 0 || !al(a, sa) || !al(b, sb) || !al(sum_out, ss) || !al(mul, 0) || !al(dst, sd) ||
+            (GATED && !al(c, sc))) {
+        return false;
+    }
+    auto launch = [&](auto bs_tag, auto vpt_tag) {
+        constexpr int bs  = decltype(bs_tag)::value;
+        constexpr int vpt = decltype(vpt_tag)::value;
+        add_rms_norm_mul_vec<bs, vpt, GATED><<<nrows, bs, 0, stream>>>(a, b, sum_out, mul, dst, ncols, sa, sb, ss, sd, eps, c, g, sc, sg);
+    };
+    const int n4 = ncols / 4;
+    if (n4 <= 32) {
+        launch(std::integral_constant<int, 32>{},   std::integral_constant<int, 1>{});
+    } else if (n4 <= 128) {
+        launch(std::integral_constant<int, 128>{},  std::integral_constant<int, 1>{});
+    } else if (n4 <= 256) {
+        launch(std::integral_constant<int, 256>{},  std::integral_constant<int, 1>{});
+    } else if (n4 <= 512) {
+        launch(std::integral_constant<int, 512>{},  std::integral_constant<int, 1>{});
+    } else if (n4 <= 1024) {
+        launch(std::integral_constant<int, 1024>{}, std::integral_constant<int, 1>{});
+    } else if (n4 <= 4096) {
+        launch(std::integral_constant<int, 1024>{}, std::integral_constant<int, 4>{});
+    } else {
+        return false;
+    }
+    return true;
+}
+
 // shape / aliasing checks shared by the plain and the h1 variant
 bool ggml_cuda_add_rms_norm_mul_ok(const ggml_tensor * add, const ggml_tensor * rms, const ggml_tensor * mul) {
     const ggml_tensor * a = add->src[0];
@@ -1465,9 +1554,13 @@ bool ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor 
     float eps = 0.0f;
     memcpy(&eps, rms->op_params, sizeof(float));
     const int64_t fs = sizeof(float);
-    add_rms_norm_mul_f32<1024><<<(int) add->ne[1], 1024, 0, ctx.stream()>>>(
-        (const float *) a->data, (const float *) b->data, (float *) add->data, (const float *) w->data, (float *) mul->data,
-        (int) add->ne[0], a->nb[1]/fs, b->nb[1]/fs, add->nb[1]/fs, mul->nb[1]/fs, eps);
+    if (!add_rms_norm_mul_try_vec<false>(ctx.stream(), (int) add->ne[1], (const float *) a->data, (const float *) b->data,
+            (float *) add->data, (const float *) w->data, (float *) mul->data, (int) add->ne[0], a->nb[1]/fs, b->nb[1]/fs,
+            add->nb[1]/fs, mul->nb[1]/fs, eps)) {
+        add_rms_norm_mul_f32<1024><<<(int) add->ne[1], 1024, 0, ctx.stream()>>>(
+            (const float *) a->data, (const float *) b->data, (float *) add->data, (const float *) w->data, (float *) mul->data,
+            (int) add->ne[0], a->nb[1]/fs, b->nb[1]/fs, add->nb[1]/fs, mul->nb[1]/fs, eps);
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -1500,9 +1593,13 @@ bool ggml_cuda_op_shexp_gate_rms_norm_mul(ggml_backend_cuda_context & ctx, const
     }
     float eps = 0.0f;
     memcpy(&eps, rms->op_params, sizeof(float));
-    add_rms_norm_mul_f32<1024, true><<<(int) nrows, 1024, 0, ctx.stream()>>>(
-        p.a, p.s, p.sum_out, (const float *) w->data, (float *) mul->data, (int) ncols, p.sa, p.ss, p.so,
-        (int64_t) (mul->nb[1]/sizeof(float)), eps, p.r, p.g, p.sr, p.sg);
+    const int64_t sd = mul->nb[1]/sizeof(float);
+    if (!add_rms_norm_mul_try_vec<true>(ctx.stream(), (int) nrows, p.a, p.s, p.sum_out, (const float *) w->data, (float *) mul->data,
+            (int) ncols, p.sa, p.ss, p.so, sd, eps, p.r, p.g, p.sr, p.sg)) {
+        add_rms_norm_mul_f32<1024, true><<<(int) nrows, 1024, 0, ctx.stream()>>>(
+            p.a, p.s, p.sum_out, (const float *) w->data, (float *) mul->data, (int) ncols, p.sa, p.ss, p.so, sd, eps,
+            p.r, p.g, p.sr, p.sg);
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
