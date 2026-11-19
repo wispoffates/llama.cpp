@@ -11928,6 +11928,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_rms_norm_mul_rope({256, 8, t, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NEOX, true, true));
         test_cases.emplace_back(new test_rms_norm_mul_rope({512, 4, t, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NEOX, true, true));
+        // glimmer: NORMAL rope, head 128, 16 q / 1 k heads per GPU
+        test_cases.emplace_back(new test_rms_norm_mul_rope({128, 16, t, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, true));
+        test_cases.emplace_back(new test_rms_norm_mul_rope({128, 1, t, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, true));
     }
 
     // p100-series: vision-encoder LayerNorm * w + b at our mmproj shapes (whole-graph eval: nvprof sees the fused vs unfused kernels;
