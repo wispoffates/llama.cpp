@@ -1034,7 +1034,8 @@ static bool mmvq_h1_rms_norm_mul_try_impl(ggml_backend_cuda_context & ctx, const
     mmvq_h1_entry & entry = mmvq_h1_slot(ctx, mul, mul->data, 1, K, 0, hit);
     __half * xh = (__half *) entry.buf;
     float  * xs = (float *) ((char *) entry.buf + (size_t) K*sizeof(__half));
-    static const bool vec_on = [] { const char * e = getenv("GGML_CUDA_H1_NORM_VEC"); return e && atoi(e) != 0; }();
+    // phase NBS: float4 h1 norm by default (-17..-31 % per call at 2048..6656 wide); GGML_CUDA_H1_NORM_VEC=0 = the 1024-thread kernel
+    static const bool vec_on = [] { const char * e = getenv("GGML_CUDA_H1_NORM_VEC"); return !e || atoi(e) != 0; }();
     auto al = [](const void * p) { return p == nullptr || ((uintptr_t) p % 16) == 0; };
     const float * vx = gate ? gate->a : (add ? (const float *) add->src[0]->data : (const float *) x->data);
     const float * vb = gate ? gate->s : (add ? (const float *) add->src[1]->data : nullptr);

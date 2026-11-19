@@ -786,18 +786,24 @@ static void group_norm_f32_cuda(
 
 // p100-series: vectorised launch (#29720 port). Returns false when the shapes / alignment do not allow it (or GGML_CUDA_RMS_NORM_VEC=0);
 // the caller then launches the scalar kernels. Block size and float4-per-thread follow upstream's choice by n4 = ncols / 4.
-// p100-series norm block sizes (11-19, phase NBS). GGML_CUDA_NORM_BS: 0 = upstream's table by n4 (32/128/256/512/1024, 1024 x 4),
-// K = 1/2/4: at least K float4 per thread, block = the row rounded up to a warp (no idle threads past the row's end).
-// GGML_CUDA_NORM_ROWS = R > 1: rows of <= 32 float4 (<= 128 floats) run one warp per row, R rows per block (one-warp blocks cap
-// sm_60 at 32 resident warps per SM); the sum is exactly the one-warp block's, so results are bit-identical.
-// GGML_CUDA_NORM_SHORT64=1: rows of 33..64 float4 the same way with 2 float4 per lane (changes the sum order vs the 128 block).
+// p100-series norm block sizes (11-19, phase NBS, sm_60 sweep results/nbs-20261119). The vec norm's launch shape by n4 = ncols / 4
+// float4 per row and the launch's row count:
+//   n4 <= 64 (<= 256 floats: head norms): upstream's table (32 / 128 threads, one row per block) while rows < NORM_ROWS_MIN (1024);
+//            from there one warp per row, 4 rows per block (one-warp blocks cap sm_60 at 32 resident warps per SM): 128-wide -9 %
+//            (bit-identical: the one-warp sum), 256-wide -39..-43 %; at 16..96 rows the multi-row blocks LOSE 14..31 %
+//   n4 > 64: block fitted to the row (rounded up to a warp; upstream's table leaves 320 of gemma4's 1024 threads idle and runs
+//            Swift's 1280 float4 as 1024 x 4): 1 float4 per thread below 256 rows (decode -5..-18 % at 2560..6656 wide), 2 from
+//            256 rows (prompt -15..-38 %); wider rows take 2 / 4 as needed
+// add_rms_norm_mul_vec takes the same plan, so fused add+norm stays bit-identical to the unfused norm.
+// GGML_CUDA_NORM_BS = 0 upstream's table everywhere, K = 1/2/4 force >= K float4 per thread (sweep); GGML_CUDA_NORM_ROWS = R rows per
+// block for short rows at any row count (1 = never); GGML_CUDA_NORM_ROWS_MIN overrides 1024.
 static int norm_env_int(const char * name, const int def) {
     const char * e = getenv(name);
     return e ? atoi(e) : def;
 }
-static int rms_norm_bs_mode()    { static const int v = norm_env_int("GGML_CUDA_NORM_BS", 0);      return v; }
-static int rms_norm_rows_mode()  { static const int v = norm_env_int("GGML_CUDA_NORM_ROWS", 1);    return v; }
-static bool rms_norm_short64()   { static const int v = norm_env_int("GGML_CUDA_NORM_SHORT64", 0); return v != 0; }
+static int rms_norm_bs_mode()    { static const int v = norm_env_int("GGML_CUDA_NORM_BS", -1);       return v; }
+static int rms_norm_rows_mode()  { static const int v = norm_env_int("GGML_CUDA_NORM_ROWS", -1);     return v; }
+static int rms_norm_rows_min()   { static const int v = norm_env_int("GGML_CUDA_NORM_ROWS_MIN", 1024); return v; }
 
 // fitted vec config for n4 float4 per row: false if it does not fit 1024 threads x 4
 static bool rms_norm_fit_cfg(const int n4, const int min_vpt, int & bs, int & vpt) {
@@ -808,6 +814,35 @@ static bool rms_norm_fit_cfg(const int n4, const int min_vpt, int & bs, int & vp
     }
     bs = std::max(32, ((n4 + vpt - 1)/vpt + 31)/32*32);
     return bs <= 1024;
+}
+
+enum class norm_plan_kind { TABLE, FIT, ROWS };
+struct norm_plan { norm_plan_kind kind; int bs, vpt, rows; };
+
+// rows_ok: the warp-per-row kernel can take this launch (rms_norm only: no add, mul one row)
+static norm_plan rms_norm_plan(const int n4, const int64_t nrows, const bool rows_ok) {
+    norm_plan p = { norm_plan_kind::TABLE, 0, 0, 1 };
+    const int mode  = rms_norm_bs_mode();
+    const int rmode = rms_norm_rows_mode();
+    if (n4 <= 64) {
+        const int R = rmode >= 0 ? rmode : (nrows >= rms_norm_rows_min() ? 4 : 1);
+        if (rows_ok && R > 1 && mode != 0) {
+            p.kind = norm_plan_kind::ROWS; p.vpt = n4 <= 32 ? 1 : 2; p.rows = std::min(R, 32);
+            return p;
+        }
+        if (mode <= 0) {
+            return p;   // TABLE
+        }
+    } else if (mode == 0) {
+        return p;
+    }
+    const int min_vpt = mode > 0 ? mode : (nrows >= 256 ? 2 : 1);
+    if (!rms_norm_fit_cfg(n4, min_vpt, p.bs, p.vpt)) {
+        p.kind = norm_plan_kind::TABLE;
+        return p;
+    }
+    p.kind = norm_plan_kind::FIT;
+    return p;
 }
 
 // one warp per row (blockDim = 32 x R), rows flattened over (row, channel, sample); mul (if any) is one row broadcast
@@ -885,12 +920,12 @@ static bool rms_norm_f32_try_vec(const dim3 blocks_num, const float * x, float *
     }
     const int n4 = ncols / 4;
     const bool mul_one_row = !do_multiply || (mul_nrows_packed.z == 1 && mul_nchannels_packed.z == 1 && mul_nsamples_packed.z == 1);
-    const int  rows_r      = rms_norm_rows_mode();
-    if (!do_add && mul_one_row && ((n4 <= 32 && rows_r > 1) || (n4 > 32 && n4 <= 64 && rms_norm_short64()))) {
-        const int     R         = std::max(1, std::min(rows_r, 32));
-        const int64_t nrows_tot = (int64_t) blocks_num.x*blocks_num.y*blocks_num.z;
-        const dim3    grid((unsigned) ((nrows_tot + R - 1)/R)), block(WARP_SIZE, R);
-        if (n4 <= 32) {
+    const int64_t nrows_tot = (int64_t) blocks_num.x*blocks_num.y*blocks_num.z;
+    const norm_plan plan = rms_norm_plan(n4, nrows_tot, !do_add && mul_one_row);
+    if (plan.kind == norm_plan_kind::ROWS) {
+        const int  R = plan.rows;
+        const dim3 grid((unsigned) ((nrows_tot + R - 1)/R)), block(WARP_SIZE, R);
+        if (plan.vpt == 1) {
             rms_norm_f32_rows<1, do_multiply, do_scale><<<grid, block, 0, stream>>>(x, dst, ncols, blocks_num.x, blocks_num.y, nrows_tot,
                 stride_row, stride_channel, stride_sample, eps, mul, scale_out);
         } else {
@@ -912,17 +947,13 @@ static bool rms_norm_f32_try_vec(const dim3 blocks_num, const float * x, float *
             scale_out);
     };
     auto launch = [&](auto bs_tag, auto vpt_tag) { launch_bs(bs_tag, vpt_tag, 0); };
-    if (rms_norm_bs_mode() > 0) {
-        int bs, vpt;
-        if (!rms_norm_fit_cfg(n4, rms_norm_bs_mode(), bs, vpt)) {
-            return false;
-        }
-        if (vpt == 1) {
-            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{}, bs);
-        } else if (vpt == 2) {
-            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 2>{}, bs);
+    if (plan.kind == norm_plan_kind::FIT) {
+        if (plan.vpt == 1) {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{}, plan.bs);
+        } else if (plan.vpt == 2) {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 2>{}, plan.bs);
         } else {
-            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 4>{}, bs);
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 4>{}, plan.bs);
         }
         return true;
     }
@@ -1171,7 +1202,8 @@ void ggml_cuda_op_rms_norm_mul_gated(ggml_backend_cuda_context & ctx, const ggml
     memcpy(&eps, rms_norm->op_params, sizeof(float));
 
     const int64_t zs1 = z->nb[1] / sizeof(float), zs2 = z->nb[2] / sizeof(float), zs3 = z->nb[3] / sizeof(float);
-    static const int rows_r = norm_env_int("GGML_CUDA_GDN_NORM_ROWS", 0);
+    // GDN gated norm, one warp per row (phase NBS: prompt -83 %, decode -6..-11 % vs the 256-thread kernel); 0 = the old kernel
+    static const int rows_r = norm_env_int("GGML_CUDA_GDN_NORM_ROWS", 4);
     auto al = [](const void * p) { return ((uintptr_t) p % 16) == 0; };
     if (rows_r > 0 && ncols % 4 == 0 && ncols <= 256 && al(x->data) && al(z->data) && al(w->data) && al(dst->data) &&
             zs1 % 4 == 0 && zs2 % 4 == 0 && zs3 % 4 == 0) {
@@ -1670,17 +1702,14 @@ static bool add_rms_norm_mul_try_vec(cudaStream_t stream, const int nrows, const
     };
     auto launch = [&](auto bs_tag, auto vpt_tag) { launch_bs(bs_tag, vpt_tag, 0); };
     const int n4 = ncols / 4;
-    if (rms_norm_bs_mode() > 0) {
-        int bs, vpt;
-        if (!rms_norm_fit_cfg(n4, rms_norm_bs_mode(), bs, vpt)) {
-            return false;
-        }
-        if (vpt == 1) {
-            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{}, bs);
-        } else if (vpt == 2) {
-            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 2>{}, bs);
+    const norm_plan plan = rms_norm_plan(n4, nrows, false);   // the unfused norm's plan (no warp-rows: ncols >= 1024 here)
+    if (plan.kind == norm_plan_kind::FIT) {
+        if (plan.vpt == 1) {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{}, plan.bs);
+        } else if (plan.vpt == 2) {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 2>{}, plan.bs);
         } else {
-            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 4>{}, bs);
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 4>{}, plan.bs);
         }
         return true;
     }
