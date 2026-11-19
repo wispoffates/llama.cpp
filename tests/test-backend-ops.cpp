@@ -4338,7 +4338,8 @@ struct test_add_rms_norm : public test_case {
 
 // p100-series: qwen35moe / qwen4exp shared-expert tail (CUDA fusion ggml_cuda_shexp_gate_try): out = (a + s*sigmoid(g)) + r with one
 // gate value per row; tail 0 = that sum, 1 = + rms_norm * w (next pre-norm), 2 = 1 + the sum again (both outputs checked),
-// 3 = 1 feeding a q4_0 matvec (the h1 decode path, rows must be 1)
+// 3 = 1 feeding a q4_0 matvec (the h1 decode path, rows must be 1); 4 / 5 = plain rms_norm(a) * w / rms_norm(a + r) * w feeding the
+// q4_0 matvec (the h1 norm without the gate tail; phase NBS float4 h1 norm)
 struct test_shexp_gate : public test_case {
     const int64_t n;
     const int64_t t;
@@ -4356,7 +4357,7 @@ struct test_shexp_gate : public test_case {
     }
 
     double max_nmse_err() override {
-        return tail == 3 ? 5e-4 : 1e-7;
+        return tail >= 3 ? 5e-4 : 1e-7;
     }
 
     test_shexp_gate(int64_t n = 2048, int64_t t = 1, int tail = 1) : n(n), t(t), tail(tail) {}
@@ -4368,10 +4369,17 @@ struct test_shexp_gate : public test_case {
         ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, t);
         ggml_set_name(g, "g"); ggml_set_name(s, "s"); ggml_set_name(a, "a"); ggml_set_name(r, "r");
 
-        ggml_tensor * sig = ggml_sigmoid(ctx, g);
-        ggml_tensor * m   = ggml_mul(ctx, s, sig);
-        ggml_tensor * f   = ggml_add(ctx, a, m);
-        ggml_tensor * l   = ggml_add(ctx, f, r);
+        ggml_tensor * l;
+        if (tail == 4) {
+            l = a;
+        } else if (tail == 5) {
+            l = ggml_add(ctx, a, r);
+        } else {
+            ggml_tensor * sig = ggml_sigmoid(ctx, g);
+            ggml_tensor * m   = ggml_mul(ctx, s, sig);
+            ggml_tensor * f   = ggml_add(ctx, a, m);
+            l = ggml_add(ctx, f, r);
+        }
         ggml_set_name(l, "l");
         if (tail == 0) {
             return l;
@@ -4382,7 +4390,7 @@ struct test_shexp_gate : public test_case {
         ggml_set_name(out, "normed");
         if (tail == 2) {
             out = ggml_add(ctx, out, l);
-        } else if (tail == 3) {
+        } else if (tail >= 3) {
             ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, n, 256);
             ggml_set_name(wq, "wq");
             out = ggml_mul_mat(ctx, wq, out);
@@ -12043,6 +12051,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_shexp_gate(n, 1, 3));
     }
     test_cases.emplace_back(new test_shexp_gate(1000, 3, 1));   // < 1024 columns: the norm stays separate, the 4-node tail fuses
+    for (int64_t n : {2816, 5120, 6656}) {   // phase NBS: the h1 norm (plain / add / gated) at gemma4 / Swift / glimmer widths
+        for (int tail : {3, 4, 5}) {
+            test_cases.emplace_back(new test_shexp_gate(n, 1, tail));
+        }
+    }
+    for (int tail : {4, 5}) {
+        test_cases.emplace_back(new test_shexp_gate(2048, 1, tail));
+    }
     test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { 1025, 2, 3, 2 }, 1e-5f, false, true));
     test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { 8192, 1, 1, 1 }, 1e-5f, false, true));
     for (uint32_t n : { 768, 1024, 1280 }) {

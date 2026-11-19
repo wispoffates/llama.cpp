@@ -897,6 +897,75 @@ static __global__ void __launch_bounds__(block_size) mmvq_h1_rms_norm_mul(
     }
 }
 
+// p100-series (phase NBS): float4 form, block fitted to the row (GGML_CUDA_H1_NORM_VEC=1). Each thread holds 4 consecutive outputs, so an
+// h1 block (32 outputs) is 8 lanes: max over own 4, then xor-shuffles 4 / 2 / 1. The norm's sum is in the vec norm's order (not the
+// 1024-thread scalar one) -> rounding changes; XH / XS arithmetic per value is unchanged. MODE 0 plain, 1 + b, 2 shexp gate tail.
+template <int vpt, int MODE>
+static __global__ void __launch_bounds__(1024) mmvq_h1_rms_norm_mul_vec(
+        const float * x, const float * w, float * dst, __half * __restrict__ XH, float * __restrict__ XS, const int ncols, const float eps,
+        const float * b, float * sum_out, const float * c, const float * g) {
+    __shared__ float s_sum[32];
+    const int tid = threadIdx.x;
+    const int bsz = blockDim.x;
+    const int ncols4 = ncols / 4;
+    float sig = 0.0f;
+    if constexpr (MODE == 2) {
+        sig = ggml_cuda_op_sigmoid_single(*g);
+    }
+    float4 xs[vpt];
+    float  tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*bsz;
+        xs[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (i < ncols4) {
+            const float4 xv = ((const float4 *) x)[i];
+            if constexpr (MODE == 2) {
+                const float4 bv = ((const float4 *) b)[i];
+                const float4 cv = ((const float4 *) c)[i];
+                xs[k] = make_float4((xv.x + __fmul_rn(bv.x, sig)) + cv.x, (xv.y + __fmul_rn(bv.y, sig)) + cv.y,
+                                    (xv.z + __fmul_rn(bv.z, sig)) + cv.z, (xv.w + __fmul_rn(bv.w, sig)) + cv.w);
+            } else if constexpr (MODE == 1) {
+                const float4 bv = ((const float4 *) b)[i];
+                xs[k] = make_float4(xv.x + bv.x, xv.y + bv.y, xv.z + bv.z, xv.w + bv.w);
+            } else {
+                xs[k] = xv;
+            }
+            if constexpr (MODE > 0) {
+                ((float4 *) sum_out)[i] = xs[k];
+            }
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = block_reduce<block_reduce_method::SUM, 0>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / ncols + eps);
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*bsz;
+        const bool in = i < ncols4;   // ncols % 32 == 0: an 8-lane group is wholly in or out; every lane shuffles
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (in) {
+            const float4 wv = ((const float4 *) w)[i];
+            v = make_float4(scale * xs[k].x * wv.x, scale * xs[k].y * wv.y, scale * xs[k].z * wv.z, scale * xs[k].w * wv.w);
+            ((float4 *) dst)[i] = v;
+        }
+        float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+        for (int o = 4; o >= 1; o >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        }
+        if (in) {
+            const float sc = m > 0.0f ? m : 1.0f;
+            __half2 * xh2 = (__half2 *) (XH + 4*i);
+            xh2[0] = __halves2half2(__float2half(v.x/sc), __float2half(v.y/sc));
+            xh2[1] = __halves2half2(__float2half(v.z/sc), __float2half(v.w/sc));
+            if ((i & 7) == 0) {
+                XS[i/8] = sc;
+            }
+        }
+    }
+}
+
 // add != nullptr: cgraph->nodes[i] is the RMS_NORM of `add` (the residual ADD at i - 1), fused in front
 // gate != nullptr: the RMS_NORM's input is the shared-expert tail sum (p100-series shexp gate fusion), computed in front
 static bool mmvq_h1_rms_norm_mul_try_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, ggml_tensor * add,
@@ -965,7 +1034,37 @@ static bool mmvq_h1_rms_norm_mul_try_impl(ggml_backend_cuda_context & ctx, const
     mmvq_h1_entry & entry = mmvq_h1_slot(ctx, mul, mul->data, 1, K, 0, hit);
     __half * xh = (__half *) entry.buf;
     float  * xs = (float *) ((char *) entry.buf + (size_t) K*sizeof(__half));
-    if (gate != nullptr) {
+    static const bool vec_on = [] { const char * e = getenv("GGML_CUDA_H1_NORM_VEC"); return e && atoi(e) != 0; }();
+    auto al = [](const void * p) { return p == nullptr || ((uintptr_t) p % 16) == 0; };
+    const float * vx = gate ? gate->a : (add ? (const float *) add->src[0]->data : (const float *) x->data);
+    const float * vb = gate ? gate->s : (add ? (const float *) add->src[1]->data : nullptr);
+    float       * vo = gate ? gate->sum_out : (add ? (float *) add->data : nullptr);
+    const float * vc = gate ? gate->r : nullptr;
+    const int n4 = (int) (K/4);
+    if (vec_on && n4 <= 4096 && al(vx) && al(vb) && al(vo) && al(vc) && al(w->data) && al(mul->data) && al(xh)) {
+        const int vpt = n4 <= 1024 ? 1 : (n4 <= 2048 ? 2 : 4);
+        const int bs  = std::max(32, ((n4 + vpt - 1)/vpt + 31)/32*32);
+        auto go = [&](auto vpt_tag, auto mode_tag) {
+            mmvq_h1_rms_norm_mul_vec<decltype(vpt_tag)::value, decltype(mode_tag)::value><<<1, bs, 0, ctx.stream()>>>(
+                vx, (const float *) w->data, (float *) mul->data, xh, xs, (int) K, eps, vb, vo, vc, gate ? gate->g : nullptr);
+        };
+        auto by_mode = [&](auto vpt_tag) {
+            if (gate) {
+                go(vpt_tag, std::integral_constant<int, 2>{});
+            } else if (add) {
+                go(vpt_tag, std::integral_constant<int, 1>{});
+            } else {
+                go(vpt_tag, std::integral_constant<int, 0>{});
+            }
+        };
+        if (vpt == 1) {
+            by_mode(std::integral_constant<int, 1>{});
+        } else if (vpt == 2) {
+            by_mode(std::integral_constant<int, 2>{});
+        } else {
+            by_mode(std::integral_constant<int, 4>{});
+        }
+    } else if (gate != nullptr) {
         mmvq_h1_rms_norm_mul<1024, true, true><<<1, 1024, 0, ctx.stream()>>>(
             gate->a, (const float *) w->data, (float *) mul->data, xh, xs, (int) K, eps, gate->s, gate->sum_out, gate->r, gate->g);
     } else if (add != nullptr) {
