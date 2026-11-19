@@ -4406,6 +4406,56 @@ struct test_shexp_gate : public test_case {
     }
 };
 
+// p100-series (phase CVT): prompt-size dense matmuls on the cuBLAS fp16 path. mode 0 = gate / up -> SWIGLU (the fp16-input SWIGLU
+// fusion), mode 1 = three matmuls of one activation summed (q / k / v: the src1 fp16 cache), mode 2 = 0 followed by the down matmul
+struct test_cublas_cvt : public test_case {
+    const ggml_type type;
+    const int64_t k, n, t;
+    const int mode;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CUBLAS_CVT";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, k, n, t, mode);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_cublas_cvt(ggml_type type = GGML_TYPE_Q8_0, int64_t k = 1024, int64_t n = 2048, int64_t t = 512, int mode = 0)
+        : type(type), k(k), n(n), t(t), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, t);
+        ggml_tensor * w0 = ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * w1 = ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_set_name(x, "x"); ggml_set_name(w0, "w0"); ggml_set_name(w1, "w1");
+        ggml_tensor * a = ggml_mul_mat(ctx, w0, x);
+        ggml_tensor * b = ggml_mul_mat(ctx, w1, x);
+        ggml_tensor * out;
+        if (mode == 1) {
+            ggml_tensor * w2 = ggml_new_tensor_2d(ctx, type, k, n);
+            ggml_set_name(w2, "w2");
+            out = ggml_add(ctx, ggml_add(ctx, a, b), ggml_mul_mat(ctx, w2, x));
+        } else {
+            out = ggml_swiglu_split(ctx, a, b);
+            if (mode == 2) {
+                ggml_tensor * wd = ggml_new_tensor_2d(ctx, type, n, k);
+                ggml_set_name(wd, "wd");
+                out = ggml_mul_mat(ctx, wd, out);
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -12051,6 +12101,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_shexp_gate(n, 1, 3));
     }
     test_cases.emplace_back(new test_shexp_gate(1000, 3, 1));   // < 1024 columns: the norm stays separate, the 4-node tail fuses
+    // p100-series (phase CVT): cuBLAS fp16 path conversions (src1 cache, fp16-input SWIGLU) at prompt sizes, plus a decode-size
+    // control (t = 4: the matvec fusions keep it)
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_F16}) {
+        for (int mode : {0, 1, 2}) {
+            for (int64_t t : {4, 64, 512}) {
+                test_cases.emplace_back(new test_cublas_cvt(type, 1024, 2048, t, mode));
+            }
+        }
+    }
     for (int64_t n : {2816, 5120, 6656}) {   // phase NBS: the h1 norm (plain / add / gated) at gemma4 / Swift / glimmer widths
         for (int tail : {3, 4, 5}) {
             test_cases.emplace_back(new test_shexp_gate(n, 1, tail));

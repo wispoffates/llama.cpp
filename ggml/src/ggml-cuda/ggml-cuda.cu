@@ -2989,6 +2989,59 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
 };
 
+// p100-series (phase CVT): fp16 copy of a contiguous F32 src1 for the cuBLAS fp16 path, kept for the rest of the graph evaluation
+// so the next matmuls reading the same activation (q / k / v, qkv / z, gate / up) skip their conversion. Entries are valid only for
+// the graph_epoch they were made in; keys are the view base at offset 0 (a reshape of the norm output finds it). Same conversion
+// kernel, so bit-identical. GGML_CUDA_CUBLAS_SRC1_CACHE=0 off.
+struct cublas_f16_entry {
+    const ggml_tensor * key  = nullptr;
+    const void *        data = nullptr;
+    int64_t             n    = 0;
+    uint64_t            epoch = 0;
+    void *              buf  = nullptr;
+    size_t              cap  = 0;
+};
+struct cublas_f16_cache {
+    cublas_f16_entry e[3];
+    int              next   = 0;
+    int              device = -1;
+};
+static const half * ggml_cuda_cublas_src1_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_CUBLAS_SRC1_CACHE"); return !e || atoi(e) != 0; }();
+    if (!on || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1)) {
+        return nullptr;
+    }
+    if (ctx.cublas_f16_cache == nullptr) {
+        ctx.cublas_f16_cache = new cublas_f16_cache();
+    }
+    cublas_f16_cache & c = *(cublas_f16_cache *) ctx.cublas_f16_cache;
+    if (c.device != ctx.device) {   // one context per device; never seen to change, but buffers belong to their device
+        c = cublas_f16_cache();
+        c.device = ctx.device;
+    }
+    const ggml_tensor * key = src1->view_src != nullptr && src1->view_offs == 0 ? src1->view_src : src1;
+    const int64_t n = ggml_nelements(src1);
+    for (cublas_f16_entry & e : c.e) {
+        if (e.key == key && e.data == src1->data && e.n == n && e.epoch == ctx.graph_epoch) {
+            return (const half *) e.buf;
+        }
+    }
+    cublas_f16_entry & e = c.e[c.next];
+    c.next = (c.next + 1) % 3;
+    const size_t need = (size_t) n*sizeof(half);
+    if (e.cap < need) {
+        if (e.buf) {
+            CUDA_CHECK(cudaFree(e.buf));   // synchronizes; only when the buffer grows
+        }
+        CUDA_CHECK(cudaMalloc(&e.buf, need));
+        e.cap = need;
+    }
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    to_fp16(src1->data, (half *) e.buf, n, ctx.stream());
+    e.key = key; e.data = src1->data; e.n = n; e.epoch = ctx.graph_epoch;
+    return (const half *) e.buf;
+}
+
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     using traits = batched_mul_mat_traits<compute_type>;
@@ -3071,8 +3124,14 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src0_ptr = src0_alloc.get();
     }
 
+    const cuda_t * src1_cached = nullptr;
+    if constexpr (compute_type == GGML_TYPE_F16) {
+        src1_cached = (const cuda_t *) ggml_cuda_cublas_src1_f16(ctx, src1);   // contiguous: element strides unchanged
+    }
     if (src1->type == compute_type) {
         src1_ptr = (const cuda_t *) src1->data;
+    } else if (src1_cached != nullptr) {
+        src1_ptr = src1_cached;
     } else {
         src1_alloc.alloc(ggml_nelements(src1));
 
@@ -3126,7 +3185,29 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         if constexpr (compute_type == GGML_TYPE_F32) {
             dst_ptr = (char *) dst_ddf;  // Direct F32 output
         } else {
-            dst_ptr = (char *) dst_temp.alloc(ne_dst);
+            // p100-series (phase CVT): a fused consumer (gate / up -> SWIGLU) reads this fp16 result itself
+            int k_def = -1;
+            if constexpr (compute_type == GGML_TYPE_F16) {
+                for (int k = 0; k < 2; ++k) {
+                    if (ctx.cublas_defer[k] == dst && ggml_is_contiguous(dst)) {
+                        k_def = k;
+                    }
+                }
+            }
+            if (k_def >= 0) {
+                const size_t need = (size_t) ne_dst*sizeof(cuda_t);
+                if (ctx.cublas_defer_cap[k_def] < need) {
+                    if (ctx.cublas_defer_buf[k_def]) {
+                        CUDA_CHECK(cudaFree(ctx.cublas_defer_buf[k_def]));
+                    }
+                    CUDA_CHECK(cudaMalloc(&ctx.cublas_defer_buf[k_def], need));
+                    ctx.cublas_defer_cap[k_def] = need;
+                }
+                dst_ptr = (char *) ctx.cublas_defer_buf[k_def];
+                ctx.cublas_deferred[k_def] = true;
+            } else {
+                dst_ptr = (char *) dst_temp.alloc(ne_dst);
+            }
             nbd2 /= sizeof(float) / sizeof(cuda_t);
             nbd3 /= sizeof(float) / sizeof(cuda_t);
         }
@@ -3234,8 +3315,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
 
-    // Convert output back to F32 if needed
-    if (cu_data_type != CUDA_R_32F) {
+    // Convert output back to F32 if needed (not when a fused consumer took the fp16 result)
+    if (cu_data_type != CUDA_R_32F && dst_ptr == (char *) dst_temp.get()) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
         to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
     }
@@ -6727,6 +6808,66 @@ static int ggml_cuda_shexp_gate_try(ggml_backend_cuda_context & ctx, const ggml_
     return 4;
 }
 
+// p100-series (phase CVT): see the caller. Runs both matmuls through the normal dispatch with their output conversion deferred; when
+// both GEMMs left fp16 results, one kernel computes SWIGLU from them, else the deferred one is converted and SWIGLU runs as usual.
+// GGML_CUDA_CUBLAS_GLU_F16=0 off.
+static __global__ void swiglu_f16in_f32(const half * gate, const half * up, float * dst, const int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = ggml_cuda_op_silu_single(__half2float(gate[i])) * __half2float(up[i]);   // = the unfused unary_gated_op_kernel
+    }
+}
+
+static bool ggml_cuda_cublas_glu_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_CUBLAS_GLU_F16"); return !e || atoi(e) != 0; }();
+    if (!on || i + 2 >= cgraph->n_nodes || !ctx.stream_context().concurrent_events.empty()) {
+        return false;
+    }
+    ggml_tensor * m0  = cgraph->nodes[i];
+    ggml_tensor * m1  = cgraph->nodes[i + 1];
+    ggml_tensor * glu = cgraph->nodes[i + 2];
+    if (m1->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+            ggml_get_op_params_i32(glu, 1) != 0 || glu->src[1] == nullptr) {
+        return false;
+    }
+    ggml_tensor * g = glu->src[0];   // silu(g) * u
+    ggml_tensor * u = glu->src[1];
+    if (!((g == m0 && u == m1) || (g == m1 && u == m0))) {
+        return false;
+    }
+    for (const ggml_tensor * t : { (const ggml_tensor *) m0, (const ggml_tensor *) m1, (const ggml_tensor *) glu }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || !ggml_are_same_shape(t, glu) || !(t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return false;
+        }
+    }
+    if (m0->src[1]->ne[1] < 32 || (m0->flags & GGML_TENSOR_FLAG_OUTPUT) || (m1->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1) {
+        return false;   // decode / verify batches stay with the matvec fusions; the GEMM results must have no other reader
+    }
+    ctx.cublas_defer[0] = g;  ctx.cublas_defer[1] = u;
+    ctx.cublas_deferred[0] = ctx.cublas_deferred[1] = false;
+    const bool ok0 = ggml_cuda_compute_forward(ctx, m0);
+    const bool ok1 = ggml_cuda_compute_forward(ctx, m1);
+    ctx.cublas_defer[0] = ctx.cublas_defer[1] = nullptr;
+    GGML_ASSERT(ok0 && ok1);
+    const int64_t n = ggml_nelements(glu);
+    if (ctx.cublas_deferred[0] && ctx.cublas_deferred[1]) {
+        swiglu_f16in_f32<<<(unsigned) ((n + 255)/256), 256, 0, ctx.stream()>>>(
+            (const half *) ctx.cublas_defer_buf[0], (const half *) ctx.cublas_defer_buf[1], (float *) glu->data, n);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+        for (int k = 0; k < 2; ++k) {
+            if (ctx.cublas_deferred[k]) {
+                to_fp32(ctx.cublas_defer_buf[k], (float *) (k == 0 ? g : u)->data, n, ctx.stream());
+            }
+        }
+        GGML_ASSERT(ggml_cuda_compute_forward(ctx, glu));
+    }
+    ctx.cublas_deferred[0] = ctx.cublas_deferred[1] = false;
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -7749,6 +7890,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
+        return 2;
+    }
+
+    // p100-series (phase CVT): prompt-size MUL_MAT(gate) + MUL_MAT(up) -> SWIGLU that nothing above fused: if both GEMMs take the
+    // cuBLAS fp16 path, SWIGLU reads their fp16 results (no fp16 -> f32 conversion launches; exact, so bit-identical)
+    if (node->op == GGML_OP_MUL_MAT && ggml_cuda_cublas_glu_try(*cuda_ctx, cgraph, i)) {
         return 2;
     }
 

@@ -1434,6 +1434,15 @@ struct ggml_backend_cuda_context {
     void * mmvq_h1_cache  = nullptr;
     void * mmvq_f16_cache = nullptr;
 
+    // p100-series (phase CVT): the cuBLAS fp16 path's src1 conversions, reused within one graph evaluation (ggml-cuda.cu), and
+    // matmul outputs whose fp16 -> f32 conversion a fused consumer takes over (gate / up -> SWIGLU): while cublas_defer[k] is set,
+    // a cuBLAS fp16 GEMM producing that tensor leaves its fp16 result in cublas_defer_buf[k] and sets cublas_deferred[k]
+    void *              cublas_f16_cache      = nullptr;
+    const ggml_tensor * cublas_defer[2]       = { nullptr, nullptr };
+    void *              cublas_defer_buf[2]   = { nullptr, nullptr };
+    size_t              cublas_defer_cap[2]   = { 0, 0 };
+    bool                cublas_deferred[2]    = { false, false };
+
     // p100-series: nodes a fusion already computed out of order (e.g. a SET_ROWS a few nodes after the norm that wrote its rows);
     // the graph loop skips them. Cleared at the start of every graph evaluation.
     const ggml_tensor * fuse_skip[8] = { nullptr };
