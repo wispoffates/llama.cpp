@@ -1438,6 +1438,7 @@ struct ggml_backend_cuda_context {
     // matmul outputs whose fp16 -> f32 conversion a fused consumer takes over (gate / up -> SWIGLU): while cublas_defer[k] is set,
     // a cuBLAS fp16 GEMM producing that tensor leaves its fp16 result in cublas_defer_buf[k] and sets cublas_deferred[k]
     void *              cublas_f16_cache      = nullptr;
+    void *              tile_mm_cache         = nullptr;   // tile-mm.cu: prepared activations (+ MUL_MAT_ID routing), per graph_epoch
     const ggml_tensor * cublas_defer[2]       = { nullptr, nullptr };
     void *              cublas_defer_buf[2]   = { nullptr, nullptr };
     size_t              cublas_defer_cap[2]   = { 0, 0 };

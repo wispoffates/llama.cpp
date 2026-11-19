@@ -4456,6 +4456,62 @@ struct test_cublas_cvt : public test_case {
     }
 };
 
+// p100-series (phase CVT): gate / up MUL_MAT_ID of one routing -> SWIGLU (the tile GEMM prep + routing cache; prompt sizes take tile_mm)
+struct test_moe_gate_up : public test_case {
+    const ggml_type type;
+    const int64_t n_expert, n_used, k, m, t;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GATE_UP";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n_expert, n_used, k, m, t);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_moe_gate_up(ggml_type type, int64_t n_expert, int64_t n_used, int64_t k, int64_t m, int64_t t)
+        : type(type), n_expert(n_expert), n_used(n_used), k(k), m(m), t(t) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * wg  = ggml_new_tensor_3d(ctx, type, k, m, n_expert);
+        ggml_tensor * wu  = ggml_new_tensor_3d(ctx, type, k, m, n_expert);
+        ggml_tensor * x   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, t);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, t);
+        ggml_set_name(wg, "wg"); ggml_set_name(wu, "wu"); ggml_set_name(x, "x"); ggml_set_name(ids, "ids");
+        ggml_tensor * g = ggml_mul_mat_id(ctx, wg, x, ids);
+        ggml_tensor * u = ggml_mul_mat_id(ctx, wu, x, ids);
+        ggml_tensor * out = ggml_swiglu_split(ctx, g, u);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * x = ggml_get_first_tensor(ctx); x != NULL; x = ggml_get_next_tensor(ctx, x)) {
+            if (x->type == GGML_TYPE_I32) {
+                for (int64_t r = 0; r < ggml_nrows(x); r++) {
+                    std::vector<int32_t> data(n_expert);
+                    for (int i = 0; i < n_expert; i++) {
+                        data[i] = i;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(x, data.data(), r * x->nb[1], n_used * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(x);
+            }
+        }
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -12109,6 +12165,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_cublas_cvt(type, 1024, 2048, t, mode));
             }
         }
+    }
+    // tile GEMM prep cache: MoE gate / up expert matmuls of one routing (test_mul_mat_id style, two weights, same ids) -> SWIGLU
+    for (int64_t t : {16, 100, 512}) {
+        test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q4_K, 16, 4, 1024, 512, t));
+        test_cases.emplace_back(new test_moe_gate_up(GGML_TYPE_Q5_K, 16, 4, 1024, 512, t));
     }
     for (int64_t n : {2816, 5120, 6656}) {   // phase NBS: the h1 norm (plain / add / gated) at gemma4 / Swift / glimmer widths
         for (int tail : {3, 4, 5}) {

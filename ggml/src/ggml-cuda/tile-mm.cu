@@ -1,4 +1,5 @@
 #include "tile-mm.cuh"
+#include <algorithm>
 #include "mmid.cuh"
 
 #include <atomic>
@@ -646,6 +647,61 @@ static bool tmm_type_ok(const ggml_type type) {
            type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ1_M;
 }
 
+// p100-series (phase CVT): the prepared activation (XS + S) of a tile GEMM -- and for MUL_MAT_ID the routing (ids_src1 / ids_dst /
+// bounds / tiles) -- kept for the rest of the graph evaluation: the next tile GEMM of the same activation (gate / up of the shared
+// expert, gate / up expert matmuls of one routing) reuses it instead of re-running tile_mm_prep (+ the ids helper and tile list).
+// Entries are valid only for the graph_epoch they were made in; identical inputs give identical bytes, so bit-identical.
+// GGML_CUDA_TILE_PREP_CACHE=0 off.
+struct tmm_cache_entry {
+    int64_t  key[12] = { 0 };
+    uint64_t epoch   = 0;
+    bool     used    = false;
+    char *   buf     = nullptr;
+    size_t   cap     = 0;
+};
+// 2 entries: enough for gate -> up of one activation with another tile GEMM in between (qwen36: experts gate / up / down, then the
+// shared expert's gate / up). They are persistent device buffers on top of the pool (~23 MB each for a 512-token MoE prompt at K
+// 2816), so keep the count small for the VRAM-tight entries (Flash-Next).
+struct tmm_cache {
+    tmm_cache_entry e[2];
+    int             next = 0;
+};
+static bool tmm_prep_cache_on() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_TILE_PREP_CACHE"); return !e || atoi(e) != 0; }();
+    return on;
+}
+static const ggml_tensor * tmm_key_base(const ggml_tensor * t) {
+    return t->view_src != nullptr && t->view_offs == 0 ? t->view_src : t;
+}
+// returns the entry (buf holds >= bytes); hit = it already holds this key's contents from this graph evaluation
+static tmm_cache_entry & tmm_cache_get(ggml_backend_cuda_context & ctx, const int64_t (&key)[12], const size_t bytes, bool & hit) {
+    if (ctx.tile_mm_cache == nullptr) {
+        ctx.tile_mm_cache = new tmm_cache();
+    }
+    tmm_cache & c = *(tmm_cache *) ctx.tile_mm_cache;
+    for (tmm_cache_entry & e : c.e) {
+        if (e.used && e.epoch == ctx.graph_epoch && std::equal(key, key + 12, e.key)) {
+            hit = true;
+            return e;
+        }
+    }
+    hit = false;
+    tmm_cache_entry & e = c.e[c.next];
+    c.next = (c.next + 1) % 2;
+    if (e.cap < bytes) {
+        if (e.buf) {
+            CUDA_CHECK(cudaFree(e.buf));   // synchronizes; only when the buffer grows
+        }
+        CUDA_CHECK(cudaMalloc(&e.buf, bytes));
+        e.cap = bytes;
+    }
+    std::copy(key, key + 12, e.key);
+    e.epoch = ctx.graph_epoch;
+    e.used  = true;
+    return e;
+}
+static size_t tmm_align(const size_t n) { return (n + 255) & ~(size_t) 255; }
+
 bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     // GGML_CUDA_TILE_Q6K=0 / _Q5K=0 / _Q4K=0 / _Q8_0=0 / _Q4_0=0 turn a type off; GGML_CUDA_TILE_MIN / _MAX (or the older _Q6K_MIN / _MAX) set the column
     // range that takes this path (default 9..127, q6_K 9..80 -- see below). 81..127 used to go to dequantize -> fp16 cuBLAS; phase TWV
@@ -683,16 +739,28 @@ bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     splits = (nu + u_per - 1)/u_per;
 
     cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<__half> xs(ctx.pool(), N*K);
-    ggml_cuda_pool_alloc<float>  sc(ctx.pool(), N*nwin);
     ggml_cuda_pool_alloc<float>  part(ctx.pool(), (int64_t) splits*N*M);
-    {
+    const int64_t sx1 = (int64_t) (src1->nb[1]/sizeof(float));
+    __half * xs_p = nullptr;
+    float  * sc_p = nullptr;
+    ggml_cuda_pool_alloc<__half> xs(ctx.pool());
+    ggml_cuda_pool_alloc<float>  sc(ctx.pool());
+    bool hit = false;
+    if (tmm_prep_cache_on()) {
+        const int64_t key[12] = { 1, (int64_t) (intptr_t) tmm_key_base(src1), (int64_t) (intptr_t) src1->data, N, K, sx1, nwin, 0, 0, 0, 0, 0 };
+        tmm_cache_entry & e = tmm_cache_get(ctx, key, tmm_align((size_t) N*K*sizeof(__half)) + (size_t) N*nwin*sizeof(float), hit);
+        xs_p = (__half *) e.buf;
+        sc_p = (float *) (e.buf + tmm_align((size_t) N*K*sizeof(__half)));
+    } else {
+        xs_p = xs.alloc(N*K);
+        sc_p = sc.alloc(N*nwin);
+    }
+    if (!hit) {
         const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) N);
-        tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), nullptr, xs.get(), sc.get(),
-                                            (int) K, nwin);
+        tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, sx1, nullptr, xs_p, sc_p, (int) K, nwin);
     }
     tile_mm_params prm = {};
-    prm.W = src0->data; prm.row_bytes = (int64_t) src0->nb[1]; prm.XS = xs.get(); prm.S = sc.get(); prm.P = part.get();
+    prm.W = src0->data; prm.row_bytes = (int64_t) src0->nb[1]; prm.XS = xs_p; prm.S = sc_p; prm.P = part.get();
     prm.M = (int) M; prm.K = (int) K; prm.N = (int) N; prm.nwin = nwin; prm.u_per = u_per;
     tile_mm_dispatch<false>(type, tn, prm, splits, stream);
     tile_mm_reduce<<<std::min<int64_t>(1024, (N*M + 255)/256), 256, 0, stream>>>(part.get(), (float *) dst->data, (int) M, (int) N,
@@ -727,28 +795,46 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int max_tiles = (int) ((total + bn - 1)/bn + n_experts);
 
     cudaStream_t stream = ctx.stream();
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), total);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), total);
-    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
-    ggml_cuda_pool_alloc<int32_t> tiles(ctx.pool(), 2*max_tiles + 1);
-    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), max_tiles); // filled by the helper, unused here
-    ggml_cuda_pool_alloc<__half>  xs(ctx.pool(), total*K);
-    ggml_cuda_pool_alloc<float>   sc(ctx.pool(), total*nwin);
     const int si1  = (int) (ids->nb[1]/sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2]/src1->nb[1]);
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tile_spec.get(), (int) n_experts, (int) n_tokens,
-                                   (int) n_used, (int) nch, bn, si1, sis1, /*write_inverse =*/ false, stream);
-    tile_mm_id_tiles<<<1, 256, (n_experts + 1)*sizeof(int), stream>>>((const int32_t *) ids->data, si1, (int) n_tokens, (int) n_used,
-                                   (int) n_experts, bn, bounds.get(), tiles.get() + 1, tiles.get());
-    {
+    const int64_t sx1 = (int64_t) (src1->nb[1]/sizeof(float));
+    // one block: ids_src1 | ids_dst | bounds | tiles | XS | S (cached), or pool allocations (cache off)
+    const size_t o_ids_dst = tmm_align((size_t) total*sizeof(int32_t));
+    const size_t o_bounds  = o_ids_dst + tmm_align((size_t) total*sizeof(int32_t));
+    const size_t o_tiles   = o_bounds + tmm_align((size_t) (n_experts + 1)*sizeof(int32_t));
+    const size_t o_xs      = o_tiles + tmm_align((size_t) (2*max_tiles + 1)*sizeof(int32_t));
+    const size_t o_sc      = o_xs + tmm_align((size_t) total*K*sizeof(__half));
+    const size_t bytes     = o_sc + (size_t) total*nwin*sizeof(float);
+    ggml_cuda_pool_alloc<char> blk(ctx.pool());
+    char * base = nullptr;
+    bool hit = false;
+    if (tmm_prep_cache_on()) {
+        const int64_t key[12] = { 2, (int64_t) (intptr_t) tmm_key_base(src1), (int64_t) (intptr_t) src1->data,
+                                  (int64_t) (intptr_t) tmm_key_base(ids), (int64_t) (intptr_t) ids->data, n_tokens, n_used, nch, K, sx1,
+                                  (int64_t) n_experts*65536 + bn, (int64_t) si1*65536 + sis1 };
+        base = tmm_cache_get(ctx, key, bytes, hit).buf;
+    } else {
+        base = blk.alloc(bytes);
+    }
+    int32_t * ids_src1 = (int32_t *) base;
+    int32_t * ids_dst  = (int32_t *) (base + o_ids_dst);
+    int32_t * bounds   = (int32_t *) (base + o_bounds);
+    int32_t * tiles    = (int32_t *) (base + o_tiles);
+    __half  * xs       = (__half *)  (base + o_xs);
+    float   * sc       = (float *)   (base + o_sc);
+    if (!hit) {
+        ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tile_spec(ctx.pool(), max_tiles); // filled by the helper, unused here
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1, ids_dst, tile_spec.get(), (int) n_experts, (int) n_tokens,
+                                       (int) n_used, (int) nch, bn, si1, sis1, /*write_inverse =*/ false, stream);
+        tile_mm_id_tiles<<<1, 256, (n_experts + 1)*sizeof(int), stream>>>((const int32_t *) ids->data, si1, (int) n_tokens, (int) n_used,
+                                       (int) n_experts, bn, bounds, tiles + 1, tiles);
         const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) total);
-        tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), ids_src1.get(), xs.get(),
-                                            sc.get(), (int) K, nwin);
+        tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, sx1, ids_src1, xs, sc, (int) K, nwin);
     }
     tile_mm_params prm = {};
     prm.W = src0->data; prm.row_bytes = (int64_t) src0->nb[1]; prm.expert_bytes = (int64_t) src0->nb[2];
-    prm.XS = xs.get(); prm.S = sc.get(); prm.dst = (float *) dst->data; prm.s1 = (int64_t) (dst->nb[1]/sizeof(float));
-    prm.ids_dst = ids_dst.get(); prm.bounds = bounds.get(); prm.tiles = tiles.get() + 1; prm.ntiles = tiles.get();
+    prm.XS = xs; prm.S = sc; prm.dst = (float *) dst->data; prm.s1 = (int64_t) (dst->nb[1]/sizeof(float));
+    prm.ids_dst = ids_dst; prm.bounds = bounds; prm.tiles = tiles + 1; prm.ntiles = tiles;
     prm.M = (int) M; prm.K = (int) K; prm.N = 0; prm.nwin = nwin;
     tile_mm_dispatch<true>(type, tn, prm, max_tiles, stream);
     CUDA_CHECK(cudaGetLastError());
