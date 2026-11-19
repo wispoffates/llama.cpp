@@ -878,9 +878,41 @@ static void rms_norm_mul_rope_cuda_gs(
     }
 }
 
+// p100-series port of upstream #32500: the position index of a rope pair for MROPE / IMROPE (as rope_multi computes it)
+static __device__ __forceinline__ int rope_mrope_pos_idx(
+        const int iw, const int channel, const int nchannels,
+        const mrope_sections sections, const bool is_imrope) {
+    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
+    const int sec_w     = sections.v[1] + sections.v[0];
+    const int sector    = (iw / 2) % sect_dims;
+
+    if (is_imrope) {
+        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {
+            return channel + nchannels * 1;
+        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {
+            return channel + nchannels * 2;
+        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {
+            return channel;
+        } else {
+            return channel + nchannels * 3;
+        }
+    } else {
+        if (sector < sections.v[0]) {
+            return channel;
+        } else if (sector < sec_w) {
+            return channel + nchannels * 1;
+        } else if (sector < sec_w + sections.v[2]) {
+            return channel + nchannels * 2;
+        } else {
+            return channel + nchannels * 3;
+        }
+    }
+}
+
 // fused RMS_NORM + MUL + ROPE (+ VIEW + SET_ROWS)
 // one block per row: block_reduce gives the norm scale, then each thread applies mul and rope to the elements it owns
-template <int block_size, bool has_ff, typename D>
+// p100-series: supports_mrope (#32500) is chosen per launch from the rope mode, so NORMAL / NEOX models compile to the v5.11 code
+template <int block_size, bool has_ff, typename D, bool supports_mrope = false>
 static __global__ void rms_norm_mul_rope_f32(
         const float * x, D * dst, const int ncols,
         const int64_t s01, const int64_t s02, const int64_t s03,
@@ -894,8 +926,9 @@ static __global__ void rms_norm_mul_rope_f32(
         const float freq_scale, const float ext_factor, const float attn_factor,
         const rope_corr_dims corr_dims, const float theta_scale,
         const float * freq_factors,
+        const mrope_sections sections,
         const int64_t * row_indices, const int set_rows_stride,
-        const bool is_neox) {
+        const bool is_neox, const bool is_mrope, const bool is_imrope) {
     ggml_cuda_pdl_lc();
     const int row     = blockIdx.x;
     const int channel = blockIdx.y;
@@ -931,7 +964,7 @@ static __global__ void rms_norm_mul_rope_f32(
     for (int i0 = 2*tid; i0 < ncols; i0 += 2*block_size) {
         int ix0;
         int ix1;
-        if (is_neox && i0 < n_dims) {
+        if ((is_neox || (supports_mrope && is_mrope)) && i0 < n_dims) {
             ix0 = i0/2;
             ix1 = i0/2 + n_dims/2;
         } else {
@@ -948,7 +981,8 @@ static __global__ void rms_norm_mul_rope_f32(
             continue;
         }
 
-        const float theta_base  = pos[channel]*powf(theta_scale, i0/2.0f);
+        const int   pos_idx     = supports_mrope && is_mrope ? rope_mrope_pos_idx(i0, channel, gridDim.y, sections, is_imrope) : channel;
+        const float theta_base  = pos[pos_idx]*powf(theta_scale, i0/2.0f);
         const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
 
         float cos_theta;
@@ -975,9 +1009,11 @@ static void rms_norm_mul_rope_cuda(
         const float freq_scale, const float freq_base, const float ext_factor, const float attn_factor,
         const rope_corr_dims corr_dims,
         const float * freq_factors,
+        const mrope_sections sections,
         const int64_t * row_indices, const int set_rows_stride,
-        const bool is_neox, cudaStream_t stream) {
+        const bool is_neox, const bool is_mrope, const bool is_imrope, cudaStream_t stream) {
     if (nchannels > UINT16_MAX || nsamples > UINT16_MAX) {   // #28175 guard: grid.y/z would overflow
+        GGML_ASSERT(!is_mrope);   // ggml_cuda_should_fuse_rms_norm_mul_rope refuses MROPE here
         rms_norm_mul_rope_cuda_gs<D>(x, dst, ncols, nrows, nchannels, nsamples, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
             mul_ncols, mul_nrows, mul_nchannels, mul_nsamples, n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
             freq_factors, row_indices, set_rows_stride, is_neox, stream);
@@ -994,38 +1030,59 @@ static void rms_norm_mul_rope_cuda(
     const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
     const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
 
-    if (ncols < 1024) {
-        const dim3 block_dims(256, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
+    auto launch_block = [&](auto bs_tag, auto mrope_tag) {
+        constexpr int  block_size     = decltype(bs_tag)::value;
+        constexpr bool supports_mrope = decltype(mrope_tag)::value;
+        const dim3 block_dims(block_size, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, block_size > WARP_SIZE ? 32*sizeof(float) : 0, stream};
         if (freq_factors == nullptr) {
-            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<256, false, D>, launch_params,
+            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<block_size, false, D, supports_mrope>, launch_params,
                 x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
+                freq_factors, sections, row_indices, set_rows_stride, is_neox, is_mrope, is_imrope);
         } else {
-            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<256, true, D>, launch_params,
+            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<block_size, true, D, supports_mrope>, launch_params,
                 x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
                 mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
+                freq_factors, sections, row_indices, set_rows_stride, is_neox, is_mrope, is_imrope);
         }
+    };
+    auto launch = [&](auto bs_tag) {
+        if (is_mrope) {
+            launch_block(bs_tag, std::true_type{});
+        } else {
+            launch_block(bs_tag, std::false_type{});
+        }
+    };
+
+    // #32500 block sizes: narrow blocks for multi-token rows of <= 256 values (one block per head and token), 256 threads kept for
+    // single-token rows. GGML_CUDA_NORM_ROPE_TUNE=0 = the v5.11 choice (256 below 1024 values, else 1024).
+    static const bool tune = [] { const char * e = getenv("GGML_CUDA_NORM_ROPE_TUNE"); return !(e && atoi(e) == 0); }();
+    const bool single = nchannels == 1 && nsamples == 1;
+    if (!tune) {
+        if (ncols < 1024) {
+            launch(std::integral_constant<int, 256>{});
+        } else {
+            launch(std::integral_constant<int, 1024>{});
+        }
+    } else if (is_neox && !is_mrope && single && ncols <= 8 * WARP_SIZE) {
+        launch(std::integral_constant<int, 256>{});
+    } else if (ncols <= 2 * WARP_SIZE) {
+        launch(std::integral_constant<int, WARP_SIZE>{});
+    } else if (ncols <= 4 * WARP_SIZE) {
+        launch(std::integral_constant<int, 2 * WARP_SIZE>{});
+    } else if (ncols <= 8 * WARP_SIZE) {
+        if (single) {
+            launch(std::integral_constant<int, 256>{});
+        } else {
+            launch(std::integral_constant<int, 2 * WARP_SIZE>{});
+        }
+    } else if (ncols < 1024) {
+        launch(std::integral_constant<int, 256>{});
     } else {
-        const dim3 block_dims(1024, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, 32*sizeof(float), stream};
-        if (freq_factors == nullptr) {
-            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<1024, false, D>, launch_params,
-                x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
-                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
-        } else {
-            ggml_cuda_kernel_launch(rms_norm_mul_rope_f32<1024, true, D>, launch_params,
-                x, dst, ncols, s01, s02, s03, s1, s2, s3, eps, mul, mul_s01, mul_s02, mul_s03,
-                mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
-                n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
-                freq_factors, row_indices, set_rows_stride, is_neox);
-        }
+        launch(std::integral_constant<int, 1024>{});
     }
 }
 
@@ -1064,6 +1121,7 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     float attn_factor;
     float beta_fast;
     float beta_slow;
+    mrope_sections sections;
 
     memcpy(&freq_base,   (const int32_t *) rope->op_params +  5, sizeof(float));
     memcpy(&freq_scale,  (const int32_t *) rope->op_params +  6, sizeof(float));
@@ -1071,8 +1129,11 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
     memcpy(&attn_factor, (const int32_t *) rope->op_params +  8, sizeof(float));
     memcpy(&beta_fast,   (const int32_t *) rope->op_params +  9, sizeof(float));
     memcpy(&beta_slow,   (const int32_t *) rope->op_params + 10, sizeof(float));
+    memcpy(&sections.v,  (const int32_t *) rope->op_params + 11, sizeof(int) * 4);
 
-    const bool is_neox = mode & GGML_ROPE_TYPE_NEOX;
+    const bool is_neox   = mode & GGML_ROPE_TYPE_NEOX;
+    const bool is_mrope  = (mode & GGML_ROPE_TYPE_MROPE) != 0;
+    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
 
     const int32_t * pos = (const int32_t *) rope->src[1]->data;
 
@@ -1106,14 +1167,14 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-            freq_factors, row_indices, set_rows_stride, is_neox, stream);
+            freq_factors, sections, row_indices, set_rows_stride, is_neox, is_mrope, is_imrope, stream);
     } else if (dst_type == GGML_TYPE_F16) {
         rms_norm_mul_rope_cuda((const float *) x->data, (half *) dst_d,
             x->ne[0], x->ne[1], x->ne[2], x->ne[3], s01, s02, s03, s1, s2, s3, eps,
             (const float *) mul_src->data, mul_s01, mul_s02, mul_s03,
             mul_src->ne[0], mul_src->ne[1], mul_src->ne[2], mul_src->ne[3],
             n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor, corr_dims,
-            freq_factors, row_indices, set_rows_stride, is_neox, stream);
+            freq_factors, sections, row_indices, set_rows_stride, is_neox, is_mrope, is_imrope, stream);
     } else {
         GGML_ABORT("fatal error");
     }

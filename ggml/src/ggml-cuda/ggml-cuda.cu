@@ -5221,10 +5221,25 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
         return false;
     }
 
-    // the fused kernel handles the norm/neox rope modes only
+    // the fused kernel handles the norm/neox rope modes, and MROPE / IMROPE (#32500 port; GGML_CUDA_NORM_ROPE_MROPE=0 turns those off)
     const int mode = ((const int32_t *) rope->op_params)[2];
-    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX) {
+    static const bool fuse_mrope = [] { const char * e = getenv("GGML_CUDA_NORM_ROPE_MROPE"); return !(e && atoi(e) == 0); }();
+    const bool mrope_ok = fuse_mrope && (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE);
+    if (mode != GGML_ROPE_TYPE_NORMAL && mode != GGML_ROPE_TYPE_NEOX && !mrope_ok) {
         return false;
+    }
+
+    if (mode & GGML_ROPE_TYPE_MROPE) {
+        int sections[4];
+        memcpy(sections, (const int32_t *) rope->op_params + 11, sizeof(int) * 4);
+        const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+        if ((sections[0] <= 0 && sections[1] <= 0 && sections[2] <= 0) || sect_dims <= 0) {
+            return false;
+        }
+        // p100-series: the #28175 guard kernel (grid.y/z > 65535) has no MROPE path
+        if (rms_norm->src[0]->ne[2] > UINT16_MAX || rms_norm->src[0]->ne[3] > UINT16_MAX) {
+            return false;
+        }
     }
 
     const int n_dims = ((const int32_t *) rope->op_params)[1];
