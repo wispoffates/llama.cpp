@@ -1060,8 +1060,11 @@ static void rms_norm_mul_rope_cuda(
     // #32500 block sizes: narrow blocks for multi-token rows of <= 256 values (one block per head and token), 256 threads kept for
     // single-token rows. GGML_CUDA_NORM_ROPE_TUNE=0 = the v5.11 choice (256 below 1024 values, else 1024).
     static const bool tune = [] { const char * e = getenv("GGML_CUDA_NORM_ROPE_TUNE"); return !(e && atoi(e) == 0); }();
+    // p100-series: on sm_60 the narrow blocks lose at 1..4 tokens (decode, MTP verify, gemma4's -np 3 batches: +3..+17 % per call)
+    // and win from prompt batches up (512 tokens: -41..-64 %) -> only from GGML_CUDA_NORM_ROPE_TUNE_MIN tokens (rows x channels).
+    static const int tune_min = [] { const char * e = getenv("GGML_CUDA_NORM_ROPE_TUNE_MIN"); return e ? atoi(e) : 32; }();
     const bool single = nchannels == 1 && nsamples == 1;
-    if (!tune) {
+    if (!tune || (int64_t) nchannels*nsamples < tune_min) {
         if (ncols < 1024) {
             launch(std::integral_constant<int, 256>{});
         } else {

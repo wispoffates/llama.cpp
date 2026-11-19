@@ -11921,7 +11921,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_rope({n, t, 1, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
         }
     }
-    for (int64_t t : {1, 4, 512}) {
+    for (int64_t t : {1, 4, 8, 16, 32, 64, 512}) {
         for (int64_t h : {12, 2}) {
             test_cases.emplace_back(new test_rms_norm_mul_rope({256, h, t, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_IMROPE, true, true,
                                                                GGML_TYPE_F16, false, true, GGML_TYPE_F32, 64));
