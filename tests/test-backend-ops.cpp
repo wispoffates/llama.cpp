@@ -11978,9 +11978,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // p100-series (exp/norm-up): RMS_NORM * w at our models' widths (qwen36 / ornith 2048, Flash-Next 2560, gemma4 2816, Swift 5120)
     // for 1 / 4 / 512 tokens (#29720 float4 port), and the fused q/k RMS_NORM * w + ROPE at our head shapes per GPU (#32500 port):
     // qwen35 family IMROPE head 256 (64 rotated), 12 q / 2 k heads; gemma4 NEOX head 256 x 8 and head 512 x 4
-    for (int64_t n : {2048, 2560, 2816, 5120}) {
+    for (int64_t n : {2048, 2560, 2816, 5120, 6656}) {   // + glimmer 6656 (phase NBS)
         for (int64_t t : {1, 4, 512}) {
             test_cases.emplace_back(new test_rms_norm_mul_rope({n, t, 1, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
+        }
+    }
+    // p100-series (phase NBS): short rows -- head norms * w (128 / 256 wide, heads per GPU x tokens) and the GDN gated norm
+    for (int64_t t : {1, 4, 512}) {
+        for (int64_t h : {16, 24}) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope({128, h, t, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
+            test_cases.emplace_back(new test_rms_norm_mul_gated({128, h, t, 1}));
+        }
+        for (int64_t h : {8, 16}) {
+            test_cases.emplace_back(new test_rms_norm_mul_rope({256, h, t, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
+        }
+        for (int64_t n : {5120, 6656}) {
+            test_cases.emplace_back(new test_shexp_gate(n, t, 1));   // add+norm vec kernel at the wide widths
         }
     }
     for (int64_t t : {1, 4, 8, 16, 32, 64, 512}) {

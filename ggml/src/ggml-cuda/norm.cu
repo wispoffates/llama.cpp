@@ -143,13 +143,15 @@ static __global__ void rms_norm_f32(const float * x,
     // looped kernels cost gemma4 serving 1.6 % in v5.12). vec_vpt > 0: ncols % 4 == 0, x / dst / mul / add rows 16-byte aligned and
     // mul / add rows as long as x's (checked by the launcher); each thread holds vec_vpt float4 of the row.
     if constexpr (vec_vpt > 0) {
+        // block_size 0: the block is sized at launch (p100-series norm block-size fit, GGML_CUDA_NORM_BS)
+        const int      bsz    = block_size > 0 ? block_size : (int) blockDim.x;
         const int      ncols4 = ncols / 4;
         const float4 * x4     = (const float4 *) x;
         float4         xs[vec_vpt];
         float          tmp = 0.0f;
 #pragma unroll
         for (int k = 0; k < vec_vpt; k++) {
-            const int i = tid + k*block_size;
+            const int i = tid + k*bsz;
             if (i < ncols4) {
                 xs[k] = x4[i];
                 tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
@@ -159,7 +161,7 @@ static __global__ void rms_norm_f32(const float * x,
         const float scale = rsqrtf(tmp / ncols + eps);
 #pragma unroll
         for (int k = 0; k < vec_vpt; k++) {
-            const int i = tid + k*block_size;
+            const int i = tid + k*bsz;
             if (i < ncols4) {
                 float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
                 if constexpr (do_multiply) {
@@ -784,6 +786,76 @@ static void group_norm_f32_cuda(
 
 // p100-series: vectorised launch (#29720 port). Returns false when the shapes / alignment do not allow it (or GGML_CUDA_RMS_NORM_VEC=0);
 // the caller then launches the scalar kernels. Block size and float4-per-thread follow upstream's choice by n4 = ncols / 4.
+// p100-series norm block sizes (11-19, phase NBS). GGML_CUDA_NORM_BS: 0 = upstream's table by n4 (32/128/256/512/1024, 1024 x 4),
+// K = 1/2/4: at least K float4 per thread, block = the row rounded up to a warp (no idle threads past the row's end).
+// GGML_CUDA_NORM_ROWS = R > 1: rows of <= 32 float4 (<= 128 floats) run one warp per row, R rows per block (one-warp blocks cap
+// sm_60 at 32 resident warps per SM); the sum is exactly the one-warp block's, so results are bit-identical.
+// GGML_CUDA_NORM_SHORT64=1: rows of 33..64 float4 the same way with 2 float4 per lane (changes the sum order vs the 128 block).
+static int norm_env_int(const char * name, const int def) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : def;
+}
+static int rms_norm_bs_mode()    { static const int v = norm_env_int("GGML_CUDA_NORM_BS", 0);      return v; }
+static int rms_norm_rows_mode()  { static const int v = norm_env_int("GGML_CUDA_NORM_ROWS", 1);    return v; }
+static bool rms_norm_short64()   { static const int v = norm_env_int("GGML_CUDA_NORM_SHORT64", 0); return v != 0; }
+
+// fitted vec config for n4 float4 per row: false if it does not fit 1024 threads x 4
+static bool rms_norm_fit_cfg(const int n4, const int min_vpt, int & bs, int & vpt) {
+    vpt = n4 <= 1024 ? 1 : (n4 <= 2048 ? 2 : 4);
+    vpt = std::max(vpt, min_vpt);
+    if (vpt > 4 || n4 > 4096) {
+        return false;
+    }
+    bs = std::max(32, ((n4 + vpt - 1)/vpt + 31)/32*32);
+    return bs <= 1024;
+}
+
+// one warp per row (blockDim = 32 x R), rows flattened over (row, channel, sample); mul (if any) is one row broadcast
+template <int vpt, bool do_multiply, bool do_scale>
+static __global__ void __launch_bounds__(1024) rms_norm_f32_rows(const float * x, float * dst, const int ncols, const int nrows,
+        const int nchannels, const int64_t nrows_tot, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const float * mul, const float scale_out) {
+    const int64_t r = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
+    if (r >= nrows_tot) {
+        return;
+    }
+    const int     row     = r % nrows;
+    const int64_t rc      = r / nrows;
+    const int     channel = rc % nchannels;
+    const int64_t sample  = rc / nchannels;
+    const int     tid     = threadIdx.x;
+    const float4 * x4 = (const float4 *) (x + sample*stride_sample + channel*stride_channel + row*stride_row);
+    float4       * d4 = (float4 *) (dst + r*ncols);
+    const int ncols4 = ncols / 4;
+    float4 xs[vpt];
+    float  tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*WARP_SIZE;
+        if (i < ncols4) {
+            xs[k] = x4[i];
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = warp_reduce_sum(tmp);
+    const float scale = rsqrtf(tmp / ncols + eps);
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*WARP_SIZE;
+        if (i < ncols4) {
+            float4 o = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
+            if constexpr (do_multiply) {
+                const float4 m = ((const float4 *) mul)[i];
+                o.x *= m.x; o.y *= m.y; o.z *= m.z; o.w *= m.w;
+            }
+            if constexpr (do_scale) {
+                o.x *= scale_out; o.y *= scale_out; o.z *= scale_out; o.w *= scale_out;
+            }
+            d4[i] = o;
+        }
+    }
+}
+
 static bool rms_norm_vec_enabled() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_RMS_NORM_VEC"); return !(e && atoi(e) == 0); }();
     return on;
@@ -811,18 +883,49 @@ static bool rms_norm_f32_try_vec(const dim3 blocks_num, const float * x, float *
     if (do_add && (add_ncols != (uint32_t) ncols || !rms_norm_vec_rows_ok(add, add_stride_row, add_stride_channel, add_stride_sample))) {
         return false;
     }
-    auto launch = [&](auto bs_tag, auto vpt_tag) {
+    const int n4 = ncols / 4;
+    const bool mul_one_row = !do_multiply || (mul_nrows_packed.z == 1 && mul_nchannels_packed.z == 1 && mul_nsamples_packed.z == 1);
+    const int  rows_r      = rms_norm_rows_mode();
+    if (!do_add && mul_one_row && ((n4 <= 32 && rows_r > 1) || (n4 > 32 && n4 <= 64 && rms_norm_short64()))) {
+        const int     R         = std::max(1, std::min(rows_r, 32));
+        const int64_t nrows_tot = (int64_t) blocks_num.x*blocks_num.y*blocks_num.z;
+        const dim3    grid((unsigned) ((nrows_tot + R - 1)/R)), block(WARP_SIZE, R);
+        if (n4 <= 32) {
+            rms_norm_f32_rows<1, do_multiply, do_scale><<<grid, block, 0, stream>>>(x, dst, ncols, blocks_num.x, blocks_num.y, nrows_tot,
+                stride_row, stride_channel, stride_sample, eps, mul, scale_out);
+        } else {
+            rms_norm_f32_rows<2, do_multiply, do_scale><<<grid, block, 0, stream>>>(x, dst, ncols, blocks_num.x, blocks_num.y, nrows_tot,
+                stride_row, stride_channel, stride_sample, eps, mul, scale_out);
+        }
+        return true;
+    }
+    auto launch_bs = [&](auto bs_tag, auto vpt_tag, const int bs_rt) {
         constexpr int bs  = decltype(bs_tag)::value;
         constexpr int vpt = decltype(vpt_tag)::value;
-        const dim3 block_dims(bs, 1, 1);
-        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, bs > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
+        const int nthr = bs > 0 ? bs : bs_rt;
+        const dim3 block_dims(nthr, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = {blocks_num, block_dims, nthr > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
         ggml_cuda_kernel_launch(rms_norm_f32<bs, do_multiply, do_add, do_scale, vpt>, launch_params,
             x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
             mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
             add, add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed, add_nchannels_packed, add_nsamples_packed,
             scale_out);
     };
-    const int n4 = ncols / 4;
+    auto launch = [&](auto bs_tag, auto vpt_tag) { launch_bs(bs_tag, vpt_tag, 0); };
+    if (rms_norm_bs_mode() > 0) {
+        int bs, vpt;
+        if (!rms_norm_fit_cfg(n4, rms_norm_bs_mode(), bs, vpt)) {
+            return false;
+        }
+        if (vpt == 1) {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{}, bs);
+        } else if (vpt == 2) {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 2>{}, bs);
+        } else {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 4>{}, bs);
+        }
+        return true;
+    }
     if (n4 <= 32) {
         launch(std::integral_constant<int, 32>{},   std::integral_constant<int, 1>{});
     } else if (n4 <= 128) {
@@ -1012,6 +1115,51 @@ static __global__ void rms_norm_mul_gated_f32(
     }
 }
 
+// p100-series (phase NBS): one warp per row, R rows per block (GGML_CUDA_GDN_NORM_ROWS = R; 0 = the 256-thread kernel above), the
+// row in registers as float4 (read once). Same per-element arithmetic; the sum's order is the vec norm's, not the 256 block's.
+template <int vpt, bool sigmoid_gate>
+static __global__ void __launch_bounds__(1024) rms_norm_mul_gated_rows(
+        const float * x, const float * w, const float * z, float * dst, const int ncols, const float eps,
+        const int z_ne1, const int z_ne2, const int64_t z_s1, const int64_t z_s2, const int64_t z_s3, const int64_t nrows) {
+    const int64_t row = (int64_t) blockIdx.x*blockDim.y + threadIdx.y;
+    if (row >= nrows) {
+        return;
+    }
+    const int     tid = threadIdx.x;
+    const int64_t i1  = row % z_ne1;
+    const int64_t i2  = (row / z_ne1) % z_ne2;
+    const int64_t i3  = row / ((int64_t) z_ne1 * z_ne2);
+    const float4 * x4 = (const float4 *) (x + row*ncols);
+    const float4 * z4 = (const float4 *) (z + i1*z_s1 + i2*z_s2 + i3*z_s3);
+    const float4 * w4 = (const float4 *) w;
+    float4       * d4 = (float4 *) (dst + row*ncols);
+    const int ncols4 = ncols / 4;
+    float4 xs[vpt];
+    float  tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*WARP_SIZE;
+        if (i < ncols4) {
+            xs[k] = x4[i];
+            tmp += xs[k].x*xs[k].x + xs[k].y*xs[k].y + xs[k].z*xs[k].z + xs[k].w*xs[k].w;
+        }
+    }
+    tmp = warp_reduce_sum(tmp);
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+    auto gate = [](const float v) { return sigmoid_gate ? ggml_cuda_op_sigmoid_single(v) : ggml_cuda_op_silu_single(v); };
+#pragma unroll
+    for (int k = 0; k < vpt; k++) {
+        const int i = tid + k*WARP_SIZE;
+        if (i < ncols4) {
+            const float4 zv = z4[i];
+            const float4 wv = w4[i];
+            d4[i] = make_float4(gate(zv.x) * (scale * xs[k].x * wv.x), gate(zv.y) * (scale * xs[k].y * wv.y),
+                                gate(zv.z) * (scale * xs[k].z * wv.z), gate(zv.w) * (scale * xs[k].w * wv.w));
+        }
+    }
+}
+
 void ggml_cuda_op_rms_norm_mul_gated(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, const ggml_tensor * w,
                                      const ggml_tensor * z, ggml_tensor * dst, bool sigmoid_gate) {
     const ggml_tensor * x = rms_norm->src[0];
@@ -1023,6 +1171,26 @@ void ggml_cuda_op_rms_norm_mul_gated(ggml_backend_cuda_context & ctx, const ggml
     memcpy(&eps, rms_norm->op_params, sizeof(float));
 
     const int64_t zs1 = z->nb[1] / sizeof(float), zs2 = z->nb[2] / sizeof(float), zs3 = z->nb[3] / sizeof(float);
+    static const int rows_r = norm_env_int("GGML_CUDA_GDN_NORM_ROWS", 0);
+    auto al = [](const void * p) { return ((uintptr_t) p % 16) == 0; };
+    if (rows_r > 0 && ncols % 4 == 0 && ncols <= 256 && al(x->data) && al(z->data) && al(w->data) && al(dst->data) &&
+            zs1 % 4 == 0 && zs2 % 4 == 0 && zs3 % 4 == 0) {
+        const int     R     = std::min(rows_r, 32);
+        const int64_t nrows = ggml_nrows(x);
+        const dim3 grid((unsigned) ((nrows + R - 1)/R)), block(WARP_SIZE, R);
+        auto go = [&](auto vpt_tag, auto sg_tag) {
+            rms_norm_mul_gated_rows<decltype(vpt_tag)::value, decltype(sg_tag)::value><<<grid, block, 0, ctx.stream()>>>(
+                (const float *) x->data, (const float *) w->data, (const float *) z->data, (float *) dst->data, ncols, eps,
+                (int) z->ne[1], (int) z->ne[2], zs1, zs2, zs3, nrows);
+        };
+        if (ncols <= 128) {
+            sigmoid_gate ? go(std::integral_constant<int, 1>{}, std::true_type{}) : go(std::integral_constant<int, 1>{}, std::false_type{});
+        } else {
+            sigmoid_gate ? go(std::integral_constant<int, 2>{}, std::true_type{}) : go(std::integral_constant<int, 2>{}, std::false_type{});
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     const ggml_cuda_kernel_launch_params launch_params = { dim3(ggml_nrows(x)), dim3(256), 0, ctx.stream() };
     if (sigmoid_gate) {
         ggml_cuda_kernel_launch(rms_norm_mul_gated_f32<256, true>, launch_params,
@@ -1432,7 +1600,7 @@ static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_f32(const 
 // would take rms_norm_f32's vec path (#29720 port): same block size and float4-per-thread choice by n4, the same per-thread sum
 // expression and block reduction, so fused == unfused bit for bit again (the scalar kernel above matches the scalar norm path).
 template <int block_size, int vpt, bool GATED>
-static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_vec(const float * a, const float * b, float * sum_out,
+static __global__ void __launch_bounds__(block_size > 0 ? block_size : 1024) add_rms_norm_mul_vec(const float * a, const float * b, float * sum_out,
         const float * mul, float * dst, const int ncols, const int64_t sa, const int64_t sb, const int64_t ss, const int64_t sd,
         const float eps, const float * c, const float * g, const int64_t sc, const int64_t sg) {
     const int row = blockIdx.x;
@@ -1450,11 +1618,12 @@ static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_vec(const 
     }
     __shared__ float s_sum[32];
     const int ncols4 = ncols / 4;
+    const int bsz = block_size > 0 ? block_size : (int) blockDim.x;
     float4 xs[vpt];
     float  tmp = 0.0f;
 #pragma unroll
     for (int k = 0; k < vpt; k++) {
-        const int i = tid + k*block_size;
+        const int i = tid + k*bsz;
         if (i < ncols4) {
             const float4 av = a4[i];
             const float4 bv = b4[i];
@@ -1473,7 +1642,7 @@ static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_vec(const 
     const float scale = rsqrtf(tmp / ncols + eps);
 #pragma unroll
     for (int k = 0; k < vpt; k++) {
-        const int i = tid + k*block_size;
+        const int i = tid + k*bsz;
         if (i < ncols4) {
             float4 r = make_float4(scale*xs[k].x, scale*xs[k].y, scale*xs[k].z, scale*xs[k].w);
             const float4 m = m4[i];
@@ -1493,12 +1662,28 @@ static bool add_rms_norm_mul_try_vec(cudaStream_t stream, const int nrows, const
             (GATED && !al(c, sc))) {
         return false;
     }
-    auto launch = [&](auto bs_tag, auto vpt_tag) {
+    auto launch_bs = [&](auto bs_tag, auto vpt_tag, const int bs_rt) {
         constexpr int bs  = decltype(bs_tag)::value;
         constexpr int vpt = decltype(vpt_tag)::value;
-        add_rms_norm_mul_vec<bs, vpt, GATED><<<nrows, bs, 0, stream>>>(a, b, sum_out, mul, dst, ncols, sa, sb, ss, sd, eps, c, g, sc, sg);
+        add_rms_norm_mul_vec<bs, vpt, GATED><<<nrows, bs > 0 ? bs : bs_rt, 0, stream>>>(a, b, sum_out, mul, dst, ncols, sa, sb, ss, sd,
+            eps, c, g, sc, sg);
     };
+    auto launch = [&](auto bs_tag, auto vpt_tag) { launch_bs(bs_tag, vpt_tag, 0); };
     const int n4 = ncols / 4;
+    if (rms_norm_bs_mode() > 0) {
+        int bs, vpt;
+        if (!rms_norm_fit_cfg(n4, rms_norm_bs_mode(), bs, vpt)) {
+            return false;
+        }
+        if (vpt == 1) {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 1>{}, bs);
+        } else if (vpt == 2) {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 2>{}, bs);
+        } else {
+            launch_bs(std::integral_constant<int, 0>{}, std::integral_constant<int, 4>{}, bs);
+        }
+        return true;
+    }
     if (n4 <= 32) {
         launch(std::integral_constant<int, 32>{},   std::integral_constant<int, 1>{});
     } else if (n4 <= 128) {
