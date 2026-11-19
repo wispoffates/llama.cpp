@@ -66,6 +66,22 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
   is not carried over to them), the expert cache no longer checks a warmup flag upstream removed (#30565), and upstream's removal of the
   unfused GDN path (#32078) changes nothing at runtime because the series already ran the fused one. #31927's MTP device rows stay off.
   Outputs, draft acceptance and the kernels launched are identical to v5.42 on every production model; speed equal (within 0.4 %).
+- Since v5.44 (upstream `41d8297fe`): norm and conversion work on the P100s got cheaper, and a few kernels round differently.
+  - **Rounding changes:** float4 RMSNorm (upstream #29720), the qwen35-family q/k RMSNorm + IMROPE fusion with tuned blocks (#32500),
+    norm blocks sized to the row, the GDN gated norm one warp per row, and a float4 h1 decode norm.
+    - The narrow blocks and the multi-row norm kernels apply only to large launches (256 / 1024 rows); on sm_60 they lose below that.
+    - Accuracy against F32 references is equal within noise, and better at long gemma4 prompts.
+  - **Bit-identical:** the qwen35moe / qwen4exp shared-expert gate tail fused into the next norm, the cuBLAS fp16 input conversion
+    reused across matmuls of one activation, gate / up results fed to SWIGLU in fp16, and the tile GEMM prep / MoE routing reused for
+    gate and up.
+  - Upstream's LayerNorm * w + b fusion (#32454) runs as a separate kernel, so the plain LayerNorm keeps its v5.43 code.
+  - **Gate R44:**
+    - serving decode qwen36 +6..8 %, ornith +7..8 %, gemma4 +3..4 %, nemotron +1..2 %; Swift and glimmer flat.
+    - Flash-Next MTP acceptance 0.61 -> 0.57 (rounding), with decode still about +2 %; its caches use about 150 MiB more VRAM per GPU.
+  - **Opt-outs** (all of them together reproduce v5.43 bit for bit): `GGML_CUDA_RMS_NORM_VEC=0`, `GGML_CUDA_NORM_ROPE_MROPE=0`,
+    `GGML_CUDA_NORM_ROPE_TUNE=0`, `GGML_CUDA_SHEXP_GATE=0`, `GGML_CUDA_NORM_BS=0`, `GGML_CUDA_NORM_ROWS=1`, `GGML_CUDA_GDN_NORM_ROWS=0`,
+    `GGML_CUDA_H1_NORM_VEC=0`, `GGML_CUDA_CUBLAS_SRC1_CACHE=0`, `GGML_CUDA_CUBLAS_GLU_F16=0`, `GGML_CUDA_TILE_PREP_CACHE=0`,
+    `GGML_CUDA_NORM_MUL_FUSE=0`.
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
