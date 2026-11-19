@@ -1372,13 +1372,24 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // (it is the next residual) and kept in registers for the norm. Every value is computed by exactly the operations of the unfused ADD
 // kernel (a + b) and rms_norm_f32<1024, true>'s register path (same accumulation order, reduction, scale and multiply), so the
 // results are bit-identical; saves the ADD launch and one read of the row. GGML_CUDA_FUSE_ADD_NORM=0 disables.
-template <int block_size>
+// GATED (the shared-expert tail, ggml_cuda_shexp_gate): x = (a + b*sigmoid(g[row])) + c. __fmul_rn keeps the product its own
+// rounding (the unfused MUL stores it) -- nvcc would otherwise contract it into the add as an FMA.
+static __device__ __forceinline__ float shexp_gate_x(const float a, const float s, const float sig, const float r) {
+    return (a + __fmul_rn(s, sig)) + r;
+}
+
+template <int block_size, bool GATED = false>
 static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_f32(const float * a, const float * b, float * sum_out,
         const float * mul, float * dst, const int ncols, const int64_t sa, const int64_t sb, const int64_t ss, const int64_t sd,
-        const float eps) {
+        const float eps, const float * c = nullptr, const float * g = nullptr, const int64_t sc = 0, const int64_t sg = 0) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
     a += row*sa; b += row*sb; sum_out += row*ss; dst += row*sd;
+    float sig = 0.0f;
+    if constexpr (GATED) {
+        c  += row*sc;
+        sig = ggml_cuda_op_sigmoid_single(g[row*sg]);
+    }
 
     constexpr int max_regs = 8;
     __shared__ float s_sum[32];
@@ -1388,7 +1399,11 @@ static __global__ void __launch_bounds__(block_size) add_rms_norm_mul_f32(const 
 #pragma unroll
     for (int u = 0; u < max_regs; ++u) {
         const int col = tid + u*block_size;
-        xv[u] = col < ncols ? a[col] + b[col] : 0.0f;
+        if constexpr (GATED) {
+            xv[u] = col < ncols ? shexp_gate_x(a[col], b[col], sig, c[col]) : 0.0f;
+        } else {
+            xv[u] = col < ncols ? a[col] + b[col] : 0.0f;
+        }
         tmp += xv[u] * xv[u];
     }
 #pragma unroll
@@ -1453,6 +1468,41 @@ bool ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor 
     add_rms_norm_mul_f32<1024><<<(int) add->ne[1], 1024, 0, ctx.stream()>>>(
         (const float *) a->data, (const float *) b->data, (float *) add->data, (const float *) w->data, (float *) mul->data,
         (int) add->ne[0], a->nb[1]/fs, b->nb[1]/fs, add->nb[1]/fs, mul->nb[1]/fs, eps);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+static __global__ void shexp_gate_add_f32(const float * a, const float * s, const float * g, const float * r, float * dst,
+        const int ncols, const int64_t sa, const int64_t ss, const int64_t sg, const int64_t sr, const int64_t sd) {
+    const int row = blockIdx.y;
+    const int col = blockIdx.x*blockDim.x + threadIdx.x;
+    if (col >= ncols) {
+        return;
+    }
+    const float sig = ggml_cuda_op_sigmoid_single(g[row*sg]);
+    dst[row*sd + col] = shexp_gate_x(a[row*sa + col], s[row*ss + col], sig, r[row*sr + col]);
+}
+
+void ggml_cuda_op_shexp_gate_add(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_gate & p) {
+    const dim3 grid((unsigned) ((p.ncols + 255)/256), (unsigned) p.nrows);
+    shexp_gate_add_f32<<<grid, 256, 0, ctx.stream()>>>(p.a, p.s, p.g, p.r, p.sum_out, (int) p.ncols, p.sa, p.ss, p.sg, p.sr, p.so);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_op_shexp_gate_rms_norm_mul(ggml_backend_cuda_context & ctx, const ggml_cuda_shexp_gate & p, const ggml_tensor * rms,
+                                          ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const int64_t ncols = p.ncols, nrows = p.nrows;
+    if (w->type != GGML_TYPE_F32 || ggml_nelements(w) != ncols || w->nb[0] != sizeof(float) || mul->type != GGML_TYPE_F32 ||
+            mul->nb[0] != sizeof(float) || mul->ne[0] != ncols || mul->ne[1] != nrows || ggml_nrows(mul) != nrows ||
+            mul->nb[1] % sizeof(float) != 0 || ncols < 1024 || ncols > 1024*8 || nrows > 65535) {
+        return false;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    add_rms_norm_mul_f32<1024, true><<<(int) nrows, 1024, 0, ctx.stream()>>>(
+        p.a, p.s, p.sum_out, (const float *) w->data, (float *) mul->data, (int) ncols, p.sa, p.ss, p.so,
+        (int64_t) (mul->nb[1]/sizeof(float)), eps, p.r, p.g, p.sr, p.sg);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }

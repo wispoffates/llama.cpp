@@ -6632,6 +6632,98 @@ static int ggml_cuda_find_set_rows_ahead(const ggml_cgraph * cgraph, const int i
     return -1;
 }
 
+// p100-series: shared-expert gate tail. Nodes i.. = SIGMOID(g) [g: 1 x T], MUL(s, sig) [N x T, broadcast], ADD(a, mul) (moe_out +),
+// ADD(add1, r) (+ residual), optionally RMS_NORM(add2) + MUL(w). The sigmoid, the gated product and moe_out + shexp are elided
+// (single use, not outputs); add2 (the next residual) and the norm product are written. Returns the nodes fused (6, 4) or 0.
+// GGML_CUDA_SHEXP_GATE=0 off, =2 without the norm (A/B attribution).
+static int ggml_cuda_shexp_gate_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    static const int mode = [] { const char * e = getenv("GGML_CUDA_SHEXP_GATE"); return e ? atoi(e) : 1; }();
+    // a concurrent-stream region could put the moe / shexp branches on different streams with add1 as the join
+    if (mode == 0 || i + 3 >= cgraph->n_nodes || !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    ggml_tensor * sig  = cgraph->nodes[i];
+    ggml_tensor * mul  = cgraph->nodes[i + 1];
+    ggml_tensor * add1 = cgraph->nodes[i + 2];
+    ggml_tensor * add2 = cgraph->nodes[i + 3];
+    auto other = [](const ggml_tensor * n, const ggml_tensor * x) -> const ggml_tensor * {
+        return n->src[0] == x ? n->src[1] : (n->src[1] == x ? n->src[0] : nullptr);
+    };
+    if (mul->op != GGML_OP_MUL || add1->op != GGML_OP_ADD || add2->op != GGML_OP_ADD) {
+        return 0;
+    }
+    const ggml_tensor * g = sig->src[0];
+    const ggml_tensor * s = other(mul, sig);
+    const ggml_tensor * a = other(add1, mul);
+    const ggml_tensor * r = other(add2, add1);
+    if (s == nullptr || a == nullptr || r == nullptr || s == sig || a == mul || r == add1) {
+        return 0;
+    }
+    const int64_t N = add2->ne[0], T = add2->ne[1];
+    auto rows_f32 = [&](const ggml_tensor * t) {   // N x T, contiguous rows
+        return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && t->ne[0] == N && t->ne[1] == T && t->ne[2] == 1 &&
+            t->ne[3] == 1 && t->nb[1] % sizeof(float) == 0;
+    };
+    if (!rows_f32(s) || !rows_f32(a) || !rows_f32(r) || !rows_f32(mul) || !rows_f32(add1) || !rows_f32(add2) ||
+            sig->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || g->ne[0] != 1 || g->ne[1] != T || g->ne[2] != 1 ||
+            g->ne[3] != 1 || !ggml_are_same_shape(sig, g) || g->nb[1] % sizeof(float) != 0 || T > 65535) {
+        return 0;
+    }
+    for (int k = 0; k < 3; ++k) {   // elided: one consumer, not an output
+        const ggml_tensor * t = cgraph->nodes[i + k];
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i + k) != 1) {
+            return 0;
+        }
+    }
+    for (int k = 0; k < 4; ++k) {
+        if (!(cgraph->nodes[i + k]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return 0;
+        }
+    }
+    // outputs vs inputs: a written row may alias an input row exactly (each thread reads its columns before writing them, a block
+    // only writes its own row); never a partial overlap, and never g (every block reads its row's gate)
+    auto range_overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * x0 = (const char *) x->data, * y0 = (const char *) y->data;
+        return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+    };
+    auto same = [](const ggml_tensor * x, const ggml_tensor * y) { return x->data == y->data && x->nb[1] == y->nb[1]; };
+    auto out_ok = [&](const ggml_tensor * o) {
+        for (const ggml_tensor * in : { a, s, r }) {
+            if (range_overlap(o, in) && !same(o, in)) {
+                return false;
+            }
+        }
+        return !range_overlap(o, g);
+    };
+    if (!out_ok(add2)) {
+        return 0;
+    }
+    ggml_cuda_shexp_gate p;
+    p.a = (const float *) a->data;  p.sa = a->nb[1]/sizeof(float);
+    p.s = (const float *) s->data;  p.ss = s->nb[1]/sizeof(float);
+    p.g = (const float *) g->data;  p.sg = g->nb[1]/sizeof(float);
+    p.r = (const float *) r->data;  p.sr = r->nb[1]/sizeof(float);
+    p.sum_out = (float *) add2->data; p.so = add2->nb[1]/sizeof(float);
+    p.ncols = N; p.nrows = T;
+
+    if (mode == 1 && i + 5 < cgraph->n_nodes) {
+        ggml_tensor * rms  = cgraph->nodes[i + 4];
+        ggml_tensor * mul2 = cgraph->nodes[i + 5];
+        const ggml_tensor * w = mul2->op == GGML_OP_MUL ? other(mul2, rms) : nullptr;
+        if (rms->op == GGML_OP_RMS_NORM && rms->src[0] == add2 && w != nullptr && w != rms && rows_f32(rms) && rows_f32(mul2) &&
+                (rms->flags & GGML_TENSOR_FLAG_COMPUTE) && (mul2->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                !(rms->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, i + 4) == 1 &&
+                out_ok(mul2) && !range_overlap(mul2, add2) && !range_overlap(mul2, w) && !range_overlap(add2, w)) {
+            if (ggml_cuda_mmvq_h1_shexp_gate_rms_norm_mul_try(ctx, cgraph, i + 4, p) ||
+                    ggml_cuda_op_shexp_gate_rms_norm_mul(ctx, p, rms, mul2)) {
+                return 6;
+            }
+        }
+    }
+    ggml_cuda_op_shexp_gate_add(ctx, p);
+    return 4;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -6703,6 +6795,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+        }
+    }
+
+    // p100-series: shared-expert tail (qwen35moe / qwen4exp): SIGMOID(gate) -> MUL(shexp, broadcast) -> ADD(moe_out) -> ADD(residual)
+    // [-> RMS_NORM -> MUL(w), the next pre-norm] in one launch instead of 3 (+ the norm's), same roundings as unfused
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+        const int n_fused = ggml_cuda_shexp_gate_try(*cuda_ctx, cgraph, i);
+        if (n_fused > 0) {
+            return n_fused - 1;
         }
     }
 

@@ -4336,6 +4336,68 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
+// p100-series: qwen35moe / qwen4exp shared-expert tail (CUDA fusion ggml_cuda_shexp_gate_try): out = (a + s*sigmoid(g)) + r with one
+// gate value per row; tail 0 = that sum, 1 = + rms_norm * w (next pre-norm), 2 = 1 + the sum again (both outputs checked),
+// 3 = 1 feeding a q4_0 matvec (the h1 decode path, rows must be 1)
+struct test_shexp_gate : public test_case {
+    const int64_t n;
+    const int64_t t;
+    const int tail;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHEXP_GATE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, t, tail);
+    }
+
+    double max_nmse_err() override {
+        return tail == 3 ? 5e-4 : 1e-7;
+    }
+
+    test_shexp_gate(int64_t n = 2048, int64_t t = 1, int tail = 1) : n(n), t(t), tail(tail) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, t);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, t);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, t);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, t);
+        ggml_set_name(g, "g"); ggml_set_name(s, "s"); ggml_set_name(a, "a"); ggml_set_name(r, "r");
+
+        ggml_tensor * sig = ggml_sigmoid(ctx, g);
+        ggml_tensor * m   = ggml_mul(ctx, s, sig);
+        ggml_tensor * f   = ggml_add(ctx, a, m);
+        ggml_tensor * l   = ggml_add(ctx, f, r);
+        ggml_set_name(l, "l");
+        if (tail == 0) {
+            return l;
+        }
+        ggml_tensor * w   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_name(w, "w");
+        ggml_tensor * out = ggml_mul(ctx, ggml_rms_norm(ctx, l, 1e-6f), w);
+        ggml_set_name(out, "normed");
+        if (tail == 2) {
+            out = ggml_add(ctx, out, l);
+        } else if (tail == 3) {
+            ggml_tensor * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, n, 256);
+            ggml_set_name(wq, "wq");
+            out = ggml_mul_mat(ctx, wq, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * x = ggml_get_first_tensor(ctx); x != NULL; x = ggml_get_next_tensor(ctx, x)) {
+            init_tensor_uniform(x, -4.f, 4.f);
+        }
+    }
+};
+
 // GGML_OP_UNARY(RELU) + GGML_OP_SQR (fused operation)
 struct test_relu_sqr : public test_case {
     const ggml_type type;
@@ -11958,6 +12020,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
+    // p100-series: shared-expert tail fusion (qwen36 / ornith 2048, Flash-Next 2560; 1..4-token decode / verify, prompt rows)
+    for (int64_t n : {2048, 2560}) {
+        for (int64_t t : {1, 2, 4, 512}) {
+            for (int tail : {0, 1, 2}) {
+                test_cases.emplace_back(new test_shexp_gate(n, t, tail));
+            }
+        }
+        test_cases.emplace_back(new test_shexp_gate(n, 1, 3));
+    }
+    test_cases.emplace_back(new test_shexp_gate(1000, 3, 1));   // < 1024 columns: the norm stays separate, the 4-node tail fuses
     test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { 1025, 2, 3, 2 }, 1e-5f, false, true));
     test_cases.emplace_back(new test_norm_mul_add(GGML_TYPE_F32, { 8192, 1, 1, 1 }, 1e-5f, false, true));
     for (uint32_t n : { 768, 1024, 1280 }) {

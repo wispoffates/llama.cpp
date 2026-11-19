@@ -833,10 +833,12 @@ bool ggml_cuda_mmvq_h1_glu_try(ggml_backend_cuda_context & ctx, const ggml_tenso
 // arithmetic, so dst is bit-identical), and each warp's 32 consecutive outputs -- one h1 block -- also written as x/s in fp16 with
 // s = max|x| (mmvq_h1_prep's arithmetic). Saves the prep launch of every matvec fed by a norm (gemma4: 91 per GPU per token).
 // ADD: x = x + b first (the residual ADD, exactly the unfused a + b), stored to sum_out (the next residual), then the norm.
-template <int block_size, bool ADD = false>
+// GATED (with ADD): x = (x + b*sigmoid(*g)) + c, the shared-expert tail (ggml_cuda_shexp_gate), same roundings as unfused.
+template <int block_size, bool ADD = false, bool GATED = false>
 static __global__ void __launch_bounds__(block_size) mmvq_h1_rms_norm_mul(
         const float * x, const float * w, float * dst, __half * __restrict__ XH,
-        float * __restrict__ XS, const int ncols, const float eps, const float * b = nullptr, float * sum_out = nullptr) {
+        float * __restrict__ XS, const int ncols, const float eps, const float * b = nullptr, float * sum_out = nullptr,
+        const float * c = nullptr, const float * g = nullptr) {
     // no __restrict__ on x / b / sum_out / dst: with ADD the sum may be written in place of an input (row-for-row alias)
     constexpr int max_regs = 8;
     __shared__ float s_sum[32];
@@ -844,10 +846,17 @@ static __global__ void __launch_bounds__(block_size) mmvq_h1_rms_norm_mul(
 
     float xv[max_regs];
     float tmp = 0.0f;
+    float sig = 0.0f;
+    if constexpr (GATED) {
+        sig = ggml_cuda_op_sigmoid_single(*g);
+    }
 #pragma unroll
     for (int u = 0; u < max_regs; ++u) {
         const int col = tid + u*block_size;
-        if constexpr (ADD) {
+        if constexpr (GATED) {
+            // __fmul_rn: the unfused MUL stores the product (no FMA contraction into the add)
+            xv[u] = col < ncols ? (x[col] + __fmul_rn(b[col], sig)) + c[col] : 0.0f;
+        } else if constexpr (ADD) {
             xv[u] = col < ncols ? x[col] + b[col] : 0.0f;
         } else {
             xv[u] = col < ncols ? x[col] : 0.0f;
@@ -889,10 +898,21 @@ static __global__ void __launch_bounds__(block_size) mmvq_h1_rms_norm_mul(
 }
 
 // add != nullptr: cgraph->nodes[i] is the RMS_NORM of `add` (the residual ADD at i - 1), fused in front
-static bool mmvq_h1_rms_norm_mul_try_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, ggml_tensor * add);
+// gate != nullptr: the RMS_NORM's input is the shared-expert tail sum (p100-series shexp gate fusion), computed in front
+static bool mmvq_h1_rms_norm_mul_try_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, ggml_tensor * add,
+                                          const ggml_cuda_shexp_gate * gate = nullptr);
 
 bool ggml_cuda_mmvq_h1_rms_norm_mul_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
     return mmvq_h1_rms_norm_mul_try_impl(ctx, cgraph, i, nullptr);
+}
+
+bool ggml_cuda_mmvq_h1_shexp_gate_rms_norm_mul_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i,
+                                                   const ggml_cuda_shexp_gate & gate) {
+    // nodes i, i+1 = RMS_NORM, MUL; the caller checked the gate tail and the aliasing
+    if (gate.nrows != 1) {
+        return false;
+    }
+    return mmvq_h1_rms_norm_mul_try_impl(ctx, cgraph, i, nullptr, &gate);
 }
 
 bool ggml_cuda_mmvq_h1_add_rms_norm_mul_try(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
@@ -904,7 +924,8 @@ bool ggml_cuda_mmvq_h1_add_rms_norm_mul_try(ggml_backend_cuda_context & ctx, con
     return mmvq_h1_rms_norm_mul_try_impl(ctx, cgraph, i + 1, add);
 }
 
-static bool mmvq_h1_rms_norm_mul_try_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, ggml_tensor * add) {
+static bool mmvq_h1_rms_norm_mul_try_impl(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i, ggml_tensor * add,
+                                          const ggml_cuda_shexp_gate * gate) {
     // GGML_CUDA_MMVQ_H1_NORM=0: keep the separate prep (A/B)
     static const bool enabled = [] {
         const char * s = getenv("GGML_CUDA_MMVQ_H1");
@@ -944,7 +965,10 @@ static bool mmvq_h1_rms_norm_mul_try_impl(ggml_backend_cuda_context & ctx, const
     mmvq_h1_entry & entry = mmvq_h1_slot(ctx, mul, mul->data, 1, K, 0, hit);
     __half * xh = (__half *) entry.buf;
     float  * xs = (float *) ((char *) entry.buf + (size_t) K*sizeof(__half));
-    if (add != nullptr) {
+    if (gate != nullptr) {
+        mmvq_h1_rms_norm_mul<1024, true, true><<<1, 1024, 0, ctx.stream()>>>(
+            gate->a, (const float *) w->data, (float *) mul->data, xh, xs, (int) K, eps, gate->s, gate->sum_out, gate->r, gate->g);
+    } else if (add != nullptr) {
         mmvq_h1_rms_norm_mul<1024, true><<<1, 1024, 0, ctx.stream()>>>(
             (const float *) add->src[0]->data, (const float *) w->data, (float *) mul->data, xh, xs, (int) K, eps,
             (const float *) add->src[1]->data, (float *) add->data);
