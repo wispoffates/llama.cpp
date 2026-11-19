@@ -6713,7 +6713,10 @@ static int ggml_cuda_shexp_gate_try(ggml_backend_cuda_context & ctx, const ggml_
         if (rms->op == GGML_OP_RMS_NORM && rms->src[0] == add2 && w != nullptr && w != rms && rows_f32(rms) && rows_f32(mul2) &&
                 (rms->flags & GGML_TENSOR_FLAG_COMPUTE) && (mul2->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                 !(rms->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, i + 4) == 1 &&
-                out_ok(mul2) && !range_overlap(mul2, add2) && !range_overlap(mul2, w) && !range_overlap(add2, w)) {
+                out_ok(mul2) && !range_overlap(mul2, add2) && !range_overlap(mul2, w) && !range_overlap(add2, w) &&
+                // an ADD of the norm product is left to rms_norm_mul_add (its FMA rounding; as the residual add+norm fusion does)
+                !(i + 6 < cgraph->n_nodes && cgraph->nodes[i + 6]->op == GGML_OP_ADD &&
+                  (cgraph->nodes[i + 6]->src[0] == mul2 || cgraph->nodes[i + 6]->src[1] == mul2))) {
             if (ggml_cuda_mmvq_h1_shexp_gate_rms_norm_mul_try(ctx, cgraph, i + 4, p) ||
                     ggml_cuda_op_shexp_gate_rms_norm_mul(ctx, p, rms, mul2)) {
                 return 6;
