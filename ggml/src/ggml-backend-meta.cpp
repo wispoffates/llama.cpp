@@ -2592,7 +2592,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     continue;
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
-                if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                // p100-series (LND): the AllReduce receive/step buffers hold the node that is actually reduced -- the delayed one
+                // below (e.g. the summed MoE output [n_embd, T], not the per-expert partials [n_embd, n_used, T], n_used x larger);
+                // GGML_META_TMP_DELAYED=0 sizes them by every partial node as before
+                static const bool tmp_delayed = [] { const char * e = getenv("GGML_META_TMP_DELAYED"); return e == nullptr || atoi(e) != 0; }();
+                if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && !tmp_delayed) {
                     max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
                 }
                 const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
@@ -2601,6 +2605,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 const int i_delayed = get_i_delayed(i);
+                if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && tmp_delayed) {
+                    max_tmp_size = std::max(max_tmp_size, ggml_nbytes(cgraph->nodes[i_delayed]));
+                }
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
