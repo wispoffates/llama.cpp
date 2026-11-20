@@ -134,22 +134,33 @@ llama-server --model gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf --mmproj mmproj-gemm
 - MTP draft: `mtp-Qwen3.8-27B-Q4_0.gguf` (Q4_0; 1.37 GB) sha256 `50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e`
 - Vision projector: `mmproj-Swift-1.5-Qwen3.8-27B-F16.gguf` sha256 `daa1116c9422fa390cc8688495da0e91781f92841dfc3b31a378ff252571745a`
 
+Production (since 2026-10-26):
+
 ```bash
-GGML_CUDA_P2P=1 \
-llama-server --model Swift-1.5-Qwen3.8-27B-Q6_K.gguf --mmproj mmproj-Swift-1.5-Qwen3.8-27B-F16.gguf \
-  --chat-template-kwargs '{"reasoning_effort":"medium"}' --model-draft mtp-Qwen3.8-27B-Q4_0.gguf \
+GGML_CUDA_P2P=1 LLAMA_MTP_DRAFT_VOCAB=98304 \
+llama-server --model Swift-1.5-Qwen3.8-27B-Q6_K.gguf --mmproj mmproj-Swift-1.5-Qwen3.8-27B-F16.gguf --mmproj-device CUDA1 \
+  --chat-template-kwargs '{"reasoning_effort":"medium"}' --model-draft mtp-Qwen3.8-27B-Q4_0.gguf --device-draft CUDA0 \
   --ctx-size 24576 --n-gpu-layers 99 --fit off --flash-attn on --split-mode tensor --parallel 2 --kv-unified --jinja \
-  --spec-type draft-mtp,ngram-mod --spec-ngram-mod-n-max 63 --tensor-split 49.3,50.7
+  --spec-type draft-mtp,ngram-mod --spec-ngram-mod-n-max 63
 ```
 
-Since 2026-10-24 (after these measurements) production also sets `LLAMA_MTP_DRAFT_VOCAB=98304`: the MTP draft scores the first 98,304
-token ids instead of the default 81,920 (+0.7 % decode on average, +1.5 % on triage, identical output).
+Swift rows in the serving tables measured before these two changes used `--tensor-split 49.3,50.7`, no `--mmproj-device` /
+`--device-draft`, and no `LLAMA_MTP_DRAFT_VOCAB`.
 
-Since 2026-10-26 production drops `--tensor-split 49.3,50.7` and adds `--mmproj-device CUDA1 --device-draft CUDA0`. The tensor split
+- `LLAMA_MTP_DRAFT_VOCAB=98304` (since 2026-10-24): the MTP draft scores the first 98,304 token ids instead of the default 81,920
+  (+0.7 % decode on average, +1.5 % on triage, identical output).
+- Even split with the devices pinned (since 2026-10-26), replacing `--tensor-split 49.3,50.7`. The tensor split
 rounds each GPU's share down to whole split units (4 KV-head groups on the attention layers, 16 key heads on the GDN layers), so 49.3
 made every other attention layer 25/75 and every other GDN layer 7/9, and GPU 0 waited ~3.3 ms per token at the AllReduce. An even
 split has no imbalance (decode +3.3 % in llama-bench, +2-3 % serving); VRAM stays balanced by putting the vision projector on GPU 1 and
 the MTP draft on GPU 0 (worst-case peak 14.4 / 14.3 GB per GPU, more headroom than before).
+
+Two more Swift entries run in production, same model files and flags as above unless listed:
+
+- **MTP + ngram-simple:** `--spec-type draft-mtp,ngram-simple` (no `--spec-ngram-mod-n-max`), `--ctx-size 32768`, no `--mmproj-device` /
+  `--device-draft`; same `LLAMA_MTP_DRAFT_VOCAB=98304`.
+- **MTP only:** no `--spec-type` (the MTP draft alone), no `--chat-template-kwargs`, `--ctx-size 32768`, no `--mmproj-device` /
+  `--device-draft`, and no `LLAMA_MTP_DRAFT_VOCAB` (default 81,920 rows).
 
 ### qwen36 35B-A3B (MoE)
 
@@ -157,10 +168,15 @@ the MTP draft on GPU 0 (worst-case peak 14.4 / 14.3 GB per GPU, more headroom th
 - Vision projector: `mmproj-qwen36-F16.gguf` sha256 `8971ee4f331ff0a4c609374f32984b3d4e6dc086c0aa35f1d637fad1829e887f`
 
 ```bash
-GGML_CUDA_P2P=1 GGML_CUDA_FUSE_ADD_NORM=0 \
+GGML_CUDA_P2P=1 GGML_CUDA_FUSE_ADD_NORM=0 GGML_CUDA_TOPK_MOE_STAGE=0 \
 llama-server --model Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf --mmproj mmproj-qwen36-F16.gguf --no-mmproj-offload \
   --ctx-size 163840 --n-gpu-layers 99 --split-mode tensor --flash-attn on --parallel 2 --kv-unified --jinja
 ```
+
+- `GGML_CUDA_FUSE_ADD_NORM=0` (since v5.15): the residual add + RMS norm fusion cost this model ~1.2 % in serving; output identical
+  either way. Since v5.44, the shared-expert gate fusion still folds the layer's last adds into the next norm, bit-identically.
+- `GGML_CUDA_TOPK_MOE_STAGE=0` (since v5.34): keeps the v5.33 top-k MoE router fallback. With the staged (always-fused) router, qwen36
+  looped in its think block on a short "count from 1 to 20" smoke prompt; the v5.33 path gives the same output as before.
 
 ### ornith 35B (MoE)
 
