@@ -1936,11 +1936,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // p100-series (phase LND): the expert-cache pools lend their VRAM to large prompt batches and take it back before any batch
     // that may decide (devices idle at both transitions)
+    if (lru && gtype == ctx_type_to_graph_type(cparams.ctx_type)) {   // GGML_CUDA_LEND_LOG: slow gaps between ubatches
+        static const bool gap_log = [] { const char * e = getenv("GGML_CUDA_LEND_LOG"); return e != nullptr && atoi(e) != 0; }();
+        static int64_t t_prev = 0;
+        static uint32_t n_prev = 0;
+        const int64_t now = ggml_time_us();
+        if (gap_log && t_prev > 0 && now - t_prev > 1500000) {
+            LLAMA_LOG_WARN("%s: %.0f ms since the previous %u-token ubatch started (lent %d), now %u tokens\n", __func__,
+                           (now - t_prev) / 1000.0, n_prev, (int) lru->lent(), ubatch.n_tokens);
+        }
+        t_prev = now;
+        n_prev = ubatch.n_tokens;
+    }
     if (lru && lru->lend_enabled() && gtype == ctx_type_to_graph_type(cparams.ctx_type)) {
         const bool want = (int) ubatch.n_tokens > lru->lend_min();
         if (want != lru->lent()) {
+            static const bool lend_log = [] { const char * e = getenv("GGML_CUDA_LEND_LOG"); return e != nullptr && atoi(e) != 0; }();
+            const int64_t t0 = ggml_time_us();
             ggml_backend_sched_synchronize(sched.get());
+            const int64_t t1 = ggml_time_us();
             lru->set_lent(want);
+            if (lend_log) {
+                LLAMA_LOG_WARN("%s: %s at a %u-token ubatch: sched sync %.1f ms, transition %.1f ms\n", __func__,
+                               want ? "lend" : "return", ubatch.n_tokens, (t1 - t0) / 1000.0, (ggml_time_us() - t1) / 1000.0);
+            }
         }
     }
 

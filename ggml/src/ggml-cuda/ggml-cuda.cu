@@ -9955,8 +9955,13 @@ static void ggml_cuda_lend_sync_all() {
 // loan cannot be returned (VRAM taken by something else) -- the pools then stay lent and the caller must not decide.
 static bool ggml_backend_cuda_lend(int lend) {
 #if defined(GGML_USE_VMM)
+    static const bool lend_log = [] { const char * e = getenv("GGML_CUDA_LEND_LOG"); return e != nullptr && atoi(e) != 0; }();
+    using lclock = std::chrono::steady_clock;
+    const auto lt0 = lclock::now();
+    auto lms = [&](lclock::time_point a, lclock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     std::lock_guard<std::mutex> lock(ggml_cuda_lend_mtx);
     ggml_cuda_lend_sync_all();
+    const auto lt1 = lclock::now();
     static cudaStream_t streams[GGML_CUDA_MAX_DEVICES] = {};
     auto stream_of = [&](int dev) {
         if (streams[dev] == nullptr) {
@@ -9973,20 +9978,49 @@ static bool ggml_backend_cuda_lend(int lend) {
             }
         }
         ggml_cuda_lend_sync_all();
+        const auto lt2 = lclock::now();
+        size_t bytes = 0;
         for (ggml_cuda_lend_entry & e : ggml_cuda_lend_entries) {
             if (!e.lent) {
                 ggml_cuda_set_device(e.device);
                 CU_CHECK(cuMemUnmap(e.ptr, e.map_size));
                 e.lent = true;
                 ggml_cuda_lend_n_lent++;
+                bytes += e.map_size;
             }
         }
+        if (lend_log) {
+            size_t fr[GGML_CUDA_MAX_DEVICES] = {}, tot = 0;
+            for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+                ggml_cuda_set_device(id);
+                cudaMemGetInfo(&fr[id], &tot);
+            }
+            GGML_LOG_WARN("lend: %.0f MiB (all devices): sync %.1f ms, park %.1f ms, unmap %.1f ms; free MiB %.0f / %.0f\n",
+                          bytes / 1048576.0, lms(lt0, lt1), lms(lt1, lt2), lms(lt2, lclock::now()), fr[0] / 1048576.0, fr[1] / 1048576.0);
+        }
         return true;
+    }
+    size_t fr0[GGML_CUDA_MAX_DEVICES] = {};
+    if (lend_log) {
+        size_t tot = 0;
+        for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+            ggml_cuda_set_device(id);
+            cudaMemGetInfo(&fr0[id], &tot);
+        }
     }
     {
         std::lock_guard<std::mutex> rl(ggml_cuda_ctx_reg_mtx);
         for (ggml_backend_cuda_context * c : ggml_cuda_ctx_reg) {
             ggml_cuda_ctx_trim(*c);
+        }
+    }
+    const auto lt2 = lclock::now();
+    size_t fr1[GGML_CUDA_MAX_DEVICES] = {};
+    if (lend_log) {
+        size_t tot = 0;
+        for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+            ggml_cuda_set_device(id);
+            cudaMemGetInfo(&fr1[id], &tot);
         }
     }
     bool ok = true;
@@ -10007,7 +10041,13 @@ static bool ggml_backend_cuda_lend(int lend) {
         e.lent = false;
         ggml_cuda_lend_n_lent--;
     }
+    const auto lt3 = lclock::now();
     ggml_cuda_lend_sync_all();
+    if (lend_log) {
+        GGML_LOG_WARN("return: sync %.1f ms, trim %.1f ms (free MiB %.0f / %.0f -> %.0f / %.0f), map %.1f ms, restore %.1f ms\n",
+                      lms(lt0, lt1), lms(lt1, lt2), fr0[0] / 1048576.0, fr0[1] / 1048576.0, fr1[0] / 1048576.0, fr1[1] / 1048576.0,
+                      lms(lt2, lt3), lms(lt3, lclock::now()));
+    }
     return ok;
 #else
     GGML_UNUSED(lend);
