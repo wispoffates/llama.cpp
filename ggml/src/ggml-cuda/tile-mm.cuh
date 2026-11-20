@@ -10,3 +10,6 @@ bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 // sorted on the device. Returns false if it does not handle the shape.
 bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
                               ggml_tensor * dst);
+
+// p100-series (phase LND): free the prepared-activation cache of this context (call between graphs)
+void ggml_cuda_tile_mm_cache_free(ggml_backend_cuda_context & ctx);

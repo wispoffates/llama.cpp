@@ -832,6 +832,156 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 };
 #endif // defined(GGML_USE_VMM)
 
+// p100-series (phase LND): lendable VRAM for the MoE expert-cache pools (llama_moe_lru, LLAMA_MOE_LRU_LEND_MIB). While
+// ggml_backend_cuda_lend_alloc(1) is set, CUDA buffers are VMM allocations with a fixed virtual range plus a pinned host
+// "parking" copy of the same size. ggml_backend_cuda_lend(1) (devices idle) parks their contents and unmaps the physical
+// memory, so a large prompt batch can use it for its compute buffers and caches; the expert assembly then reads the lent pools
+// from the parking copy (same bytes). ggml_backend_cuda_lend(0) frees the caches big batches grew (tile prep, cuBLAS fp16,
+// q8_1 scratch, the memory pools), maps the physical memory back at the same addresses and restores the contents: the pools
+// and every pointer to them are exactly as before the loan.
+struct ggml_cuda_lend_entry {
+    int         device   = -1;
+    int         physical = -1;
+    CUdeviceptr ptr      = 0;
+    size_t      size     = 0;   // buffer bytes
+    size_t      map_size = 0;   // rounded to the VMM granularity
+    void *      park     = nullptr;
+    bool        lent     = false;
+};
+static std::mutex                        ggml_cuda_lend_mtx;
+static std::vector<ggml_cuda_lend_entry> ggml_cuda_lend_entries;
+static std::atomic<int>                  ggml_cuda_lend_alloc_on{0};
+static std::atomic<int>                  ggml_cuda_lend_n_lent{0};
+// every live CUDA backend context (the unlend frees what big batches grew in each of them)
+static std::mutex                               ggml_cuda_ctx_reg_mtx;
+static std::vector<ggml_backend_cuda_context *> ggml_cuda_ctx_reg;
+
+// the expert assembly's pool source: the parking copy while the pool is lent
+static const void * ggml_cuda_lend_redirect(const void * p, bool * lent = nullptr) {
+    if (lent) {
+        *lent = false;
+    }
+    if (ggml_cuda_lend_n_lent.load(std::memory_order_acquire) == 0) {
+        return p;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_lend_mtx);
+    for (const ggml_cuda_lend_entry & e : ggml_cuda_lend_entries) {
+        const char * b = (const char *) e.ptr;
+        if (e.lent && (const char *) p >= b && (const char *) p < b + e.size) {
+            if (lent) {
+                *lent = true;
+            }
+            return (const char *) e.park + ((const char *) p - b);
+        }
+    }
+    return p;
+}
+
+#if defined(GGML_USE_VMM)
+static void ggml_cuda_lend_set_access(CUdeviceptr p, size_t sz, int physical_device) {
+    std::vector<CUmemAccessDesc> descs;
+    const int device_count = ggml_cuda_info().device_count;
+    bool seen[GGML_CUDA_MAX_DEVICES] = {};
+    for (int id = 0; id < device_count; ++id) {
+        const int idp = ggml_cuda_get_physical_device(id);
+        if (seen[idp]) {
+            continue;
+        }
+        if (idp != physical_device) {
+            int can = 0;
+            if (!ggml_cuda_p2p_enabled() || cudaDeviceCanAccessPeer(&can, idp, physical_device) != cudaSuccess || !can) {
+                continue;
+            }
+        }
+        seen[idp] = true;
+        CUmemAccessDesc a = {};
+        a.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        a.location.id   = idp;
+        a.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        descs.push_back(a);
+    }
+    CU_CHECK(cuMemSetAccess(p, sz, descs.data(), descs.size()));
+}
+
+static bool ggml_cuda_lend_map(ggml_cuda_lend_entry & e) {
+    CUmemAllocationProp prop = {};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = e.physical;
+    CUmemGenericAllocationHandle h;
+    if (cuMemCreate(&h, e.map_size, &prop, 0) != CUDA_SUCCESS) {
+        return false;
+    }
+    const CUresult r = cuMemMap(e.ptr, e.map_size, 0, h, 0);
+    CU_CHECK(cuMemRelease(h));   // the mapping keeps the memory
+    if (r != CUDA_SUCCESS) {
+        return false;
+    }
+    ggml_cuda_lend_set_access(e.ptr, e.map_size, e.physical);
+    return true;
+}
+#endif // defined(GGML_USE_VMM)
+
+static cudaError_t ggml_cuda_lend_malloc(void ** ptr, size_t size, int device) {
+#if defined(GGML_USE_VMM)
+    if (!ggml_cuda_info().devices[device].vmm) {
+        return cudaErrorNotSupported;
+    }
+    ggml_cuda_set_device(device);
+    const size_t g = ggml_cuda_info().devices[device].vmm_granularity;
+    ggml_cuda_lend_entry e;
+    e.device   = device;
+    e.physical = ggml_cuda_get_physical_device(device);
+    e.size     = size;
+    e.map_size = g * ((size + g - 1) / g);
+    if (cuMemAddressReserve(&e.ptr, e.map_size, 0, 0, 0) != CUDA_SUCCESS) {
+        return cudaErrorMemoryAllocation;
+    }
+    if (!ggml_cuda_lend_map(e)) {
+        CU_CHECK(cuMemAddressFree(e.ptr, e.map_size));
+        return cudaErrorMemoryAllocation;
+    }
+    if (cudaMallocHost(&e.park, e.size) != cudaSuccess) {
+        (void) cudaGetLastError();
+        CU_CHECK(cuMemUnmap(e.ptr, e.map_size));
+        CU_CHECK(cuMemAddressFree(e.ptr, e.map_size));
+        return cudaErrorMemoryAllocation;
+    }
+    *ptr = (void *) e.ptr;
+    std::lock_guard<std::mutex> lock(ggml_cuda_lend_mtx);
+    ggml_cuda_lend_entries.push_back(e);
+    return cudaSuccess;
+#else
+    GGML_UNUSED(ptr); GGML_UNUSED(size); GGML_UNUSED(device);
+    return cudaErrorNotSupported;
+#endif // defined(GGML_USE_VMM)
+}
+
+// true if ptr was a lendable allocation (now freed)
+static bool ggml_cuda_lend_free(void * ptr) {
+#if defined(GGML_USE_VMM)
+    std::lock_guard<std::mutex> lock(ggml_cuda_lend_mtx);
+    for (size_t i = 0; i < ggml_cuda_lend_entries.size(); ++i) {
+        ggml_cuda_lend_entry & e = ggml_cuda_lend_entries[i];
+        if ((void *) e.ptr == ptr) {
+            ggml_cuda_set_device(e.device);
+            if (!e.lent) {
+                CU_CHECK(cuMemUnmap(e.ptr, e.map_size));
+            } else {
+                ggml_cuda_lend_n_lent--;
+            }
+            CU_CHECK(cuMemAddressFree(e.ptr, e.map_size));
+            CUDA_CHECK(cudaFreeHost(e.park));
+            ggml_cuda_lend_entries.erase(ggml_cuda_lend_entries.begin() + i);
+            return true;
+        }
+    }
+#else
+    GGML_UNUSED(ptr);
+#endif // defined(GGML_USE_VMM)
+    return false;
+}
+
 // Debug pool for NVIDIA compute-sanitizer, e.g.
 // `GGML_CUDA_POOL_DEBUG=1 compute-sanitizer --tool memcheck ./build/bin/test-backend-ops -b CUDA0`
 // Allocations are exact-size and freed on release,
@@ -1028,6 +1178,10 @@ static void ggml_cuda_lru_stash_flush_ce(ggml_backend_cuda_context & ctx);
 static void ggml_cuda_lru_stash_worker_stop(ggml_backend_cuda_context & ctx);
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_ctx_reg_mtx);
+        ggml_cuda_ctx_reg.erase(std::remove(ggml_cuda_ctx_reg.begin(), ggml_cuda_ctx_reg.end(), this), ggml_cuda_ctx_reg.end());
+    }
     ggml_cuda_lru_stash_worker_stop(*this);
     delete (ggml_cuda_lru_mirror *) lru_mirror;
     if (lru_wb_stream != nullptr) {
@@ -1124,7 +1278,9 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (!ggml_cuda_lend_free(dev_ptr)) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -1404,7 +1560,17 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    cudaError_t err = cudaErrorNotSupported;
+    if (ggml_cuda_lend_alloc_on.load() && size > 0) {   // p100-series (phase LND): lendable expert-pool memory
+        err = ggml_cuda_lend_malloc(&dev_ptr, size, buft_ctx->device);
+        if (err != cudaSuccess) {
+            GGML_LOG_WARN("%s: lendable allocation of %.2f MiB on device %d failed (%s), using cudaMalloc\n", __func__,
+                          size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+        }
+    }
+    if (err != cudaSuccess) {
+        err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -2703,6 +2869,7 @@ static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor 
     }
     const ggml_tensor * state = dst->src[0];
     const ggml_tensor * pool  = dst->src[1];
+    const char * pool_data = (const char *) ggml_cuda_lend_redirect(pool->data);   // phase LND: parking copy while lent
 
     ggml_tensor * src;
     memcpy(&src, dst->op_params, sizeof(src));
@@ -2723,10 +2890,10 @@ static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor 
             const int j0 = 0, nj = pooled_only ? n_slot_x : n_expert_x;
             const dim3 grid(gx, nj), block(256);
             if (es % 16 == 0) {
-                k_lru_assemble_sliced<true><<<grid, block, 0, stream>>>((const char *) pool->data, hbase, (char *) dst->data, es,
+                k_lru_assemble_sliced<true><<<grid, block, 0, stream>>>(pool_data, hbase, (char *) dst->data, es,
                     n_slot_x, j0, hexpert, xctrl, xlayer);
             } else {
-                k_lru_assemble_sliced<false><<<grid, block, 0, stream>>>((const char *) pool->data, hbase, (char *) dst->data, es,
+                k_lru_assemble_sliced<false><<<grid, block, 0, stream>>>(pool_data, hbase, (char *) dst->data, es,
                     n_slot_x, j0, hexpert, xctrl, xlayer);
             }
             return;
@@ -2760,11 +2927,11 @@ static void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor 
     const dim3 grid(gx, n_expert), block(256);
     if (vec) {
         k_lru_assemble<true><<<grid, block, 0, stream>>>((const int32_t *) state->data, n_slot,
-            (const char *) src->data, (const char *) pool->data, (char *) dst->data,
+            (const char *) src->data, pool_data, (char *) dst->data,
             src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off, hslot, pooled_only, ctrl, layer);
     } else {
         k_lru_assemble<false><<<grid, block, 0, stream>>>((const int32_t *) state->data, n_slot,
-            (const char *) src->data, (const char *) pool->data, (char *) dst->data,
+            (const char *) src->data, pool_data, (char *) dst->data,
             src->nb[2], dst->nb[2], seg_bytes, n_rows, src_row_stride, src_off, hslot, pooled_only, ctrl, layer);
     }
 }
@@ -2858,7 +3025,13 @@ static void ggml_cuda_lru_assemble_dma(ggml_backend_cuda_context & ctx, ggml_ten
         }
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + (size_t) n_slot * es,
             (const char *) src->data + (size_t) xdev * (size_t) n_host * es, (size_t) n_host * es, cudaMemcpyHostToDevice, copy_stream));
-        CUDA_CHECK(cudaMemcpyAsync(dst->data, pool->data, (size_t) n_slot * es, cudaMemcpyDeviceToDevice, ctx.stream()));
+        bool lent = false;   // phase LND: a lent pool comes from its parking copy, by DMA beside the host part
+        const void * pool_src = ggml_cuda_lend_redirect(pool->data, &lent);
+        if (lent) {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, pool_src, (size_t) n_slot * es, cudaMemcpyHostToDevice, copy_stream));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, pool->data, (size_t) n_slot * es, cudaMemcpyDeviceToDevice, ctx.stream()));
+        }
         return;
     }
     const int32_t * owner = m.data();
@@ -3942,6 +4115,11 @@ static lru_fill_desc ggml_cuda_lru_fill_desc(const ggml_tensor * dst) {
     memcpy(&src, dst->op_params, sizeof(src));
     GGML_ASSERT(pool->nb[2] % 16 == 0);
     GGML_ASSERT(src->nb[2] % 16 == 0);
+    {   // phase LND: a lent pool has no device memory -- llama_context returns the loan before any batch that decides
+        bool lent = false;
+        ggml_cuda_lend_redirect(pool->data, &lent);
+        GGML_ASSERT(!lent && "LRU fill into a lent expert pool");
+    }
 
     // under a device split this dispatch runs once per device with a pool view of that device's slice, so the source offset
     // needs the device index (device i holds slice i of an even split)
@@ -9730,6 +9908,136 @@ static void ggml_backend_cuda_ar_rank_run_norm(void * c, int rank, ggml_backend_
     ggml_cuda_ar_rank_reduce_norm((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), t, a);
 }
 
+// p100-series (phase LND): free what large batches grew in a context (device idle, between graphs)
+static void ggml_cuda_ctx_trim(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_set_device(ctx.device);
+    ggml_cuda_tile_mm_cache_free(ctx);
+    if (ctx.cublas_f16_cache != nullptr) {
+        cublas_f16_cache * c = (cublas_f16_cache *) ctx.cublas_f16_cache;
+        for (cublas_f16_entry & e : c->e) {
+            if (e.buf) {
+                CUDA_CHECK(cudaFree(e.buf));
+            }
+        }
+        delete c;
+        ctx.cublas_f16_cache = nullptr;
+    }
+    for (int k = 0; k < 2; ++k) {
+        if (ctx.cublas_defer_buf[k] != nullptr) {
+            CUDA_CHECK(cudaFree(ctx.cublas_defer_buf[k]));
+            ctx.cublas_defer_buf[k] = nullptr;
+            ctx.cublas_defer_cap[k] = 0;
+        }
+    }
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        if (ctx.mmvq_q8_1_ptr[i] != nullptr) {
+            ggml_cuda_set_device(i);
+            CUDA_CHECK(cudaFree(ctx.mmvq_q8_1_ptr[i]));
+            ctx.mmvq_q8_1_ptr[i] = nullptr;
+            ctx.mmvq_q8_1_cap[i] = 0;
+        }
+        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            ctx.pools[i][j].reset();
+        }
+    }
+    ggml_cuda_set_device(ctx.device);
+}
+
+static void ggml_cuda_lend_sync_all() {
+    for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+        ggml_cuda_set_device(id);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+}
+
+// lend = 1: park the lendable pools and release their VRAM; 0: trim every context, take the VRAM back, restore. All devices
+// must be idle apart from work this call waits for (llama_context synchronizes its scheduler first). Returns false when the
+// loan cannot be returned (VRAM taken by something else) -- the pools then stay lent and the caller must not decide.
+static bool ggml_backend_cuda_lend(int lend) {
+#if defined(GGML_USE_VMM)
+    std::lock_guard<std::mutex> lock(ggml_cuda_lend_mtx);
+    ggml_cuda_lend_sync_all();
+    static cudaStream_t streams[GGML_CUDA_MAX_DEVICES] = {};
+    auto stream_of = [&](int dev) {
+        if (streams[dev] == nullptr) {
+            ggml_cuda_set_device(dev);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[dev], cudaStreamNonBlocking));
+        }
+        return streams[dev];
+    };
+    if (lend) {
+        for (ggml_cuda_lend_entry & e : ggml_cuda_lend_entries) {   // devices copy in parallel, one stream each
+            if (!e.lent) {
+                ggml_cuda_set_device(e.device);
+                CUDA_CHECK(cudaMemcpyAsync(e.park, (const void *) e.ptr, e.size, cudaMemcpyDeviceToHost, stream_of(e.device)));
+            }
+        }
+        ggml_cuda_lend_sync_all();
+        for (ggml_cuda_lend_entry & e : ggml_cuda_lend_entries) {
+            if (!e.lent) {
+                ggml_cuda_set_device(e.device);
+                CU_CHECK(cuMemUnmap(e.ptr, e.map_size));
+                e.lent = true;
+                ggml_cuda_lend_n_lent++;
+            }
+        }
+        return true;
+    }
+    {
+        std::lock_guard<std::mutex> rl(ggml_cuda_ctx_reg_mtx);
+        for (ggml_backend_cuda_context * c : ggml_cuda_ctx_reg) {
+            ggml_cuda_ctx_trim(*c);
+        }
+    }
+    bool ok = true;
+    for (ggml_cuda_lend_entry & e : ggml_cuda_lend_entries) {
+        if (!e.lent) {
+            continue;
+        }
+        ggml_cuda_set_device(e.device);
+        if (!ggml_cuda_lend_map(e)) {
+            size_t fr = 0, tot = 0;
+            cudaMemGetInfo(&fr, &tot);
+            GGML_LOG_ERROR("%s: cannot take back %.2f MiB of lent expert-pool VRAM on device %d (free %.2f MiB)\n", __func__,
+                           e.map_size / 1048576.0, e.device, fr / 1048576.0);
+            ok = false;
+            continue;
+        }
+        CUDA_CHECK(cudaMemcpyAsync((void *) e.ptr, e.park, e.size, cudaMemcpyHostToDevice, stream_of(e.device)));
+        e.lent = false;
+        ggml_cuda_lend_n_lent--;
+    }
+    ggml_cuda_lend_sync_all();
+    return ok;
+#else
+    GGML_UNUSED(lend);
+    return false;
+#endif // defined(GGML_USE_VMM)
+}
+
+// set around the allocation of the lendable pools (same thread); returns false if this build cannot lend (no VMM)
+static bool ggml_backend_cuda_lend_alloc(int on) {
+#if defined(GGML_USE_VMM)
+    ggml_cuda_lend_alloc_on.store(on);
+    return true;
+#else
+    GGML_UNUSED(on);
+    return false;
+#endif
+}
+
+// lendable bytes per device (registered allocations)
+static size_t ggml_backend_cuda_lend_bytes(int device) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_lend_mtx);
+    size_t n = 0;
+    for (const ggml_cuda_lend_entry & e : ggml_cuda_lend_entries) {
+        if (e.device == device) {
+            n += e.map_size;
+        }
+    }
+    return n;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -9776,6 +10084,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_copy_batch") == 0) {
         return (void *) ggml_backend_cuda_copy_batch;
+    }
+    if (strcmp(name, "ggml_backend_cuda_lend") == 0) {
+        return (void *) ggml_backend_cuda_lend;
+    }
+    if (strcmp(name, "ggml_backend_cuda_lend_alloc") == 0) {
+        return (void *) ggml_backend_cuda_lend_alloc;
+    }
+    if (strcmp(name, "ggml_backend_cuda_lend_bytes") == 0) {
+        return (void *) ggml_backend_cuda_lend_bytes;
     }
 #ifdef GGML_USE_NCCL
     if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
@@ -9867,6 +10184,10 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_ctx_reg_mtx);
+        ggml_cuda_ctx_reg.push_back(ctx);
     }
 
     ggml_backend_t cuda_backend = new ggml_backend {

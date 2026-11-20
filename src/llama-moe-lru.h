@@ -75,6 +75,15 @@ struct llama_moe_lru {
     // per-layer and total counters at teardown (hit rates)
     void log_final_stats();
 
+    // phase LND: lend the VRAM of the biggest layers' pools to large prompt batches (LLAMA_MOE_LRU_LEND_MIB = MiB per device,
+    // CUDA VMM builds). A lent pool is parked in pinned host memory; the expert assembly reads it from there (same bytes), and
+    // the loan is returned (contents restored at the same addresses) before any batch of <= lend_min() tokens.
+    bool lend_enabled() const { return lend_fn != nullptr && n_lend_layers > 0; }
+    int  lend_min() const { return lend_min_tokens; }
+    bool lent() const { return is_lent; }
+    // the devices must be idle; aborts if the loan cannot be returned (a decide would write into unmapped memory)
+    void set_lent(bool on);
+
     // call only when pooled(il)
     ggml_tensor * state_get(int il) const { GGML_ASSERT(pooled(il)); return layers[layer_to_pool[il]].state; }
     ggml_tensor * pool_get(int il, int kind) const { GGML_ASSERT(pooled(il)); return layers[layer_to_pool[il]].pool[kind]; }
@@ -116,6 +125,16 @@ private:
     bool use_assemble = true;
     bool use_prefetch = false;
     int64_t n_expert = 0;
+
+    // phase LND lending
+    bool (*lend_fn)(int) = nullptr;
+    bool (*lend_alloc_fn)(int) = nullptr;
+    int     n_lend_layers   = 0;
+    int     lend_min_tokens = 512;
+    bool    is_lent         = false;
+    double  lend_mib        = 0.0;
+    int64_t n_lend          = 0;
+    double  lend_ms = 0.0, unlend_ms = 0.0;
 
     // model layer -> index into layers, -1 when not pooled
     std::vector<int> layer_to_pool;

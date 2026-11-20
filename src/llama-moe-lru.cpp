@@ -411,6 +411,63 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
 
     layers.resize(this->n_layers);
 
+    // phase LND: the layers whose pools are lent to large prompt batches (biggest per-device pools first, until the budget)
+    std::vector<bool> lendable(this->n_layers, false);
+    {
+        const char * e = getenv("LLAMA_MOE_LRU_LEND_MIB");
+        const double want = e ? atof(e) : 0.0;
+        const char * em = getenv("LLAMA_MOE_LRU_LEND_MIN");
+        if (em) {
+            lend_min_tokens = std::max(1, atoi(em));
+        }
+        // a batch that decides (writes the pools) must never run while they are lent
+        lend_min_tokens = std::max(lend_min_tokens, (int) (slots_min / n_used_h));
+        if (want > 0.0) {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+            if (reg) {
+                lend_alloc_fn = (bool (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_lend_alloc");
+                lend_fn       = (bool (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_lend");
+            }
+            if (lend_alloc_fn == nullptr || lend_fn == nullptr || !lend_alloc_fn(0)) {
+                LLAMA_LOG_WARN("llama_moe_lru: LLAMA_MOE_LRU_LEND_MIB set, but this backend cannot lend (needs CUDA with VMM) -- off\n");
+                lend_fn = nullptr;
+                lend_alloc_fn = nullptr;
+            } else {
+                int n_dev_split = 1;
+                if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+                    n_dev_split = 0;
+                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                        n_dev_split += ggml_backend_dev_type(ggml_backend_dev_get(i)) == GGML_BACKEND_DEVICE_TYPE_GPU;
+                    }
+                    n_dev_split = std::max(1, n_dev_split);
+                }
+                std::vector<std::pair<double, int>> sz;
+                for (int li = 0; li < this->n_layers; li++) {
+                    const auto & ly = model.layers[pooled_ids[li]];
+                    const double es = (double) ly.ffn_gate_exps->nb[2] + ly.ffn_up_exps->nb[2] + ly.ffn_down_exps->nb[2];
+                    sz.push_back({ layer_slots[li] * es / n_dev_split / 1048576.0, li });
+                }
+                std::sort(sz.begin(), sz.end(), [](const auto & a, const auto & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+                for (const auto & [mib, li] : sz) {
+                    if (lend_mib >= want) {
+                        break;
+                    }
+                    lendable[li] = true;
+                    lend_mib += mib;
+                    n_lend_layers++;
+                }
+                std::string ls;
+                for (int li = 0; li < this->n_layers; li++) {
+                    if (lendable[li]) {
+                        ls += (ls.empty() ? "" : ",") + std::to_string(pooled_ids[li]);
+                    }
+                }
+                LLAMA_LOG_INFO("llama_moe_lru: lending %d layers' pools (%.0f MiB per device; layers %s) to prompt batches of > %d tokens\n",
+                               n_lend_layers, lend_mib, ls.c_str(), lend_min_tokens);
+            }
+        }
+    }
+
     for (int li = 0; li < this->n_layers; li++) {
         const int il = pooled_ids[li];
         per_layer & L = layers[li];
@@ -448,16 +505,32 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         }
         // +tick +cum_ids +cum_fills (+ exclusive: expert -> host slot)
         // (+ refill: this device's log counter)
-        L.state = ggml_new_tensor_1d(pctx.get(), GGML_TYPE_I32,
+        // phase LND: a lendable layer keeps its state in a buffer of its own (only the pools are lent)
+        ggml_context_ptr sctx(lendable[li] ? ggml_init({ 2 * ggml_tensor_overhead(), nullptr, true }) : nullptr);
+        L.state = ggml_new_tensor_1d(lendable[li] ? sctx.get() : pctx.get(), GGML_TYPE_I32,
                                      n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? 2 * n_expert + 1 : 0));
         ggml_format_name(L.state, "blk.%d.moe_lru_state", il);
 
+        if (lendable[li]) {
+            lend_alloc_fn(1);
+        }
         ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(pctx.get(), L.buft);
+        if (lendable[li]) {
+            lend_alloc_fn(0);
+        }
         if (!b) {
             throw std::runtime_error("llama_moe_lru: pool alloc failed");
         }
         bufs.emplace_back(b);
         pool_ctxs.emplace_back(std::move(pctx));
+        if (lendable[li]) {
+            ggml_backend_buffer_t sb = ggml_backend_alloc_ctx_tensors_from_buft(sctx.get(), L.buft);
+            if (!sb) {
+                throw std::runtime_error("llama_moe_lru: state alloc failed");
+            }
+            bufs.emplace_back(sb);
+            pool_ctxs.emplace_back(std::move(sctx));
+        }
 
         // owner = -1, slot owner = -1, last_use = 0, tick = 1, counters = 0
         const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? 2 * n_expert + 1 : 0);
@@ -619,7 +692,33 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
 }
 
 
+void llama_moe_lru::set_lent(bool on) {
+    if (!lend_enabled() || on == is_lent) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    const bool ok = lend_fn(on ? 1 : 0);
+    const double ms = (ggml_time_us() - t0) / 1000.0;
+    if (!ok) {
+        GGML_ABORT("llama_moe_lru: the lent expert-pool VRAM could not be taken back (see the log above)");
+    }
+    is_lent = on;
+    if (on) {
+        n_lend++;
+        lend_ms += ms;
+    } else {
+        unlend_ms += ms;
+    }
+    if (n_lend <= 2) {
+        LLAMA_LOG_INFO("llama_moe_lru: %s %.0f MiB per device in %.1f ms\n", on ? "lent" : "took back", lend_mib, ms);
+    }
+}
+
 void llama_moe_lru::log_final_stats() {
+    if (n_lend > 0) {
+        LLAMA_LOG_INFO("llama_moe_lru: lent %lld times, %.1f ms per lend, %.1f ms per return\n", (long long) n_lend,
+                       lend_ms / n_lend, unlend_ms / std::max<int64_t>(1, n_lend - (is_lent ? 1 : 0)));
+    }
     int64_t total_ids = 0, total_fills = 0;
 
     // pool index -> model layer number, for the per-layer log lines

@@ -1934,6 +1934,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // p100-series (phase LND): the expert-cache pools lend their VRAM to large prompt batches and take it back before any batch
+    // that may decide (devices idle at both transitions)
+    if (lru && lru->lend_enabled() && gtype == ctx_type_to_graph_type(cparams.ctx_type)) {
+        const bool want = (int) ubatch.n_tokens > lru->lend_min();
+        if (want != lru->lent()) {
+            ggml_backend_sched_synchronize(sched.get());
+            lru->set_lent(want);
+        }
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;

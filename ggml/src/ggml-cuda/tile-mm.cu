@@ -674,6 +674,22 @@ static const ggml_tensor * tmm_key_base(const ggml_tensor * t) {
     return t->view_src != nullptr && t->view_offs == 0 ? t->view_src : t;
 }
 // returns the entry (buf holds >= bytes); hit = it already holds this key's contents from this graph evaluation
+// p100-series (phase LND): drop the prepared-activation cache (between graphs, device idle) -- the expert-cache lending gives
+// its VRAM back to the pools before decode
+void ggml_cuda_tile_mm_cache_free(ggml_backend_cuda_context & ctx) {
+    if (ctx.tile_mm_cache == nullptr) {
+        return;
+    }
+    tmm_cache * c = (tmm_cache *) ctx.tile_mm_cache;
+    for (tmm_cache_entry & e : c->e) {
+        if (e.buf) {
+            CUDA_CHECK(cudaFree(e.buf));
+        }
+    }
+    delete c;
+    ctx.tile_mm_cache = nullptr;
+}
+
 static tmm_cache_entry & tmm_cache_get(ggml_backend_cuda_context & ctx, const int64_t (&key)[12], const size_t bytes, bool & hit) {
     if (ctx.tile_mm_cache == nullptr) {
         ctx.tile_mm_cache = new tmm_cache();
