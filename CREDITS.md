@@ -22,6 +22,7 @@ Commits written by the maintainer with AI help carry an `Assisted-by:` trailer.
 ## Ideas and measurements we learned from (no code copied)
 
 - [Niko1221/Strata](https://github.com/Niko1221/Strata) -- Flash-Next on consumer hardware: route-tail expert skip, QSA memory tricks (MIT)
+- [Megla123/Scream-P100](https://github.com/Megla123/Scream-P100) -- Flash-Next on 2x P100: lending expert-cache VRAM to big prompt chunks (`FNX_PF_LEND`), the idea behind v5.45's `LLAMA_MOE_LRU_LEND_MIB` (MIT)
 - [ikawrakow/ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) -- fused up/gate and P2P reduce ideas, register-resident row sums (#2721)
 - [shinbunbun/llama-cpp-p100-patches](https://github.com/shinbunbun/llama-cpp-p100-patches) -- a measured, rebased patch series for P100; our maintenance model
 - [apollo-mg/Project-Apollo](https://github.com/apollo-mg/Project-Apollo), [vmelnic/pascal-llm](https://github.com/vmelnic/pascal-llm) -- P100 profiling findings and prior art (these repos have no license; we used findings only)

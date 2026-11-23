@@ -82,6 +82,21 @@ upstream base and gave identical outputs in its gate. Paths are shortened; ports
     `GGML_CUDA_NORM_ROPE_TUNE=0`, `GGML_CUDA_SHEXP_GATE=0`, `GGML_CUDA_NORM_BS=0`, `GGML_CUDA_NORM_ROWS=1`, `GGML_CUDA_GDN_NORM_ROWS=0`,
     `GGML_CUDA_H1_NORM_VEC=0`, `GGML_CUDA_CUBLAS_SRC1_CACHE=0`, `GGML_CUDA_CUBLAS_GLU_F16=0`, `GGML_CUDA_TILE_PREP_CACHE=0`,
     `GGML_CUDA_NORM_MUL_FUSE=0`.
+- Since v5.45 (upstream `41d8297fe`, unchanged): Flash-Next can read prompts in 2048-token chunks without giving up decode slots.
+  - **Lending** (`LLAMA_MOE_LRU_LEND_MIB`, off unless set): before a prompt batch larger than 512 tokens, the expert cache parks the
+    experts of its biggest per-layer pools in pinned host memory and lends their VRAM to the prompt pass; the pass reads parked experts
+    by DMA. Before the next batch of 512 tokens or fewer (decode, drafts) the VRAM is taken back and the experts restored. Each switch
+    takes about 0.2 s. Outputs are bit-identical with and without lending.
+  - **Smaller AllReduce buffers under `-sm tensor`:** the receive / step buffers are sized by the node that is actually reduced, not by
+    every partial node (the MoE per-expert partials made them about 10x too big). -360 MiB per GPU at `-ub 2048`; gemma4 -114 MiB per
+    GPU at its production settings. Opt-out: `GGML_META_TMP_DELAYED=0`.
+  - `GGML_CUDA_LEND_LOG=1` logs each lend / return step and slow gaps between prompt chunks (diagnostics only).
+  - **Gates R45 / R46:** every other production model is bit-identical to v5.44 (KL divergence, served texts, kernel census). Flash-Next
+    with `-ub 2048 --spec-draft-n-ubatch 512` and `LLAMA_MOE_LRU_LEND_MIB=600` (762 MiB lent per GPU, 256 slots kept) vs the v5.44
+    setup: prefill x1.35-1.72 at 2.4K-15K tokens, a 5.5K prompt's first token -27 %, decode equal within load-to-load noise, peak
+    VRAM +90..100 MiB. MTP acceptance 0.57 -> 0.55 because 2048-token chunks round differently.
+  - Prompt reads still wait on disk when n-gram rows of the lazily read table are not in the page cache (production had this before
+    too); capping a prompt's first chunk at 512 tokens was tried and dropped (no net gain, R46).
 - Every step of the ladder, stock llama.cpp and Kmic-68's fork used the same flags below. Flags a build doesn't know would be dropped and
   listed; none were.
 
@@ -222,17 +237,22 @@ llama-server --model NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf \
   `282764bf3ce11b1ff6c715d65b37d7d690eb782734127429d2af6bd72b4c48b9`); `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` (full vocabulary)
   sha256 `b9880220df29fc224bbce408c867cd5d9c021263b754033ea624b669e374f4ec`
 
-**p100-series (v5.28 and later), production:**
+**p100-series (v5.45 and later), production:**
 
 ```bash
 GGML_CUDA_P2P=1 LLAMA_MOE_LRU_EXCLUSIVE=1 GGML_CUDA_LRU_DMA=1 LLAMA_MOE_LRU_PREFETCH=1 GGML_CUDA_LRU_ASYNC=1 \
-GGML_CUDA_LRU_STASH=48 GGML_CUDA_LRU_STASH_CE=1 \
+GGML_CUDA_LRU_STASH=48 GGML_CUDA_LRU_STASH_CE=1 LLAMA_MOE_LRU_LEND_MIB=600 \
 LLAMA_MOE_LRU_PROFILE=profile-flashnext.txt LLAMA_MOE_LRU_SLOTS=slots-flashnext.txt \
 llama-server --model Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
   --model-draft mtp-Qwen3.8-Flash-Next-Q5_K-frspec-65k-conv.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 \
   --ctx-size 16384 --n-gpu-layers 99 --fit off --flash-attn on --split-mode tensor -lzm on --no-repack \
-  --n-cpu-moe 999 --moe-lru-slots 256 -ub 512 -b 2048 --parallel 1 --jinja
+  --n-cpu-moe 999 --moe-lru-slots 256 -ub 2048 -b 2048 --spec-draft-n-ubatch 512 --parallel 1 --jinja
 ```
+
+- v5.28-v5.44 ran the same line with `-ub 512` and without `LLAMA_MOE_LRU_LEND_MIB` / `--spec-draft-n-ubatch` (still valid).
+- `LLAMA_MOE_LRU_LEND_MIB=600` (since v5.45) lends about 762 MiB of expert-cache VRAM per GPU to prompt chunks larger than 512 tokens
+  (see the v5.45 note above); without it, `-ub 2048` fits only about 224 slots. `--spec-draft-n-ubatch 512` keeps the MTP draft
+  context's batches at 512 tokens.
 
 - Tensor split is required: the expert cache and the Flash-Next kernels are built and measured for `-sm tensor` only.
 - Experts go to host memory with `--n-cpu-moe 999` (not `-ot`); the model is memory-mapped (default load mode).
